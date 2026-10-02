@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+state.sqlite*
+*.lock
+executor-runtime.json
+executor.log
+watch.log
+writer.log
+/reports/
+logs/
+backups/
+plans/
+quarantine/
+tests/sandbox/
+config.toml
+*.torrent
+

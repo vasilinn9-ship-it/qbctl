@@ -1,0 +1,29 @@
+revision = 1
+[paths]
+incoming = "C:\\torrents\\incoming"
+archive = "C:\\torrents\\archive"
+working = "C:\\torrents\\working"
+completed = "C:\\torrents\\completed"
+[api]
+url = "http://127.0.0.1:8080"
+timeout = 4.0
+username_env = "QBCTL_USERNAME"
+password_env = "QBCTL_PASSWORD"
+[policy]
+target_client_count = 10
+download_slots = 10
+upload_slots = 5
+down_bps = 0
+up_bps = 0
+legacy_k = []
+[resources]
+enabled = false
+threshold = 50.0
+resume_below = 40.0
+high_seconds = 20.0
+low_seconds = 60.0
+step = 5
+sample_seconds = 5.0
+network_baseline_bps = 0
+required_metrics = ["cpu", "memory", "disk"]
+unknown_policy = "hold"

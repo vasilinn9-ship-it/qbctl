@@ -1,0 +1,228 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "qbctl result schema 1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "operation_id",
+    "command",
+    "started_at",
+    "finished_at",
+    "result",
+    "actions",
+    "issues",
+    "pending_operations",
+    "next_safe_commands"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "cli_version": {
+      "type": "string"
+    },
+    "operation_id": {
+      "type": "string"
+    },
+    "command": {
+      "type": "string"
+    },
+    "started_at": {
+      "type": "string"
+    },
+    "finished_at": {
+      "type": "string"
+    },
+    "result": {
+      "enum": [
+        "ok",
+        "partial",
+        "blocked",
+        "unknown",
+        "error"
+      ]
+    },
+    "policy_revision": {
+      "type": "integer"
+    },
+    "desired": {
+      "type": "object"
+    },
+    "observed": {
+      "type": "object",
+      "properties": {
+        "completed_data_audited": {
+          "const": false
+        },
+        "allowed_downloads": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "client_count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "action",
+          "result"
+        ]
+      }
+    },
+    "issues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "code"
+        ]
+      }
+    },
+    "pending_operations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "hash",
+          "kind",
+          "stage"
+        ]
+      }
+    },
+    "next_safe_commands": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "response_replayed": {
+      "type": "boolean"
+    },
+    "evidence": {
+      "type": "string"
+    },
+    "state_version": {
+      "type": "integer"
+    },
+    "migration_applied": {
+      "type": "boolean"
+    },
+    "audit": {
+      "type": "object",
+      "properties": {
+        "completed_data_audited": {
+          "const": false
+        },
+        "registry": {
+          "type": "object"
+        }
+      }
+    },
+    "elapsed_seconds": {
+      "type": "number",
+      "minimum": 0
+    },
+    "phase_timings": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "calls",
+          "seconds"
+        ],
+        "properties": {
+          "calls": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "seconds": {
+            "type": "number",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "operation_progress": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "hash",
+          "kind",
+          "stage"
+        ],
+        "properties": {
+          "files_total": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "files_handed_off": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "files_remaining": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "diagnostic": {
+      "type": "object",
+      "required": ["hash", "state", "code", "message", "evidence", "basis"],
+      "properties": {
+        "hash": {"type": "string"},
+        "state": {"type": "string"},
+        "code": {"type": "string"},
+        "message": {"type": "string"},
+        "evidence": {"type": "object"},
+        "basis": {"type": "string"}
+      }
+    }
+  },
+  "allOf": [{
+    "properties": {
+      "diagnostics": {"type": "array", "items": {"$ref": "#/$defs/diagnostic"}},
+      "executor": {
+        "type": "object",
+        "properties": {
+          "alive": {"type": "boolean"},
+          "mode": {"enum": ["off", "starting", "foreground", "background"]},
+          "ownership_locked": {"type": "boolean"},
+          "automatic_watch": {"const": false}
+        }
+      },
+      "job": {
+        "type": "object",
+        "required": ["id", "state"],
+        "properties": {
+          "id": {"type": "string"},
+          "state": {"enum": ["queued", "running", "waiting", "finished", "paused", "blocked", "unknown", "error"]},
+          "no_overall_deadline": {"const": true},
+          "scope_frozen": {"type": "boolean"},
+          "live_journal": {"type": "object"}
+        }
+      },
+      "report": {
+        "type": "object",
+        "required": ["basis", "completed_tasks", "pending_count", "next_safe_commands"],
+        "properties": {
+          "basis": {"enum": ["historical_result", "verified_actions_in_this_call"]},
+          "completed_tasks": {"type": "integer", "minimum": 0},
+          "pending_count": {"type": "integer", "minimum": 0},
+          "next_safe_commands": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    }
+  }]
+}
