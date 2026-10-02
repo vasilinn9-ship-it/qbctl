@@ -3,33 +3,23 @@ name: Rust
 on:
   push:
     branches:
-      - "rust/slice-1-foundation"
+      - main
+      - "rust/**"
+  pull_request:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: rust/slice-1-foundation
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Normalize source and lockfile
-        shell: pwsh
-        run: |
-          cargo fmt --all
-          cargo generate-lockfile
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Cargo.lock apps crates
-          if (-not (git diff --cached --quiet)) {
-            git commit -m "Apply rustfmt and lockfile [skip ci]"
-            git push origin HEAD:rust/slice-1-foundation
-          }
+      - name: Format
+        run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
