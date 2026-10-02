@@ -52,10 +52,7 @@ pub struct SystemService {
 }
 
 impl SystemService {
-    pub fn new(
-        journal: Arc<dyn JournalHealthPort>,
-        runtime: Arc<dyn RuntimeHealthPort>,
-    ) -> Self {
+    pub fn new(journal: Arc<dyn JournalHealthPort>, runtime: Arc<dyn RuntimeHealthPort>) -> Self {
         Self { journal, runtime }
     }
 
