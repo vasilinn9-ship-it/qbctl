@@ -1,35 +1,108 @@
 # Development guide
 
-## Layout
+Rust v1 is the active architecture target. Python 0.2.17 remains a behavioral/reference implementation until Rust release acceptance.
 
-- `qbctl/`: application modules
-- `qbctl_entry.py` and `qbctl.cmd`: Windows entry points
-- `config.example.toml`: safe template; copy it to ignored local `config.toml`
-- `tests/test_*.py`: isolated unit suite
-- `docs/reports/`: curated, sanitized reports; raw client snapshots remain local
-- `result.schema.json`: JSON output contract
+Start with:
 
-## Local setup
+- [ARCHITECTURE.md](ARCHITECTURE.md)
+- [INVARIANTS.md](INVARIANTS.md)
+- [RUST_V1.md](RUST_V1.md)
 
-Install Python 3.12+ on Windows, clone the repository, copy `config.example.toml` to `config.toml`, and edit the directory settings. Set API credentials in the process environment; do not put passwords in TOML, command lines, test fixtures, or commits.
+## Rust workspace
 
-The standard-library test command is:
+Production target:
 
-```powershell
+~~~text
+apps/qbctl
+apps/qbctld
+
+crates/qb-domain
+crates/qb-application
+crates/qb-proto
+crates/qb-ipc
+crates/qb-metainfo
+crates/qb-qbit
+crates/qb-journal
+crates/qb-win
+~~~
+
+Dependency direction and responsibilities are defined in [architecture/layers.md](architecture/layers.md).
+
+## Rust change checklist
+
+Before changing implementation:
+
+1. Identify the owning layer/crate.
+2. Identify affected invariant IDs from [INVARIANTS.md](INVARIANTS.md).
+3. Keep Protobuf/IPC/SQL/Win32/qBittorrent DTOs outside domain/application boundaries.
+4. For every new external mutation, define:
+   - preconditions;
+   - durable intent;
+   - external effect;
+   - fresh postcondition observation;
+   - durable receipt;
+   - Unknown/recovery behavior.
+5. Add failure-path tests, not only happy-path tests.
+6. Do not introduce a new abstraction/crate/queue/cache unless it creates a real boundary or solves demonstrated complexity.
+
+Every review of mutation code should be able to answer:
+
+- What is authoritative state if the process dies immediately before the effect?
+- What is authoritative state if it dies immediately after the effect?
+- How does restart distinguish applied, not-applied, and ambiguous?
+- Why can retry not duplicate/destructively repeat the effect?
+
+## Rust commands
+
+On Windows:
+
+~~~powershell
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+~~~
+
+A slice is not complete until its required Windows integration/fault tests are green.
+
+## Runtime/data safety
+
+For Rust development, use a temporary or dedicated `QBCTL_RUNTIME_DIR`.
+
+Do not point development/test instances at personal payload roots or the normal qBittorrent profile. E2E work uses disposable qBittorrent profiles and synthetic torrent fixtures.
+
+Never commit:
+
+- credentials;
+- live SQLite state;
+- torrent files from real users;
+- tracker passkeys;
+- raw client snapshots;
+- logs containing private operational data.
+
+## Python reference implementation
+
+Legacy Python modules remain under `qbctl/` and are used as behavior/reference evidence while Rust is incomplete.
+
+Python tests:
+
+~~~powershell
 py -3 -m unittest discover -s tests -v
-```
+~~~
 
-Tests should use temporary directories and fake/local HTTP APIs. They must not require the user's qBittorrent session, real torrent metadata, or data folders. Keep generated test output under ignored runtime or sandbox folders.
+The Python implementation should not be structurally copied into Rust. In particular, the former large controller/common-module pattern is explicitly not the Rust architecture.
 
-## Change checklist
+The historical Python architecture is preserved under [legacy/python-architecture.md](legacy/python-architecture.md).
 
-1. Identify the relevant invariant in `PROTOCOL.md` and the code path in `ARCHITECTURE.md`.
-2. Keep filesystem intents, mutations, receipts, and recovery behavior consistent. Preserve no-overwrite semantics and request-ID idempotency.
-3. Add or update isolated tests for code changes. Never use live torrent/client data as a test fixture.
-4. Run the unit suite and report the exact command and result. Distinguish automated tests from live acceptance and historical reports.
-5. Update `result.schema.json` and its documentation when the result contract changes.
-6. Update a curated report under `docs/reports/` when implementation or acceptance status changes. Do not copy raw operational JSON, local databases, backup folders, torrent hashes, or personal file names into the public repository.
+## Architecture changes
 
-## Before a live operation
+A change requires ADR-level review before implementation if it changes:
 
-A live `--apply` operation can change qBittorrent state and move files. Use a separate disposable qBittorrent profile and temporary folders for end-to-end development. Never point a development checkout at production paths unless the operator explicitly authorizes that live operation.
+- dependency direction;
+- public protocol compatibility;
+- persistence compatibility;
+- mutation/recovery semantics;
+- source-delete/no-overwrite guarantees;
+- single-writer/concurrency model;
+- local security/trust boundary.
+
+Local implementation details that preserve these contracts do not require architecture redesign.
