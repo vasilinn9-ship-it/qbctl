@@ -310,6 +310,7 @@ All implementation is governed by [INVARIANTS.md](INVARIANTS.md). Its MUST/MUST 
 ## Detailed documents
 
 - [INVARIANTS.md](INVARIANTS.md) — non-negotiable production invariants.
+- [COMPLEXITY.md](COMPLEXITY.md) — limits on speculative abstraction and infrastructure.
 - [layers.md](architecture/layers.md) — layer/crate ownership and dependency rules.
 - [protocol.md](architecture/protocol.md) — wire/transport/protocol-adapter boundary.
 - [persistence.md](architecture/persistence.md) — SQLite and internal persistence contract.
