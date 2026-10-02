@@ -18,6 +18,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Architecture invariants
+        shell: pwsh
+        run: ./scripts/check-architecture.ps1
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
