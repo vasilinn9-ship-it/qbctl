@@ -58,7 +58,7 @@ Owns local transport mechanics:
 - connection lifecycle;
 - transport errors.
 
-It must not dispatch application use cases.
+It must not dispatch application use cases, depend on `qb-proto`/`prost`, or encode/decode protocol messages.
 
 ## protocol adapter
 
