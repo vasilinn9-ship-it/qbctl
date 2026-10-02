@@ -1,0 +1,9 @@
+[package]
+name = "qb-win"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+fs2.workspace = true
+thiserror.workspace = true

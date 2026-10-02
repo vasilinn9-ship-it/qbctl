@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package qbctl.v1;
+
+import "common.proto";
+
+enum DaemonState {
+  DAEMON_STATE_UNSPECIFIED = 0;
+  DAEMON_STATE_STARTING = 1;
+  DAEMON_STATE_MIGRATING = 2;
+  DAEMON_STATE_RECOVERING = 3;
+  DAEMON_STATE_DEGRADED = 4;
+  DAEMON_STATE_READY = 5;
+  DAEMON_STATE_DRAINING = 6;
+  DAEMON_STATE_STOPPED = 7;
+  DAEMON_STATE_FAILED = 8;
+}
+
+message CapabilitiesRequest {}
+
+message CapabilitiesResponse {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+  string daemon_version = 3;
+  repeated string capabilities = 4;
+}
+
+message StatusRequest {}
+
+message StatusResponse {
+  DaemonState daemon_state = 1;
+  string instance_id = 2;
+  uint32 schema_version = 3;
+  bool mutation_admission_enabled = 4;
+}
+
+message DoctorRequest {}
+
+message DoctorCheck {
+  string name = 1;
+  bool ok = 2;
+  string message = 3;
+}
+
+message DoctorResponse {
+  repeated DoctorCheck checks = 1;
+}
+
+message Request {
+  uint64 sequence = 1;
+  optional string request_id = 2;
+
+  oneof command {
+    CapabilitiesRequest capabilities = 10;
+    StatusRequest status = 11;
+    DoctorRequest doctor = 12;
+  }
+}
+
+message Response {
+  uint64 sequence = 1;
+  Status status = 2;
+  optional string request_id = 3;
+  optional string operation_id = 4;
+  optional string job_id = 5;
+  repeated Problem problems = 6;
+  repeated NextAction next_actions = 7;
+
+  oneof payload {
+    CapabilitiesResponse capabilities = 20;
+    StatusResponse system_status = 21;
+    DoctorResponse doctor = 22;
+  }
+}

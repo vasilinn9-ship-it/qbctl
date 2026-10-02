@@ -1,0 +1,8 @@
+[package]
+name = "qb-application"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+qb-domain = { path = "../qb-domain" }

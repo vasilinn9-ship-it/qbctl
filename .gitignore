@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 state.sqlite*
 *.lock
+!Cargo.lock
 executor-runtime.json
 executor.log
 watch.log
@@ -14,6 +15,9 @@ quarantine/
 tests/sandbox/
 config.toml
 *.torrent
+
+# Rust build output.
+/target/
 
 # Local operational artifacts; publish curated reports under docs/reports instead.
 /*.json
