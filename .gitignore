@@ -15,3 +15,13 @@ tests/sandbox/
 config.toml
 *.torrent
 
+# Local operational artifacts; publish curated reports under docs/reports instead.
+/*.json
+/*.txt
+/*.md
+!/README.md
+/benchmark_receipts.py
+/tests/*.json
+/tests/*.txt
+/tests/run_acceptance_*.py
+/tests/verify_acceptance_*.py
