@@ -64,19 +64,6 @@ strong_id!(OperationId);
 strong_id!(JobId);
 strong_id!(PlanId);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct PolicyRevision(u64);
-
-impl PolicyRevision {
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
