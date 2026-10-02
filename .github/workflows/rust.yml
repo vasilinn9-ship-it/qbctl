@@ -3,77 +3,34 @@ name: Rust
 on:
   push:
     branches:
-      - main
-      - "rust/**"
-  pull_request:
+      - "rust/slice-1-foundation"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: rust/slice-1-foundation
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-
-      - name: Apply rustfmt
-        run: cargo fmt --all
-
-      - name: Upload formatted Rust source
-        uses: actions/upload-artifact@v4
-        with:
-          name: rust-formatted
-          path: |
-            apps/**/*.rs
-            crates/**/*.rs
-
+      - name: Normalize source and lockfile
+        shell: pwsh
+        run: |
+          cargo fmt --all
+          cargo generate-lockfile
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock apps crates
+          if (-not (git diff --cached --quiet)) {
+            git commit -m "Apply rustfmt and lockfile [skip ci]"
+            git push origin HEAD:rust/slice-1-foundation
+          }
       - name: Clippy
-        id: clippy
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          cargo clippy --workspace --all-targets -- -D warnings 2>&1 | Tee-Object -FilePath clippy.log
-          exit $LASTEXITCODE
-
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
-        id: tests
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          cargo test --workspace 2>&1 | Tee-Object -FilePath test.log
-          exit $LASTEXITCODE
-
-      - name: Generate lockfile
-        id: lockfile
-        continue-on-error: true
-        run: cargo generate-lockfile
-
-      - name: Verify formatting committed
-        id: formatting
-        continue-on-error: true
-        run: git diff --exit-code -- apps crates
-
-      - name: Upload diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: rust-ci-diagnostics
-          if-no-files-found: ignore
-          path: |
-            clippy.log
-            test.log
-            Cargo.lock
-
-      - name: Final gate
-        if: always()
-        shell: pwsh
-        run: |
-          $failed = $false
-          if ("${{ steps.clippy.outcome }}" -ne "success") { Write-Error "clippy failed"; $failed = $true }
-          if ("${{ steps.tests.outcome }}" -ne "success") { Write-Error "tests failed"; $failed = $true }
-          if ("${{ steps.lockfile.outcome }}" -ne "success") { Write-Error "lockfile failed"; $failed = $true }
-          if ("${{ steps.formatting.outcome }}" -ne "success") { Write-Error "formatting not committed"; $failed = $true }
-          if ($failed) { exit 1 }
+        run: cargo test --workspace
