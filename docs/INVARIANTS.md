@@ -131,6 +131,8 @@ After a process crash, authoritative recovery data MUST come from the journal pl
 
 Exactly one daemon instance MUST own a runtime root and authoritative writes.
 
+On Windows, runtime ownership MUST be enforced by a kernel-backed exclusive handle. The current v1 mechanism keeps `daemon.lock` open with `CreateFile` sharing disabled (`share_mode(0)`), so a second process cannot acquire the same runtime root while the owner is alive.
+
 The CLI MUST NOT open the operational SQLite database or mutate qBittorrent/payload directly.
 
 ### INV-RUN-002 — one mutation lane in v1
