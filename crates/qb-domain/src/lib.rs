@@ -7,16 +7,16 @@ pub struct IdError;
 
 impl fmt::Display for IdError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("identifier must be non-empty, at most 128 bytes, and contain no control characters")
+        f.write_str(
+            "identifier must be non-empty, at most 128 bytes, and contain no control characters",
+        )
     }
 }
 
 impl Error for IdError {}
 
 fn valid_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= MAX_ID_LEN
-        && !value.chars().any(char::is_control)
+    !value.is_empty() && value.len() <= MAX_ID_LEN && !value.chars().any(char::is_control)
 }
 
 macro_rules! strong_id {

@@ -1,7 +1,4 @@
-use std::{
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context as _, Result};
 use qb_ipc::{IpcError, ServerConnection, ServerListener};
@@ -50,11 +47,11 @@ pub async fn run(runtime_override: Option<PathBuf>) -> Result<()> {
     };
     runtime_root.ensure().context("create runtime root")?;
 
-    let _instance_guard = InstanceGuard::acquire(&runtime_root).context("acquire daemon ownership")?;
+    let _instance_guard =
+        InstanceGuard::acquire(&runtime_root).context("acquire daemon ownership")?;
     let config = Config::load(runtime_root.path()).context("load config")?;
-    let journal = Arc::new(
-        Journal::open(runtime_root.path().join("state.sqlite")).context("open journal")?,
-    );
+    let journal =
+        Arc::new(Journal::open(runtime_root.path().join("state.sqlite")).context("open journal")?);
 
     let context = Arc::new(Context {
         instance_id: Uuid::new_v4().to_string(),

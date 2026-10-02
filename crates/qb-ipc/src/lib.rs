@@ -51,9 +51,7 @@ mod platform {
         Ok(())
     }
 
-    async fn recv_message<S, M>(
-        framed: &mut Framed<S, LengthDelimitedCodec>,
-    ) -> Result<M, IpcError>
+    async fn recv_message<S, M>(framed: &mut Framed<S, LengthDelimitedCodec>) -> Result<M, IpcError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
         M: Message + Default,

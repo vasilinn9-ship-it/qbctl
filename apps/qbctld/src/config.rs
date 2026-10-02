@@ -24,10 +24,10 @@ impl Config {
     pub fn load(runtime_root: &Path) -> Result<Self> {
         let path = runtime_root.join("config.toml");
         let mut config = if path.exists() {
-            let raw = fs::read_to_string(&path)
-                .with_context(|| format!("read {}", path.display()))?;
-            let file: FileConfig = toml::from_str(&raw)
-                .with_context(|| format!("parse {}", path.display()))?;
+            let raw =
+                fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+            let file: FileConfig =
+                toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
 
             if file.revision.unwrap_or(1) != 1 {
                 bail!("unsupported config revision");

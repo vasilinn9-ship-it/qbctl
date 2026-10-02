@@ -109,7 +109,8 @@ async fn execute(cli: Cli) -> Result<Response, CliError> {
 
     let command = match cli.command {
         Command::Capabilities => request::Command::Capabilities(CapabilitiesRequest {}),
-        Command::Status | Command::Daemon {
+        Command::Status
+        | Command::Daemon {
             command: DaemonCommand::Status,
         } => request::Command::Status(StatusRequest {}),
         Command::Doctor => request::Command::Doctor(DoctorRequest {}),
@@ -151,8 +152,8 @@ fn render_human(response: &Response) -> Result<(), CliError> {
             }
         }
         Some(response::Payload::SystemStatus(value)) => {
-            let state = DaemonState::try_from(value.daemon_state)
-                .unwrap_or(DaemonState::Unspecified);
+            let state =
+                DaemonState::try_from(value.daemon_state).unwrap_or(DaemonState::Unspecified);
             println!(
                 "{} · instance {} · schema {} · mutations {}",
                 state.as_str_name(),
