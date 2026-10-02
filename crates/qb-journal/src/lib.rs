@@ -240,6 +240,41 @@ mod tests {
         assert_eq!(reopened.schema_version().expect("version"), SCHEMA_VERSION);
     }
 
+
+    #[test]
+    fn rejects_newer_schema_version() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.sqlite");
+
+        let connection = Connection::open(&path).expect("sqlite");
+        connection
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .expect("set newer version");
+        drop(connection);
+
+        let error = Journal::open(&path).err().expect("must reject newer schema");
+        assert!(matches!(
+            error,
+            JournalError::StateVersionUnsupported {
+                found,
+                supported
+            } if found == SCHEMA_VERSION + 1 && supported == SCHEMA_VERSION
+        ));
+    }
+
+    #[test]
+    fn corrupt_database_is_not_replaced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.sqlite");
+        std::fs::write(&path, b"not a sqlite database").expect("write corrupt db");
+
+        let error = Journal::open(&path).err().expect("must reject corrupt db");
+        assert!(matches!(error, JournalError::Sqlite(_)));
+
+        let bytes = std::fs::read(&path).expect("read corrupt db");
+        assert_eq!(bytes, b"not a sqlite database");
+    }
+
     #[test]
     fn rejects_unknown_unversioned_database() {
         let dir = tempfile::tempdir().expect("tempdir");
