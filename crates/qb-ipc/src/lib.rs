@@ -1,6 +1,5 @@
 use std::io;
 
-use prost::Message;
 use thiserror::Error;
 
 pub const DEFAULT_PIPE: &str = r"\\.\pipe\qbctl";
