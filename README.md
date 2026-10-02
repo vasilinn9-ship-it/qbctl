@@ -104,6 +104,7 @@ Do not commit live SQLite databases, torrent files, credentials, logs, or client
 ## Developer documentation
 
 - [Rust architecture source of truth](docs/ARCHITECTURE.md)
+- [Industrial invariants](docs/INVARIANTS.md)
 - [Architecture layers](docs/architecture/layers.md)
 - [Protocol architecture](docs/architecture/protocol.md)
 - [Persistence architecture](docs/architecture/persistence.md)
