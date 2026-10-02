@@ -13,6 +13,8 @@ use tracing::{error, info, warn};
 
 use crate::{bootstrap, protocol, server::Server};
 
+const MAX_CLIENT_TASKS: usize = 32;
+
 pub struct RuntimeContext {
     instance_id: String,
     runtime_root: PathBuf,
@@ -96,7 +98,7 @@ pub async fn run(runtime_override: Option<PathBuf>) -> Result<()> {
                 info!("shutdown requested");
                 break;
             }
-            accepted = server.accept() => {
+            accepted = server.accept(), if tasks.len() < MAX_CLIENT_TASKS => {
                 match accepted {
                     Ok(connection) => {
                         let runtime = Arc::clone(&bootstrap.runtime);
