@@ -12,6 +12,7 @@ prost.workspace = true
 qb-ipc = { path = "../../crates/qb-ipc" }
 qb-journal = { path = "../../crates/qb-journal" }
 qb-proto = { path = "../../crates/qb-proto" }
+qb-qbit = { path = "../../crates/qb-qbit" }
 qb-win = { path = "../../crates/qb-win" }
 serde.workspace = true
 tokio.workspace = true
