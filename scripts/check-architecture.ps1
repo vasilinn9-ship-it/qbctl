@@ -10,7 +10,7 @@ $allowed = @{
     "qb-domain"      = @()
     "qb-application" = @("qb-domain")
     "qb-proto"       = @()
-    "qb-ipc"         = @("qb-proto")
+    "qb-ipc"         = @()
     "qb-metainfo"    = @("qb-domain", "qb-application")
     "qb-qbit"        = @("qb-domain", "qb-application")
     "qb-journal"     = @("qb-domain", "qb-application")
@@ -75,6 +75,11 @@ Assert-SourceClean "crates/qb-domain/src" @(
     "windows::",
     "prost::",
     "clap::"
+)
+
+Assert-SourceClean "crates/qb-ipc/src" @(
+    "qb_proto",
+    "prost::"
 )
 
 Assert-SourceClean "crates/qb-application/src" @(
