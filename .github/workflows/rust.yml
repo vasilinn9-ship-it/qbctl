@@ -17,6 +17,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: rustfmt, clippy
+      - name: Refresh Slice 2 lockfile
+        run: cargo generate-lockfile
+      - name: Upload Slice 2 lockfile
+        uses: actions/upload-artifact@v4
+        with:
+          name: slice-2-cargo-lock
+          path: Cargo.lock
       - name: Architecture invariants
         shell: pwsh
         run: ./scripts/check-architecture.ps1
