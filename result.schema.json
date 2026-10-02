@@ -217,8 +217,9 @@
         "type": "object",
         "required": ["basis", "completed_tasks", "pending_count", "next_safe_commands"],
         "properties": {
-          "basis": {"enum": ["historical_result", "verified_actions_in_this_call"]},
+          "basis": {"enum": ["historical_result", "verified_actions_in_this_call", "job_receipts"]},
           "completed_tasks": {"type": "integer", "minimum": 0},
+          "released_without_data_deletion": {"type": "integer", "minimum": 0, "description": "Verified completion removals and queue releases with payload deletion disabled."},
           "pending_count": {"type": "integer", "minimum": 0},
           "next_safe_commands": {"type": "array", "items": {"type": "string"}}
         }

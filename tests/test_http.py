@@ -46,7 +46,7 @@ class HTTPTests(unittest.TestCase):
         path,headers,body=self.seen[-1]; self.assertTrue(headers['Content-Type'].startswith('multipart/form-data; boundary=')); self.assertIn(b'fixture',body)
     def test_stopped_add_paths_and_delete_false(self):
         api=API(self.config); api.add(b'fixture',r'C:\qbctl-test\working'); body=self.seen[-1][2]
-        for token in (b'name="stopped"\r\n\r\ntrue',b'name="autoTMM"\r\n\r\nfalse',b'name="skip_checking"\r\n\r\nfalse',b'V:\\temp\\m'): self.assertIn(token,body)
+        for token in (b'name="stopped"\r\n\r\ntrue',b'name="autoTMM"\r\n\r\nfalse',b'name="skip_checking"\r\n\r\nfalse',b'C:\\qbctl-test\\working'): self.assertIn(token,body)
         api.remove('a'*40); self.assertIn(b'deleteFiles=false',self.seen[-1][2])
     def test_version_adapter_216_omits_removed_flag(self):
         self.version='2.16.0'; api=API(self.config); api.add(b'fixture',r'C:\qbctl-test\working'); self.assertNotIn(b'skip_checking',self.seen[-1][2])
@@ -66,4 +66,3 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(caught.exception.code,'AUTH_REQUIRED')
 
 if __name__=='__main__': unittest.main(verbosity=2)
-

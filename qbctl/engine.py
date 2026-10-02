@@ -525,7 +525,7 @@ class Controller:
                 parent=parent.parent
         self.store.set_stop(h,None); self.stage(o,'finished')
         moved=[f for f in o['files'] if f.get('evidence') in ('windows_rename_write_through','recovered_file_identity')]
-        self.actions.append({'action':'complete','hash':h,'result':'verified','postconditions':{'torrent_archived':True,'client_removed':True,'data_handed_off':True,'completed_data_audited':False,'files':len(o['files']),'bytes':sum(f['size'] for f in o['files']),'files_moved':len(moved),'bytes_moved':sum(f['size'] for f in moved),'files_retained_legacy':sum(f.get('evidence')=='authorized_legacy_client_completion' for f in o['files']),'verification_level':'recorded_handoff'}})
+        self.actions.append({'action':'complete','hash':h,'result':'verified','postconditions':{'torrent_archived':True,'client_removed':True,'delete_files':False,'data_handed_off':True,'completed_data_audited':False,'files':len(o['files']),'bytes':sum(f['size'] for f in o['files']),'files_moved':len(moved),'bytes_moved':sum(f['size'] for f in moved),'files_retained_legacy':sum(f.get('evidence')=='authorized_legacy_client_completion' for f in o['files']),'verification_level':'recorded_handoff'}})
     @timed('refill')
     def execute_add(self,o):
         self.api.compatible(); self.budget.check()

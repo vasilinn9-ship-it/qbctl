@@ -40,7 +40,7 @@ The tests use temporary directories and fake/local HTTP APIs. They do not requir
 
 ## Data and safety
 
-The root `config.toml`, SQLite state, logs, backups, plans, quarantine, and generated reports are local runtime data and are ignored by Git. Start with `config.example.toml`; do not commit live state or client snapshots. Read `docs/reports/` for a sanitized implementation and acceptance summary. The reports describe the recorded 0.2.17 work; they are not a claim of formal certification or a substitute for running the suite against a change.
+The root `config.toml`, SQLite state, logs, backups, plans, quarantine, and generated reports are local runtime data and are ignored by Git. Start with `config.example.toml`; do not commit live state or client snapshots. Read `docs/reports/` for a sanitized implementation and acceptance summary. The reports are versioned historical records, not a claim of formal certification or a substitute for running the suite against a change.
 
 ## Developer documentation
 

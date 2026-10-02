@@ -56,6 +56,18 @@ def diagnosis(t, reason, pending, path_ok, *, done, in_check, is_stopped):
             'basis': 'API snapshot and CLI journal; no payload inspection'}
 
 
+def _removed_without_data_deletion(action):
+    post = action.get('postconditions', {})
+    if post.get('client_removed') is not True:
+        return False
+    kind = action.get('action')
+    if kind == 'release':
+        return post.get('delete_files') is False
+    if kind == 'complete':
+        # Complete always hands off data before the API call; older receipts omitted the explicit delete_files field.
+        return post.get('data_handed_off') is True and post.get('delete_files', False) is False
+    return False
+
 def build_report(result):
     # Count verified receipts only. A replay is historical, not a new action.
     verified = [a for a in result.get('actions', []) if a.get('result') == 'verified']
@@ -74,7 +86,7 @@ def build_report(result):
         'files_retained_legacy': sum(a.get('postconditions', {}).get('files_retained_legacy', 0) for a in completed),
         'added': counts['add'], 'started': counts['resume'], 'paused': counts['pause'],
         'dedupe_deleted': sum(a.get('deleted',0) for a in verified if a['action']=='dedupe'),
-        'released_without_data_deletion': counts['release'], 'root_duplicates_removed': counts['duplicate_cleanup'],
+        'released_without_data_deletion': sum(_removed_without_data_deletion(a) for a in verified), 'root_duplicates_removed': counts['duplicate_cleanup'],
         'pending_count': len(pending),
         'pending': [{'id': o['id'], 'kind': o['kind'], 'hash': o['hash'], 'stage': o['stage']} for o in pending],
         'issue_codes': sorted({i['code'] for i in result.get('issues', [])}),
@@ -89,4 +101,4 @@ def report_line(report):
     return (f"Завершено: {report['completed_tasks']}; архивировано torrent: {report['archived_torrents']}; "
             f"подтверждено файлов: {report['confirmed_files']} ({report['confirmed_bytes']} байт); "
             f"добавлено: {report['added']}; запущено: {report['started']}; остановлено: {report['paused']}; "
-            f"освобождено записей: {report['released_without_data_deletion']}; удалено torrent-дублей: {report.get('dedupe_deleted',0)}; pending: {report['pending_count']}")
+            f"записей удалено без удаления данных: {report['released_without_data_deletion']}; удалено torrent-дублей: {report.get('dedupe_deleted',0)}; pending: {report['pending_count']}")
