@@ -5,6 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+qb-application = { path = "../../crates/qb-application" }
 anyhow.workspace = true
 clap.workspace = true
 qb-ipc = { path = "../../crates/qb-ipc" }
