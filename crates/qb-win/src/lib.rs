@@ -105,7 +105,9 @@ fn acquire_instance_file(path: &Path) -> Result<File, PlatformError> {
 
     match file.try_lock_exclusive() {
         Ok(()) => Ok(file),
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Err(PlatformError::AlreadyRunning),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            Err(PlatformError::AlreadyRunning)
+        }
         Err(error) => Err(PlatformError::Io(error)),
     }
 }
