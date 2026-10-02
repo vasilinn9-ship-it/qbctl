@@ -1,5 +1,7 @@
 # Operational protocol and invariants
 
+> Rust v1 normative safety rules are defined in [INVARIANTS.md](INVARIANTS.md). This document describes workflow-level operational invariants inherited from the Python reference controller.
+
 All four data folders are configurable. In examples below, *incoming*, *archive*, *working*, and *completed* mean the configured directories; no machine-specific paths are assumed.
 
 ## Admission
