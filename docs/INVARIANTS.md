@@ -359,6 +359,12 @@ Format, clippy, tests, and required Windows integration/fault suites MUST be gre
 
 A failing mandatory safety test MUST NOT be waived as "flaky" without root-cause analysis and an explicit decision.
 
+### INV-TEST-005 — production dependencies are reproducible
+
+The committed `Cargo.lock` MUST match the workspace.
+
+CI MUST use Cargo `--locked` for dependency-resolving build/test checks so a build cannot silently select different dependency versions.
+
 ## 12. Review invariant
 
 Every implementation change SHOULD answer four questions:
