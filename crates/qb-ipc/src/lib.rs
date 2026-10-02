@@ -1,5 +1,6 @@
 use std::io;
 
+use bytes::Bytes;
 use thiserror::Error;
 
 pub const DEFAULT_PIPE: &str = r"\\.\pipe\qbctl";
@@ -13,15 +14,12 @@ pub enum IpcError {
     UnsupportedPlatform,
     #[error("IPC I/O error: {0}")]
     Io(#[from] io::Error),
-    #[error("invalid protobuf payload: {0}")]
-    Decode(#[from] prost::DecodeError),
 }
 
 #[cfg(windows)]
 mod platform {
     use bytes::Bytes;
     use futures_util::{SinkExt, StreamExt};
-    use prost::Message;
     use tokio::{
         io::{AsyncRead, AsyncWrite},
         net::windows::named_pipe::{
@@ -39,25 +37,25 @@ mod platform {
             .new_codec()
     }
 
-    async fn send_message<S, M>(
+    async fn send_frame<S>(
         framed: &mut Framed<S, LengthDelimitedCodec>,
-        message: &M,
+        frame: Bytes,
     ) -> Result<(), IpcError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
-        M: Message,
     {
-        framed.send(Bytes::from(message.encode_to_vec())).await?;
+        framed.send(frame).await?;
         Ok(())
     }
 
-    async fn recv_message<S, M>(framed: &mut Framed<S, LengthDelimitedCodec>) -> Result<M, IpcError>
+    async fn recv_frame<S>(
+        framed: &mut Framed<S, LengthDelimitedCodec>,
+    ) -> Result<Bytes, IpcError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
-        M: Message + Default,
     {
         match framed.next().await {
-            Some(Ok(bytes)) => Ok(M::decode(bytes)?),
+            Some(Ok(bytes)) => Ok(bytes.freeze()),
             Some(Err(error)) => Err(IpcError::Io(error)),
             None => Err(IpcError::Closed),
         }
@@ -75,12 +73,12 @@ mod platform {
             })
         }
 
-        pub async fn send<M: Message>(&mut self, message: &M) -> Result<(), IpcError> {
-            send_message(&mut self.framed, message).await
+        pub async fn send_frame(&mut self, frame: impl Into<Bytes>) -> Result<(), IpcError> {
+            send_frame(&mut self.framed, frame.into()).await
         }
 
-        pub async fn recv<M: Message + Default>(&mut self) -> Result<M, IpcError> {
-            recv_message(&mut self.framed).await
+        pub async fn recv_frame(&mut self) -> Result<Bytes, IpcError> {
+            recv_frame(&mut self.framed).await
         }
     }
 
@@ -89,12 +87,12 @@ mod platform {
     }
 
     impl ServerConnection {
-        pub async fn send<M: Message>(&mut self, message: &M) -> Result<(), IpcError> {
-            send_message(&mut self.framed, message).await
+        pub async fn send_frame(&mut self, frame: impl Into<Bytes>) -> Result<(), IpcError> {
+            send_frame(&mut self.framed, frame.into()).await
         }
 
-        pub async fn recv<M: Message + Default>(&mut self) -> Result<M, IpcError> {
-            recv_message(&mut self.framed).await
+        pub async fn recv_frame(&mut self) -> Result<Bytes, IpcError> {
+            recv_frame(&mut self.framed).await
         }
     }
 
@@ -139,7 +137,7 @@ mod platform {
 
 #[cfg(not(windows))]
 mod platform {
-    use prost::Message;
+    use bytes::Bytes;
 
     use super::IpcError;
 
@@ -152,21 +150,21 @@ mod platform {
             Err(IpcError::UnsupportedPlatform)
         }
 
-        pub async fn send<M: Message>(&mut self, _message: &M) -> Result<(), IpcError> {
+        pub async fn send_frame(&mut self, _frame: impl Into<Bytes>) -> Result<(), IpcError> {
             Err(IpcError::UnsupportedPlatform)
         }
 
-        pub async fn recv<M: Message + Default>(&mut self) -> Result<M, IpcError> {
+        pub async fn recv_frame(&mut self) -> Result<Bytes, IpcError> {
             Err(IpcError::UnsupportedPlatform)
         }
     }
 
     impl ServerConnection {
-        pub async fn send<M: Message>(&mut self, _message: &M) -> Result<(), IpcError> {
+        pub async fn send_frame(&mut self, _frame: impl Into<Bytes>) -> Result<(), IpcError> {
             Err(IpcError::UnsupportedPlatform)
         }
 
-        pub async fn recv<M: Message + Default>(&mut self) -> Result<M, IpcError> {
+        pub async fn recv_frame(&mut self) -> Result<Bytes, IpcError> {
             Err(IpcError::UnsupportedPlatform)
         }
     }
@@ -183,3 +181,13 @@ mod platform {
 }
 
 pub use platform::{ClientConnection, ServerConnection, ServerListener};
+
+pub fn validate_frame_size(frame: &Bytes) -> Result<(), IpcError> {
+    if frame.len() > MAX_FRAME_LENGTH {
+        return Err(IpcError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame exceeds maximum length",
+        )));
+    }
+    Ok(())
+}
