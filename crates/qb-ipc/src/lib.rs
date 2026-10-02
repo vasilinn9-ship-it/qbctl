@@ -26,11 +26,7 @@ fn checked_frame(frame: impl Into<Bytes>) -> Result<Bytes, IpcError> {
 
 #[cfg(windows)]
 mod platform {
-    use std::{
-        ffi::c_void,
-        mem::size_of,
-        ptr,
-    };
+    use std::{ffi::c_void, mem::size_of, ptr};
 
     use bytes::Bytes;
     use futures_util::{SinkExt, StreamExt};
@@ -196,10 +192,7 @@ mod platform {
 
         #[tokio::test]
         async fn secure_server_can_be_created() {
-            let name = format!(
-                r"\\.\pipe\qbctl-ipc-test-{}",
-                std::process::id()
-            );
+            let name = format!(r"\\.\pipe\qbctl-ipc-test-{}", std::process::id());
             let _server = create_server(&name, true).expect("secure pipe");
         }
 
