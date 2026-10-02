@@ -25,3 +25,5 @@ config.toml
 /tests/*.txt
 /tests/run_acceptance_*.py
 /tests/verify_acceptance_*.py
+
+/benchmarks/

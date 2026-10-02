@@ -1,0 +1,13 @@
+{
+  "created_at": "2026-10-01T15:53:01.072401+00:00",
+  "manifest_rows": 1000,
+  "receipts": 20,
+  "file_row_writes": 20,
+  "initial_write_seconds": 0.2996,
+  "receipts_seconds": 2.8542,
+  "seconds_per_receipt": 0.1427,
+  "handoffs_recorded": 20,
+  "live_client_mutated": false,
+  "payload_accessed": false,
+  "scope": "SQLite storage benchmark, not full transfer throughput"
+}
