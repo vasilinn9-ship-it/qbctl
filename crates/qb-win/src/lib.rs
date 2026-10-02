@@ -66,6 +66,7 @@ impl InstanceGuard {
         let path = root.path().join("daemon.lock");
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(path)?;
