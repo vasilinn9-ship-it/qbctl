@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use qb_application::{
-    system::{DaemonPhase, RuntimeHealthPort, RuntimeSnapshot, SystemService},
+    system::{DaemonPhase, RuntimeHealthPort, RuntimeSnapshot},
     PortError,
 };
 use tokio::task::JoinSet;
