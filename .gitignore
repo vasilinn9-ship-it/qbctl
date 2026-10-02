@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 state.sqlite*
 *.lock
+!Cargo.lock
 executor-runtime.json
 executor.log
 watch.log
