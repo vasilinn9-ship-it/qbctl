@@ -6,7 +6,7 @@ The protocol is an outer contract, independent from domain/application internals
 
 ~~~text
 wire contract      qb-proto
-transport          qb-ipc
+transport          qb-ipc (opaque bounded byte frames)
 translation        qbctld protocol adapter
 ~~~
 
@@ -54,6 +54,8 @@ protobuf payload
 ~~~
 
 Maximum frame size: 16 MiB for v1.
+
+`qb-ipc` does not depend on Protobuf. The CLI and daemon protocol adapter encode/decode messages outside the transport crate.
 
 Transport failure does not determine mutation certainty.
 
