@@ -7,6 +7,7 @@ members = [
     "crates/qb-application",
     "crates/qb-proto",
     "crates/qb-ipc",
+    "crates/qb-metainfo",
     "crates/qb-qbit",
     "crates/qb-journal",
     "crates/qb-win",
