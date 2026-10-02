@@ -1,3 +1,5 @@
+pub mod torrent;
+
 use std::{error::Error, fmt, str::FromStr};
 
 const MAX_ID_LEN: usize = 128;
