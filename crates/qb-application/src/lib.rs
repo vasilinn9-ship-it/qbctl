@@ -1,4 +1,5 @@
 pub mod system;
+pub mod torrent;
 
 use std::{error::Error, fmt};
 
