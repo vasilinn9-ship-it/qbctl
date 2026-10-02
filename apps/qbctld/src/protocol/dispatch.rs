@@ -101,3 +101,88 @@ fn problem_response(
         payload: None,
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use qb_application::{
+        system::{DaemonPhase, RuntimeHealthPort, RuntimeSnapshot, SystemService},
+        JournalHealthPort, PortError,
+    };
+    use qb_proto::v1::{request, response, Request, Status, StatusRequest};
+
+    use super::dispatch;
+
+    struct FakeJournal;
+
+    impl JournalHealthPort for FakeJournal {
+        fn schema_version(&self) -> Result<u32, PortError> {
+            Ok(3)
+        }
+
+        fn quick_check(&self) -> Result<(), PortError> {
+            Ok(())
+        }
+    }
+
+    struct FakeRuntime;
+
+    impl RuntimeHealthPort for FakeRuntime {
+        fn snapshot(&self) -> RuntimeSnapshot {
+            RuntimeSnapshot {
+                phase: DaemonPhase::Ready,
+                instance_id: "protocol-test".into(),
+                mutation_admission_enabled: false,
+            }
+        }
+
+        fn runtime_root_check(&self) -> Result<String, PortError> {
+            Ok("test-runtime".into())
+        }
+    }
+
+    fn system() -> SystemService {
+        SystemService::new(Arc::new(FakeJournal), Arc::new(FakeRuntime))
+    }
+
+    #[test]
+    fn status_mapping_does_not_require_ipc() {
+        let response = dispatch(
+            Request {
+                sequence: 42,
+                request_id: None,
+                command: Some(request::Command::Status(StatusRequest {})),
+            },
+            &system(),
+        );
+
+        assert_eq!(response.sequence, 42);
+        assert_eq!(response.status, Status::Ok as i32);
+
+        match response.payload {
+            Some(response::Payload::SystemStatus(status)) => {
+                assert_eq!(status.instance_id, "protocol-test");
+                assert_eq!(status.schema_version, 3);
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_command_is_rejected_before_application_dispatch() {
+        let response = dispatch(
+            Request {
+                sequence: 7,
+                request_id: None,
+                command: None,
+            },
+            &system(),
+        );
+
+        assert_eq!(response.status, Status::Error as i32);
+        assert_eq!(response.problems[0].code, "INVALID_ARGUMENT");
+        assert!(response.payload.is_none());
+    }
+}
