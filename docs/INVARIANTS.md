@@ -51,6 +51,12 @@ A generic `name + map/json args` command format MUST NOT be introduced for core 
 
 Raw qBittorrent Web API passthrough MUST NOT be exposed.
 
+### INV-ARCH-006 — transport is protocol-agnostic
+
+`qb-ipc` MUST transport bounded byte frames only. It MUST NOT depend on `qb-proto` or `prost`, decode commands, or construct protocol responses.
+
+Protobuf encode/decode belongs to the CLI/protocol adapter layer. This keeps transport replaceable without changing application or wire semantics.
+
 ## 2. Simplicity invariants
 
 ### INV-SIMPLE-001 — no speculative abstraction
