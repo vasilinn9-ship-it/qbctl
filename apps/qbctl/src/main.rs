@@ -54,6 +54,8 @@ enum CliError {
     Ipc(#[from] IpcError),
     #[error("protocol major mismatch: client={client}, daemon={daemon}")]
     ProtocolMismatch { client: u32, daemon: u32 },
+    #[error("invalid protocol payload: {0}")]
+    Decode(#[from] prost::DecodeError),
     #[error("output error: {0}")]
     Output(#[from] io::Error),
 }
@@ -79,6 +81,10 @@ async fn main() -> ExitCode {
             eprintln!("{error}");
             ExitCode::from(6)
         }
+        Err(CliError::Decode(error)) => {
+            eprintln!("invalid protocol payload: {error}");
+            ExitCode::from(7)
+        }
         Err(CliError::Output(error)) => {
             eprintln!("{error}");
             ExitCode::from(8)
@@ -90,16 +96,15 @@ async fn execute(cli: Cli) -> Result<Response, CliError> {
     let pipe = std::env::var("QBCTL_PIPE").unwrap_or_else(|_| DEFAULT_PIPE.to_string());
     let mut connection = ClientConnection::connect(&pipe).await?;
 
-    connection
-        .send(&ClientHello {
-            protocol_major: PROTOCOL_MAJOR,
-            protocol_minor: PROTOCOL_MINOR,
-            client_version: env!("CARGO_PKG_VERSION").to_string(),
-            capabilities: vec!["status.v1".into()],
-        })
-        .await?;
+    let client_hello = ClientHello {
+        protocol_major: PROTOCOL_MAJOR,
+        protocol_minor: PROTOCOL_MINOR,
+        client_version: env!("CARGO_PKG_VERSION").to_string(),
+        capabilities: vec!["status.v1".into()],
+    };
+    connection.send_frame(client_hello.encode_to_vec()).await?;
 
-    let hello: ServerHello = connection.recv().await?;
+    let hello = ServerHello::decode(connection.recv_frame().await?)?;
     if hello.protocol_major != PROTOCOL_MAJOR {
         return Err(CliError::ProtocolMismatch {
             client: PROTOCOL_MAJOR,
@@ -116,15 +121,14 @@ async fn execute(cli: Cli) -> Result<Response, CliError> {
         Command::Doctor => request::Command::Doctor(DoctorRequest {}),
     };
 
-    connection
-        .send(&Request {
-            sequence: 1,
-            request_id: None,
-            command: Some(command),
-        })
-        .await?;
+    let request = Request {
+        sequence: 1,
+        request_id: None,
+        command: Some(command),
+    };
+    connection.send_frame(request.encode_to_vec()).await?;
 
-    Ok(connection.recv().await?)
+    Ok(Response::decode(connection.recv_frame().await?)?)
 }
 
 fn render(response: &Response, mode: OutputMode) -> Result<(), CliError> {
