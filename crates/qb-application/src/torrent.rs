@@ -105,3 +105,42 @@ pub trait TorrentClient: Send + Sync {
     fn network_preferences(&self) -> PortFuture<'_, NetworkPreferences>;
     fn trackers(&self, id: &TorrentId) -> PortFuture<'_, Vec<TrackerEvidence>>;
 }
+
+
+pub struct TorrentService {
+    client: std::sync::Arc<dyn TorrentClient>,
+}
+
+impl TorrentService {
+    pub fn new(client: std::sync::Arc<dyn TorrentClient>) -> Self {
+        Self { client }
+    }
+
+    pub async fn probe(&self) -> Result<QbitProbe, PortError> {
+        self.client.probe().await
+    }
+
+    pub async fn list(&self) -> Result<Vec<TorrentView>, PortError> {
+        self.client.list().await
+    }
+
+    pub async fn get(&self, id: &TorrentId) -> Result<Option<TorrentView>, PortError> {
+        self.client.get(id).await
+    }
+
+    pub async fn transfer_info(&self) -> Result<TransferInfo, PortError> {
+        self.client.transfer_info().await
+    }
+
+    pub async fn queue_settings(&self) -> Result<QueueSettings, PortError> {
+        self.client.queue_settings().await
+    }
+
+    pub async fn network_preferences(&self) -> Result<NetworkPreferences, PortError> {
+        self.client.network_preferences().await
+    }
+
+    pub async fn trackers(&self, id: &TorrentId) -> Result<Vec<TrackerEvidence>, PortError> {
+        self.client.trackers(id).await
+    }
+}
