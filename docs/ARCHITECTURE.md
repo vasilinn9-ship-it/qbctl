@@ -100,7 +100,7 @@ qb-proto
   -> no domain/application dependency
 
 qb-ipc
-  -> transport/framing; may use qb-proto only for wire helpers
+  -> no workspace dependency; bounded byte transport/framing only
 
 qb-metainfo
   -> qb-domain and/or qb-application port contracts
