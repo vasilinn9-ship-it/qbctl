@@ -2,35 +2,51 @@ mod dispatch;
 mod encode;
 mod handshake;
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context as _, Result};
 use prost::Message;
 use qb_application::system::SystemService;
 use qb_ipc::{IpcError, ServerConnection};
 use qb_proto::v1::Request;
+use tokio::time::timeout;
 
 use crate::runtime::RuntimeContext;
+
+const IPC_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub async fn serve_connection(
     mut connection: ServerConnection,
     runtime: Arc<RuntimeContext>,
     system: Arc<SystemService>,
 ) -> Result<()> {
-    if !handshake::perform(&mut connection, &runtime).await? {
+    let handshake = timeout(
+        IPC_IO_TIMEOUT,
+        handshake::perform(&mut connection, &runtime),
+    )
+    .await
+    .map_err(|_| IpcError::TimedOut)??;
+
+    if !handshake {
         return Ok(());
     }
 
     loop {
-        let frame = match connection.recv_frame().await {
-            Ok(frame) => frame,
-            Err(IpcError::Closed) => return Ok(()),
-            Err(error) => return Err(error.into()),
+        let frame = match timeout(IPC_IO_TIMEOUT, connection.recv_frame()).await {
+            Ok(Ok(frame)) => frame,
+            Ok(Err(IpcError::Closed)) => return Ok(()),
+            Ok(Err(error)) => return Err(error.into()),
+            Err(_) => return Err(IpcError::TimedOut.into()),
         };
         let request = Request::decode(frame).context("decode protocol request")?;
 
         let response = dispatch::dispatch(request, &system);
-        connection.send_frame(response.encode_to_vec()).await?;
+        timeout(
+            IPC_IO_TIMEOUT,
+            connection.send_frame(response.encode_to_vec()),
+        )
+        .await
+        .map_err(|_| IpcError::TimedOut)??;
     }
 }
 
