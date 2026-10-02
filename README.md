@@ -43,6 +43,15 @@ Important rules:
 
 Implementation is tracked under GitHub epic #13 as six large logical vertical slices.
 
+## Rust configuration
+
+While Python and Rust coexist, their config examples are intentionally separate.
+
+- Python reference: `config.example.toml`
+- Rust v1: `config.rust.example.toml`
+
+Rust user-mode runtime reads `%LOCALAPPDATA%\\qbctl\\config.toml`. Unknown fields fail closed; a Python-format config is not silently accepted by the Rust daemon.
+
 ## Current Python reference implementation
 
 ### Requirements
