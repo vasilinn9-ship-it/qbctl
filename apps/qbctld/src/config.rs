@@ -10,12 +10,14 @@ pub struct Config {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileConfig {
     revision: Option<u32>,
     ipc: Option<IpcConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct IpcConfig {
     pipe: Option<String>,
 }
@@ -54,5 +56,40 @@ impl Config {
         }
 
         Ok(config)
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_unknown_top_level_fields() {
+        let error = toml::from_str::<FileConfig>(
+            r#"
+revision = 1
+[api]
+url = "http://127.0.0.1:8080"
+"#,
+        )
+        .expect_err("legacy Python config must not be silently accepted");
+
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn rejects_unknown_ipc_fields() {
+        let error = toml::from_str::<FileConfig>(
+            r#"
+revision = 1
+[ipc]
+pipe = "\\\\.\\pipe\\qbctl"
+unexpected = true
+"#,
+        )
+        .expect_err("unknown IPC field must fail");
+
+        assert!(error.to_string().contains("unknown field"));
     }
 }
