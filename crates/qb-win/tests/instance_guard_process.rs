@@ -1,6 +1,5 @@
 use std::{
-    env,
-    fs,
+    env, fs,
     io::{BufRead, BufReader, Write},
     path::PathBuf,
     process::{Command, Stdio},
