@@ -15,6 +15,9 @@ tests/sandbox/
 config.toml
 *.torrent
 
+# Rust build output.
+/target/
+
 # Local operational artifacts; publish curated reports under docs/reports instead.
 /*.json
 /*.txt

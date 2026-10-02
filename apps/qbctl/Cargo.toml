@@ -1,0 +1,17 @@
+[package]
+name = "qbctl-rs"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "qbctl"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+prost.workspace = true
+qb-ipc = { path = "../../crates/qb-ipc" }
+qb-proto = { path = "../../crates/qb-proto" }
+thiserror.workspace = true
+tokio.workspace = true

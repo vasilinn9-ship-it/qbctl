@@ -1,0 +1,13 @@
+[package]
+name = "qb-journal"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+qb-application = { path = "../qb-application" }
+rusqlite.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
