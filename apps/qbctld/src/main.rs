@@ -1,4 +1,7 @@
+mod bootstrap;
 mod config;
+mod protocol;
+mod runtime;
 mod server;
 
 use std::{path::PathBuf, process::ExitCode};
@@ -27,7 +30,7 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Command::Run { runtime_dir } => server::run(runtime_dir).await,
+        Command::Run { runtime_dir } => runtime::run(runtime_dir).await,
     };
 
     match result {
