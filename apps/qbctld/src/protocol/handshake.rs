@@ -8,10 +8,7 @@ use qb_proto::{
 
 use crate::runtime::RuntimeContext;
 
-pub async fn perform(
-    connection: &mut ServerConnection,
-    runtime: &RuntimeContext,
-) -> Result<bool> {
+pub async fn perform(connection: &mut ServerConnection, runtime: &RuntimeContext) -> Result<bool> {
     let hello = ClientHello::decode(connection.recv_frame().await?)
         .context("decode protocol client hello")?;
 
