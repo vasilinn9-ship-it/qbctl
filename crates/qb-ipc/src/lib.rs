@@ -48,9 +48,7 @@ mod platform {
         Ok(())
     }
 
-    async fn recv_frame<S>(
-        framed: &mut Framed<S, LengthDelimitedCodec>,
-    ) -> Result<Bytes, IpcError>
+    async fn recv_frame<S>(framed: &mut Framed<S, LengthDelimitedCodec>) -> Result<Bytes, IpcError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
