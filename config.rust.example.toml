@@ -2,3 +2,9 @@ revision = 1
 
 [ipc]
 pipe = "\\\\.\\pipe\\qbctl"
+
+[qbittorrent]
+url = "http://127.0.0.1:8080"
+username = "admin"
+credential = "qbctl/qbittorrent"
+request_timeout_seconds = 4
