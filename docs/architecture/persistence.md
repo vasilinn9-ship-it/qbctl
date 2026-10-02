@@ -28,6 +28,12 @@ foreign_keys = ON
 
 The daemon is the only writer.
 
+## Incremental schema rule
+
+The conceptual model lists the durable entities required by the completed v1, but physical tables are introduced at first real use. Slice 1 intentionally persists only schema metadata/health. Mutation tables arrive with mutation semantics; job/plan tables arrive with jobs/plans.
+
+This avoids freezing speculative columns before the owning state machine exists.
+
 ## Durable entities
 
 Core logical state includes:
