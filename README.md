@@ -41,3 +41,14 @@ The tests use temporary directories and fake/local HTTP APIs. They do not requir
 ## Data and safety
 
 The root `config.toml`, SQLite state, logs, backups, plans, quarantine, and generated reports are local runtime data and are ignored by Git. Start with `config.example.toml`; do not commit live state or client snapshots. Read `docs/reports/` for a sanitized implementation and acceptance summary. The reports describe the recorded 0.2.17 work; they are not a claim of formal certification or a substitute for running the suite against a change.
+
+## Developer documentation
+
+- [Architecture](docs/ARCHITECTURE.md): modules, persistence, and concurrency model
+- [Operational protocol](docs/PROTOCOL.md): admission, handoff, recovery, and limits
+- [Development guide](docs/DEVELOPMENT.md): isolated setup, tests, and change checklist
+- [Curated reports](docs/reports/): sanitized acceptance and benchmark records
+
+The isolated journal benchmark can be reproduced with `py -3 benchmark_receipts.py`; it writes only under the local ignored `benchmarks/` directory and does not call qBittorrent or access payload files.
+
+Current compatibility target: qBittorrent 5.x with Web API 2.13–2.16. Unknown API versions are rejected for mutating operations; confirm support before upgrading the client.
