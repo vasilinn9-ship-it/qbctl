@@ -1,65 +1,77 @@
 # Rust v1 implementation
 
-The Rust rewrite is developed alongside Python `qbctl 0.2.17` until parity and release acceptance are complete.
+Rust v1 implements the architecture defined in [ARCHITECTURE.md](ARCHITECTURE.md).
 
-## Architecture
+The Python `qbctl 0.2.17` controller remains alongside the Rust rewrite until parity/release acceptance. Its architecture is legacy documentation, not the template for Rust module boundaries.
 
-The approved architecture is tracked in GitHub issues #1–#12. Implementation is tracked as large vertical slices under issue #13.
+## Workspace target
 
-Production workspace:
+Production architecture is **8 library crates + 2 binaries**:
 
-```text
-apps/qbctl      thin CLI client
-apps/qbctld     daemon/composition root
+~~~text
+apps/qbctl
+apps/qbctld
 
 crates/qb-domain
 crates/qb-application
 crates/qb-proto
 crates/qb-ipc
+crates/qb-metainfo
 crates/qb-qbit
 crates/qb-journal
 crates/qb-win
-```
+~~~
 
-## Slice 1
+## Protocol boundary
 
-Slice 1 establishes the control plane:
+Protocol is separate from the application:
 
-- Protobuf v1 handshake and system commands;
+~~~text
+qb-proto          = wire schema
+qb-ipc            = Named Pipe transport
+qbctld/protocol   = wire <-> application mapping
+qb-application    = use cases
+qb-domain         = invariants/state machines
+~~~
+
+`qbctld` must remain a composition/runtime host; application workflows must live in `qb-application`.
+
+## Large implementation slices
+
+Implementation issue #13 is organized into six large logical vertical slices:
+
+1. #14 Foundation & control plane.
+2. #15 qBittorrent observation/direct control + qb-metainfo implementation.
+3. #16 Windows storage & admission pipeline.
+4. #17 Completion handoff & recovery.
+5. #18 Reconcile, durable jobs & full agent workflow.
+6. #19 Production hardening, Windows Service & release acceptance.
+
+## Slice 1 target
+
+Slice 1 establishes:
+
+- the 8-crate workspace boundary, including an initially minimal `qb-metainfo` crate;
+- Protobuf v1 handshake/system commands;
+- explicit protocol adapter inside qbctld;
 - Windows Named Pipe transport;
-- SQLite schema v1 with WAL + FULL durability;
+- SQLite schema/migration foundation;
 - ProgramData/LocalAppData runtime-root model;
-- single daemon instance guard;
+- single daemon instance;
 - `qbctld run`;
-- `qbctl capabilities`, `status`, `daemon status`, and `doctor`;
+- `qbctl capabilities/status/daemon status/doctor`;
 - human/proto/fields output foundations.
 
-Torrent HTTP control and payload mutation are intentionally absent until later slices.
+qBittorrent HTTP and actual metainfo parser behavior belong to Slice 2.
 
 ## Development
 
 On Windows:
 
-```powershell
+~~~powershell
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-```
+~~~
 
-Run the daemon in user mode:
-
-```powershell
-cargo run -p qbctld -- run
-```
-
-Then in another shell:
-
-```powershell
-cargo run -p qbctl-rs -- status
-cargo run -p qbctl-rs -- capabilities
-cargo run -p qbctl-rs -- doctor
-```
-
-For isolated development, set `QBCTL_RUNTIME_DIR` to a temporary directory. The default user runtime root is `%LOCALAPPDATA%\qbctl`.
-
-The Rust daemon does not automatically watch, reconcile, or mutate qBittorrent in Slice 1.
+The daemon never implies automatic watch/reconcile. Automation remains opt-in.
