@@ -1,6 +1,6 @@
 # Rust v1 implementation
 
-Rust v1 implements the architecture defined in [ARCHITECTURE.md](ARCHITECTURE.md).
+Rust v1 implements the architecture defined in [ARCHITECTURE.md](ARCHITECTURE.md) and is governed by the normative [INVARIANTS.md](INVARIANTS.md).
 
 The Python `qbctl 0.2.17` controller remains alongside the Rust rewrite until parity/release acceptance. Its architecture is legacy documentation, not the template for Rust module boundaries.
 
