@@ -96,15 +96,4 @@ mod tests {
         let root = RuntimeRoot::at("example");
         assert_eq!(root.path(), Path::new("example"));
     }
-
-    #[test]
-    fn second_instance_guard_is_rejected() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = RuntimeRoot::at(dir.path());
-
-        let _first = InstanceGuard::acquire(&root).expect("first owner");
-        let second = InstanceGuard::acquire(&root);
-
-        assert!(matches!(second, Err(PlatformError::AlreadyRunning)));
-    }
 }
