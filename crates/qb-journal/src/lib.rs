@@ -157,7 +157,6 @@ mod tests {
         assert_eq!(reopened.schema_version().expect("version"), SCHEMA_VERSION);
     }
 
-
     #[test]
     fn rejects_newer_schema_version() {
         let dir = tempfile::tempdir().expect("tempdir");
