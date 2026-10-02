@@ -18,15 +18,25 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Format
-        run: cargo fmt --all --check
+      - name: Apply rustfmt
+        run: cargo fmt --all
+      - name: Upload formatted Rust source
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-formatted
+          path: |
+            apps/**/*.rs
+            crates/**/*.rs
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
-      - name: Generate lockfile artifact
+      - name: Generate lockfile
         run: cargo generate-lockfile
-      - uses: actions/upload-artifact@v4
+      - name: Upload lockfile
+        uses: actions/upload-artifact@v4
         with:
           name: cargo-lock
           path: Cargo.lock
+      - name: Verify formatting committed
+        run: git diff --exit-code -- apps crates
