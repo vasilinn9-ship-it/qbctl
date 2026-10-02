@@ -67,7 +67,10 @@ impl RuntimeHealthPort for RuntimeContext {
         } else {
             Err(PortError::new(
                 "RUNTIME_ROOT_UNAVAILABLE",
-                format!("runtime root is not a directory: {}", self.runtime_root.display()),
+                format!(
+                    "runtime root is not a directory: {}",
+                    self.runtime_root.display()
+                ),
             ))
         }
     }
