@@ -159,6 +159,24 @@ Shutdown MUST stop admitting new effects, classify any in-flight effect, persist
 
 Caller disconnect or timeout MUST NOT cancel already durably admitted work.
 
+### INV-RUN-006 — queues and concurrency are bounded
+
+IPC connections, queued jobs/mutations, concurrent read tasks, response sizes, and other externally driven resource pools MUST have explicit bounds.
+
+When a bound is reached, the daemon MUST apply backpressure or reject admission with a stable problem code. It MUST NOT accept work and silently drop it.
+
+### INV-RUN-007 — external I/O has bounded waits
+
+qBittorrent requests, IPC waits, shutdown waits, and other external I/O MUST have explicit deadlines/timeouts appropriate to their semantics.
+
+A timeout MUST classify certainty; it MUST NOT imply that an external mutation did not happen.
+
+### INV-RUN-008 — untrusted input must not panic the daemon
+
+Malformed CLI/protocol/config/metainfo/qBittorrent data MUST produce a controlled error or connection rejection.
+
+Panics are reserved for internal programmer invariants and MUST NOT be a normal response to external input.
+
 ## 5. Persistence invariants
 
 ### INV-DB-001 — SQLite is authoritative and durable
@@ -319,7 +337,25 @@ Secrets MUST NOT be persisted in ordinary TOML, SQLite operational payloads, log
 
 CLI input, Protobuf input, qBittorrent responses, metainfo paths, config, and filesystem observations MUST be treated as untrusted until validated at their boundary.
 
-## 10. Observability invariants
+## 10. Configuration invariants
+
+### INV-CONFIG-001 — configuration is validated before readiness
+
+The daemon MUST fully parse and validate the configuration required for a capability before advertising that capability as mutation-ready.
+
+Invalid configuration MUST fail closed for affected mutations and remain diagnosable through status/doctor where safe.
+
+### INV-CONFIG-002 — operations use a stable validated policy snapshot
+
+A durable operation MUST record or reference the policy/config revision that authorized it.
+
+Configuration/policy changes MUST NOT silently change the meaning of an already-admitted operation. Continuation MUST revalidate the relevant revision/preconditions explicitly.
+
+### INV-CONFIG-003 — secrets and operator config are separate concerns
+
+Validated operator configuration may reference credentials, but secret material MUST be obtained through the secret provider boundary and MUST NOT become ordinary config serialization.
+
+## 11. Observability invariants
 
 ### INV-OBS-001 — logs are non-authoritative
 
@@ -333,7 +369,7 @@ Mutation logs/events SHOULD include RequestId, OperationId, JobId where applicab
 
 Daemon status/doctor MUST expose whether mutation admission is enabled and whether Unknown/Blocked/recovery conditions prevent progress, without exposing secrets.
 
-## 11. Test/release invariants
+## 12. Test/release invariants
 
 ### INV-TEST-001 — mutation code requires failure-path tests
 
@@ -367,7 +403,7 @@ The committed `Cargo.lock` MUST match the workspace.
 
 CI MUST use Cargo `--locked` for dependency-resolving build/test checks so a build cannot silently select different dependency versions.
 
-## 12. Review invariant
+## 13. Review invariant
 
 Every implementation change SHOULD answer four questions:
 
