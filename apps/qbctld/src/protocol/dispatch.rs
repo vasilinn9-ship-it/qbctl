@@ -102,7 +102,6 @@ fn problem_response(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
