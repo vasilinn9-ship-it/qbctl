@@ -252,7 +252,9 @@ mod tests {
             .expect("set newer version");
         drop(connection);
 
-        let error = Journal::open(&path).err().expect("must reject newer schema");
+        let error = Journal::open(&path)
+            .err()
+            .expect("must reject newer schema");
         assert!(matches!(
             error,
             JournalError::StateVersionUnsupported {
