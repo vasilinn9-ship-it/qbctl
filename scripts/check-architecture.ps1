@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$metadata = cargo metadata --format-version 1 --no-deps | ConvertFrom-Json
+$metadata = cargo metadata --format-version 1 --no-deps --locked | ConvertFrom-Json
 $workspace = @{}
 foreach ($package in $metadata.packages) {
     $workspace[$package.name] = $package
