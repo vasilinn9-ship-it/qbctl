@@ -5,7 +5,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use fs2::FileExt;
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,33 +56,57 @@ pub enum PlatformError {
 }
 
 pub struct InstanceGuard {
-    file: File,
+    _file: File,
 }
 
 impl InstanceGuard {
     pub fn acquire(root: &RuntimeRoot) -> Result<Self, PlatformError> {
         root.ensure()?;
         let path = root.path().join("daemon.lock");
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path)?;
 
-        match file.try_lock_exclusive() {
-            Ok(()) => Ok(Self { file }),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                Err(PlatformError::AlreadyRunning)
-            }
-            Err(error) => Err(PlatformError::Io(error)),
-        }
+        acquire_instance_file(&path).map(|file| Self { _file: file })
     }
 }
 
-impl Drop for InstanceGuard {
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
+#[cfg(windows)]
+fn acquire_instance_file(path: &Path) -> Result<File, PlatformError> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    // Windows CreateFile sharing violation. We intentionally hold a handle
+    // opened with dwShareMode=0 for the lifetime of the daemon.
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+
+    match OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .share_mode(0)
+        .open(path)
+    {
+        Ok(file) => Ok(file),
+        Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => {
+            Err(PlatformError::AlreadyRunning)
+        }
+        Err(error) => Err(PlatformError::Io(error)),
+    }
+}
+
+#[cfg(not(windows))]
+fn acquire_instance_file(path: &Path) -> Result<File, PlatformError> {
+    use fs2::FileExt;
+
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)?;
+
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(file),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Err(PlatformError::AlreadyRunning),
+        Err(error) => Err(PlatformError::Io(error)),
     }
 }
 
