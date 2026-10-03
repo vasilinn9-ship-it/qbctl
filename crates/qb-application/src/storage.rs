@@ -57,7 +57,9 @@ pub enum IncomingDeleteOutcome {
 pub enum SameVolumeMoveOutcome {
     Moved { destination: FileEvidence },
     SourceMissing,
-    SourceChanged { observed: FileEvidence },
+    SourceChanged {
+        observed: FileEvidence,
+    },
     DestinationExists { observed: FileEvidence },
 }
 
