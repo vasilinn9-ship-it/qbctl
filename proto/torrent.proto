@@ -107,3 +107,32 @@ message MutationResultResponse {
   bool replayed = 1;
   string checkpoint = 2;
 }
+
+
+enum TrackerStatusView {
+  TRACKER_STATUS_VIEW_UNSPECIFIED = 0;
+  TRACKER_STATUS_VIEW_DISABLED = 1;
+  TRACKER_STATUS_VIEW_NOT_CONTACTED = 2;
+  TRACKER_STATUS_VIEW_WORKING = 3;
+  TRACKER_STATUS_VIEW_UPDATING = 4;
+  TRACKER_STATUS_VIEW_ERROR = 5;
+  TRACKER_STATUS_VIEW_UNKNOWN = 6;
+}
+
+message TrackerEvidenceView {
+  string identity = 1;
+  TrackerStatusView status = 2;
+  sint64 peers = 3;
+  sint64 seeds = 4;
+  sint64 leeches = 5;
+  string message = 6;
+}
+
+message TorrentDiagnoseRequest {
+  string torrent_id = 1;
+}
+
+message TorrentDiagnoseResponse {
+  TorrentSummary torrent = 1;
+  repeated TrackerEvidenceView trackers = 2;
+}
