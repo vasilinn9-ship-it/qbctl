@@ -53,12 +53,96 @@ pub enum IncomingDeleteOutcome {
     Changed,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SameVolumeMoveOutcome {
+    Moved { destination: FileEvidence },
+    SourceMissing,
+    SourceChanged { observed: FileEvidence },
+    DestinationExists { observed: FileEvidence },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VerifiedCopyOutcome {
+    Verified {
+        temp: FileEvidence,
+        sha256: [u8; 32],
+        created: bool,
+    },
+    SourceMissing,
+    SourceChanged {
+        observed: FileEvidence,
+    },
+    TempConflict {
+        observed: FileEvidence,
+        sha256: [u8; 32],
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedDeleteOutcome {
+    Deleted,
+    Missing,
+    Changed,
+}
+
 pub trait Storage: Send + Sync {
     fn volume_status(&self, root: ManagedRoot) -> Result<StorageVolumeStatus, PortError>;
 
     fn root_path(&self, root: ManagedRoot) -> Result<String, PortError>;
 
     fn matches_root_path(&self, root: ManagedRoot, observed: &str) -> Result<bool, PortError>;
+
+    fn observe_file(
+        &self,
+        _root: ManagedRoot,
+        _relative_path: &str,
+    ) -> Result<Option<FileEvidence>, PortError> {
+        Err(PortError::new(
+            "STORAGE_OBSERVE_UNSUPPORTED",
+            "managed file observation is not supported by this storage adapter",
+        ))
+    }
+
+    fn move_same_volume_no_replace(
+        &self,
+        _source_root: ManagedRoot,
+        _source_relative: &str,
+        _destination_root: ManagedRoot,
+        _destination_relative: &str,
+        _expected_source: &FileEvidence,
+    ) -> Result<SameVolumeMoveOutcome, PortError> {
+        Err(PortError::new(
+            "STORAGE_MOVE_UNSUPPORTED",
+            "same-volume managed move is not supported by this storage adapter",
+        ))
+    }
+
+    fn copy_to_temp_verified(
+        &self,
+        _source_root: ManagedRoot,
+        _source_relative: &str,
+        _destination_root: ManagedRoot,
+        _temp_relative: &str,
+        _expected_source: &FileEvidence,
+    ) -> Result<VerifiedCopyOutcome, PortError> {
+        Err(PortError::new(
+            "STORAGE_COPY_UNSUPPORTED",
+            "verified cross-volume copy is not supported by this storage adapter",
+        ))
+    }
+
+    fn delete_managed_exact(
+        &self,
+        _root: ManagedRoot,
+        _relative_path: &str,
+        _expected_evidence: &FileEvidence,
+        _expected_sha256: &[u8; 32],
+    ) -> Result<ManagedDeleteOutcome, PortError> {
+        Err(PortError::new(
+            "STORAGE_DELETE_UNSUPPORTED",
+            "exact managed deletion is not supported by this storage adapter",
+        ))
+    }
 
     fn list_incoming(&self) -> Result<Vec<String>, PortError>;
 

@@ -1,4 +1,7 @@
 use qb_application::{
+    completion::{
+        CompletionExecution, CompletionExecutionStatus, CompletionJournal, CompletionService,
+    },
     mutation::{
         MutationCommand, MutationExecution, MutationExecutionResult, MutationExecutionStatus,
         MutationService, TorrentControlAction,
@@ -8,27 +11,38 @@ use qb_application::{
     torrent::TorrentService,
     PortError,
 };
-use qb_domain::{torrent::TorrentId, RequestId};
+use qb_domain::{torrent::TorrentId, OperationId, RequestId};
 use qb_proto::{
     v1::{
         request, response, CapabilitiesResponse, DoctorCheck, DoctorResponse, MutationCertainty,
-        MutationResultResponse, NextAction, Problem, ProblemCategory, QueueTargetResponse, Request,
-        Response, RetryGuidance, Status, TorrentDiagnoseResponse, TorrentGetResponse,
+        MutationResultResponse, NextAction, OperationGetResponse, OperationListResponse,
+        OperationRecoverResponse, Problem, ProblemCategory, QueueTargetResponse, Request, Response,
+        RetryGuidance, Status, TorrentDiagnoseResponse, TorrentGetResponse,
     },
     PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
+
+#[derive(Clone, Copy, Default)]
+pub struct OperationServices<'a> {
+    pub mutations: Option<&'a MutationService>,
+    pub completion: Option<&'a CompletionService>,
+    pub completion_journal: Option<&'a dyn CompletionJournal>,
+}
 
 pub async fn dispatch(
     request: Request,
     system: &SystemService,
     storage: Option<&StorageStatusService>,
     torrents: Option<&TorrentService>,
-    mutations: Option<&MutationService>,
+    operations: OperationServices<'_>,
     mutation_admission_enabled: bool,
     qbit_startup_problem: Option<&str>,
 ) -> Response {
     let sequence = request.sequence;
     let request_id = request.request_id.clone();
+    let mutations = operations.mutations;
+    let completion = operations.completion;
+    let completion_journal = operations.completion_journal;
 
     match request.command {
         Some(request::Command::Capabilities(_)) => success(
@@ -81,6 +95,89 @@ pub async fn dispatch(
                     sequence,
                     request_id,
                     response::Payload::StorageStatus(super::encode::storage_status(status)),
+                ),
+                Err(error) => port_error(sequence, request_id, error),
+            }
+        }
+        Some(request::Command::OperationList(_)) => {
+            let Some(journal) = completion_journal else {
+                return internal_unavailable(
+                    sequence,
+                    request_id,
+                    "completion operation journal unavailable",
+                );
+            };
+            match journal.list_completions() {
+                Ok(records) => success(
+                    sequence,
+                    request_id,
+                    response::Payload::OperationList(OperationListResponse {
+                        operations: records
+                            .iter()
+                            .map(super::encode::operation_summary)
+                            .collect(),
+                    }),
+                ),
+                Err(error) => port_error(sequence, request_id, error),
+            }
+        }
+        Some(request::Command::OperationGet(command)) => {
+            let Some(journal) = completion_journal else {
+                return internal_unavailable(
+                    sequence,
+                    request_id,
+                    "completion operation journal unavailable",
+                );
+            };
+            let operation_id = match OperationId::new(command.operation_id) {
+                Ok(value) => value,
+                Err(error) => return invalid_request(sequence, request_id, &error.to_string()),
+            };
+            match journal.get_completion(&operation_id) {
+                Ok(Some(record)) => success(
+                    sequence,
+                    request_id,
+                    response::Payload::OperationGet(OperationGetResponse {
+                        operation: Some(super::encode::operation_view(record)),
+                    }),
+                ),
+                Ok(None) => state_problem(
+                    sequence,
+                    request_id,
+                    "OPERATION_NOT_FOUND",
+                    "completion operation was not found",
+                ),
+                Err(error) => port_error(sequence, request_id, error),
+            }
+        }
+        Some(request::Command::OperationRecover(command)) => {
+            let Some(service) = completion else {
+                return internal_unavailable(
+                    sequence,
+                    request_id,
+                    "completion operation service unavailable",
+                );
+            };
+            let recovery_request_id = match require_request_id(request_id.as_deref()) {
+                Ok(value) => value,
+                Err(error) => return invalid_request(sequence, request_id, &error),
+            };
+            let operation_id = match OperationId::new(command.operation_id) {
+                Ok(value) => value,
+                Err(error) => return invalid_request(sequence, request_id, &error.to_string()),
+            };
+            match service
+                .recover_operation(&operation_id, &recovery_request_id)
+                .await
+            {
+                Ok(Some(execution)) => {
+                    completion_execution_response(sequence, request_id, execution)
+                }
+                Ok(None) => state_problem(
+                    sequence,
+                    request_id,
+                    "OPERATION_NOT_FOUND",
+                    "completion operation was not found",
                 ),
                 Err(error) => port_error(sequence, request_id, error),
             }
@@ -482,6 +579,96 @@ async fn dispatch_mutation(
     }
 }
 
+fn completion_execution_response(
+    sequence: u64,
+    request_id: Option<String>,
+    execution: CompletionExecution,
+) -> Response {
+    let operation_id = Some(execution.record.operation_id.to_string());
+    let status = execution.status;
+    let payload = Some(response::Payload::OperationRecover(
+        OperationRecoverResponse {
+            operation: Some(super::encode::operation_view(execution.record)),
+            execution_status: super::encode::completion_execution_status_name(status).into(),
+            replayed: execution.replayed,
+        },
+    ));
+
+    match status {
+        CompletionExecutionStatus::Finished => Response {
+            sequence,
+            status: Status::Ok as i32,
+            request_id,
+            operation_id,
+            job_id: None,
+            problems: Vec::new(),
+            next_actions: Vec::new(),
+            payload,
+        },
+        CompletionExecutionStatus::Blocked => mutation_problem(
+            sequence,
+            request_id,
+            operation_id,
+            execution.problem.or_else(|| {
+                Some(PortError::new(
+                    "COMPLETION_BLOCKED",
+                    "completion recovery is blocked by durable evidence",
+                ))
+            }),
+            MutationProblemSpec {
+                status: Status::Blocked,
+                certainty: MutationCertainty::MayHaveApplied,
+                retry: RetryGuidance::RetryAfterStateChange,
+            },
+            payload,
+        ),
+        CompletionExecutionStatus::Failed => mutation_problem(
+            sequence,
+            request_id,
+            operation_id,
+            execution.problem.or_else(|| {
+                Some(PortError::new(
+                    "COMPLETION_FAILED",
+                    "completion recovery failed",
+                ))
+            }),
+            MutationProblemSpec {
+                status: Status::Error,
+                certainty: MutationCertainty::MayHaveApplied,
+                retry: RetryGuidance::ObserveOrRecover,
+            },
+            payload,
+        ),
+        CompletionExecutionStatus::Stopped
+        | CompletionExecutionStatus::ArchivePending
+        | CompletionExecutionStatus::PayloadPending
+        | CompletionExecutionStatus::RemoveRecordPending
+        | CompletionExecutionStatus::UnknownStop
+        | CompletionExecutionStatus::UnknownArchive
+        | CompletionExecutionStatus::UnknownArchiveSourceDelete
+        | CompletionExecutionStatus::UnknownMove
+        | CompletionExecutionStatus::UnknownSourceDelete
+        | CompletionExecutionStatus::UnknownRemoveRecord => mutation_problem(
+            sequence,
+            request_id,
+            operation_id.clone(),
+            execution.problem.or_else(|| {
+                Some(PortError::new(
+                    "COMPLETION_RECOVERY_PENDING",
+                    "completion recovery remains pending at a durable effect boundary",
+                ))
+            }),
+            MutationProblemSpec {
+                status: Status::Unknown,
+                certainty: MutationCertainty::MayHaveApplied,
+                retry: RetryGuidance::ObserveOrRecover,
+            },
+            payload,
+        )
+        .with_next_action("recover_operation", operation_id),
+    }
+}
+
 fn require_request_id(value: Option<&str>) -> Result<RequestId, String> {
     let value = value.ok_or_else(|| "request_id is required for mutations".to_string())?;
     RequestId::new(value.to_string()).map_err(|error| error.to_string())
@@ -778,7 +965,7 @@ mod tests {
     };
     use qb_proto::v1::{request, response, PauseTorrentRequest, Request, Status, StatusRequest};
 
-    use super::dispatch;
+    use super::{dispatch, OperationServices};
 
     struct FakeJournal;
 
@@ -789,6 +976,12 @@ mod tests {
 
         fn quick_check(&self) -> Result<(), PortError> {
             Ok(())
+        }
+
+        fn recovery_blockers(
+            &self,
+        ) -> Result<Vec<qb_application::RecoveryBlocker>, PortError> {
+            Ok(Vec::new())
         }
     }
 
@@ -823,7 +1016,7 @@ mod tests {
             &system(),
             None,
             None,
-            None,
+            OperationServices::default(),
             false,
             None,
         )
@@ -854,7 +1047,7 @@ mod tests {
             &system(),
             None,
             None,
-            None,
+            OperationServices::default(),
             false,
             None,
         )
@@ -878,7 +1071,7 @@ mod tests {
             &system(),
             None,
             None,
-            None,
+            OperationServices::default(),
             false,
             None,
         )

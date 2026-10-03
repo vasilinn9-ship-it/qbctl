@@ -1,4 +1,7 @@
 use qb_application::{
+    completion::{
+        CompletionFileState, CompletionHandoffStrategy, CompletionRecord, CompletionState,
+    },
     storage::{ManagedRoot, ManagedRootStatus, StorageStatusSnapshot},
     system::{
         DaemonPhase, DoctorReport as ApplicationDoctorReport,
@@ -11,7 +14,8 @@ use qb_application::{
 use qb_domain::torrent::TorrentState;
 use qb_proto::v1::{
     DaemonState, DoctorCheck, DoctorResponse, IncomingStatusEntry, ManagedRootView,
-    QbitProbeResponse, QueueSettingsResponse, StatusResponse, StorageListResponse, StorageRootView,
+    OperationFileView, OperationSummary, OperationView, QbitProbeResponse, QueueSettingsResponse,
+    RecoveryBlockerView, StatusResponse, StorageListResponse, StorageRootView,
     StorageStatusResponse, TorrentListResponse, TorrentStateView, TorrentSummary,
     TrackerEvidenceView, TrackerStatusView, TransferLimitsResponse,
 };
@@ -35,6 +39,126 @@ pub fn system_status(status: ApplicationSystemStatus) -> StatusResponse {
         instance_id: status.instance_id,
         schema_version: status.schema_version,
         mutation_admission_enabled: status.mutation_admission_enabled,
+        recovery_blockers: status
+            .recovery_blockers
+            .into_iter()
+            .map(|blocker| RecoveryBlockerView {
+                kind: blocker.kind,
+                state: blocker.state,
+                problem_code: blocker.problem_code,
+                count: blocker.count,
+            })
+            .collect(),
+    }
+}
+
+pub fn operation_summary(record: &CompletionRecord) -> OperationSummary {
+    OperationSummary {
+        operation_id: record.operation_id.to_string(),
+        request_id: record.request_id.to_string(),
+        kind: "completion".into(),
+        state: completion_state_name(record.state).into(),
+        registry_id: record.registry_id.clone(),
+        torrent_id: record.torrent_id.to_string(),
+        problem_code: record.problem_code.clone(),
+        revision: record.revision,
+        files_total: saturating_u32(record.files.len()),
+        files_moved_and_receipted: saturating_u32(
+            record
+                .files
+                .iter()
+                .filter(|file| file.state == CompletionFileState::HandedOff)
+                .count(),
+        ),
+        archive_receipted: record.archive_destination_evidence.is_some()
+            && record.archive_sha256.is_some(),
+        post_handoff_content_audited: false,
+    }
+}
+
+pub fn operation_view(record: CompletionRecord) -> OperationView {
+    let summary = operation_summary(&record);
+    let files = record
+        .files
+        .into_iter()
+        .map(|file| OperationFileView {
+            index: file.index,
+            relative_path: file.relative_path,
+            size: file.size,
+            strategy: completion_strategy_name(file.strategy).into(),
+            state: completion_file_state_name(file.state).into(),
+            destination_receipted: file.destination_evidence.is_some(),
+            problem_code: file.problem_code,
+            revision: file.revision,
+        })
+        .collect();
+
+    OperationView {
+        summary: Some(summary),
+        source_relative: record.source_relative,
+        files,
+    }
+}
+
+pub fn completion_execution_status_name(
+    status: qb_application::completion::CompletionExecutionStatus,
+) -> &'static str {
+    use qb_application::completion::CompletionExecutionStatus;
+
+    match status {
+        CompletionExecutionStatus::Stopped => "stopped",
+        CompletionExecutionStatus::ArchivePending => "archive_pending",
+        CompletionExecutionStatus::PayloadPending => "payload_pending",
+        CompletionExecutionStatus::RemoveRecordPending => "remove_record_pending",
+        CompletionExecutionStatus::Finished => "finished",
+        CompletionExecutionStatus::Blocked => "blocked",
+        CompletionExecutionStatus::UnknownStop => "unknown_stop",
+        CompletionExecutionStatus::UnknownArchive => "unknown_archive",
+        CompletionExecutionStatus::UnknownArchiveSourceDelete => "unknown_archive_source_delete",
+        CompletionExecutionStatus::UnknownMove => "unknown_move",
+        CompletionExecutionStatus::UnknownSourceDelete => "unknown_source_delete",
+        CompletionExecutionStatus::UnknownRemoveRecord => "unknown_remove_record",
+        CompletionExecutionStatus::Failed => "failed",
+    }
+}
+
+fn completion_state_name(state: CompletionState) -> &'static str {
+    match state {
+        CompletionState::Prepared => "prepared",
+        CompletionState::StopPending => "stop_pending",
+        CompletionState::UnknownStop => "unknown_stop",
+        CompletionState::Stopped => "stopped",
+        CompletionState::ArchivePending => "archive_pending",
+        CompletionState::UnknownArchive => "unknown_archive",
+        CompletionState::ArchiveSourceDeletePending => "archive_source_delete_pending",
+        CompletionState::UnknownArchiveSourceDelete => "unknown_archive_source_delete",
+        CompletionState::PayloadPending => "payload_pending",
+        CompletionState::RemoveRecordPending => "remove_record_pending",
+        CompletionState::UnknownRemoveRecord => "unknown_remove_record",
+        CompletionState::Finished => "finished",
+        CompletionState::Blocked => "blocked",
+        CompletionState::Failed => "failed",
+    }
+}
+
+fn completion_file_state_name(state: CompletionFileState) -> &'static str {
+    match state {
+        CompletionFileState::Prepared => "prepared",
+        CompletionFileState::MovePending => "move_pending",
+        CompletionFileState::UnknownMove => "unknown_move",
+        CompletionFileState::DestinationReceipted => "destination_receipted",
+        CompletionFileState::SourceDeletePending => "source_delete_pending",
+        CompletionFileState::UnknownSourceDelete => "unknown_source_delete",
+        CompletionFileState::HandedOff => "handed_off",
+        CompletionFileState::Blocked => "blocked",
+        CompletionFileState::Failed => "failed",
+    }
+}
+
+fn completion_strategy_name(strategy: CompletionHandoffStrategy) -> &'static str {
+    match strategy {
+        CompletionHandoffStrategy::SameVolume => "same_volume",
+        CompletionHandoffStrategy::CrossVolume => "cross_volume",
     }
 }
 

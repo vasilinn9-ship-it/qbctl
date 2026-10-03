@@ -28,11 +28,19 @@ message CapabilitiesResponse {
 
 message StatusRequest {}
 
+message RecoveryBlockerView {
+  string kind = 1;
+  string state = 2;
+  optional string problem_code = 3;
+  uint64 count = 4;
+}
+
 message StatusResponse {
   DaemonState daemon_state = 1;
   string instance_id = 2;
   uint32 schema_version = 3;
   bool mutation_admission_enabled = 4;
+  repeated RecoveryBlockerView recovery_blockers = 5;
 }
 
 enum ManagedRootView {
@@ -76,6 +84,62 @@ message StorageStatusResponse {
   repeated IncomingStatusEntry incoming = 6;
 }
 
+message OperationListRequest {}
+
+message OperationGetRequest {
+  string operation_id = 1;
+}
+
+message OperationRecoverRequest {
+  string operation_id = 1;
+}
+
+message OperationSummary {
+  string operation_id = 1;
+  string request_id = 2;
+  string kind = 3;
+  string state = 4;
+  string registry_id = 5;
+  string torrent_id = 6;
+  optional string problem_code = 7;
+  uint64 revision = 8;
+  uint32 files_total = 9;
+  uint32 files_moved_and_receipted = 10;
+  bool archive_receipted = 11;
+  bool post_handoff_content_audited = 12;
+}
+
+message OperationFileView {
+  uint32 index = 1;
+  string relative_path = 2;
+  uint64 size = 3;
+  string strategy = 4;
+  string state = 5;
+  bool destination_receipted = 6;
+  optional string problem_code = 7;
+  uint64 revision = 8;
+}
+
+message OperationView {
+  OperationSummary summary = 1;
+  string source_relative = 2;
+  repeated OperationFileView files = 3;
+}
+
+message OperationListResponse {
+  repeated OperationSummary operations = 1;
+}
+
+message OperationGetResponse {
+  OperationView operation = 1;
+}
+
+message OperationRecoverResponse {
+  OperationView operation = 1;
+  string execution_status = 2;
+  bool replayed = 3;
+}
+
 message DoctorRequest {}
 
 message DoctorCheck {
@@ -111,6 +175,9 @@ message Request {
     SetUploadLimitRequest transfer_upload_limit_set = 36;
     StorageListRequest storage_list = 37;
     StorageStatusRequest storage_status = 38;
+    OperationListRequest operation_list = 39;
+    OperationGetRequest operation_get = 40;
+    OperationRecoverRequest operation_recover = 41;
   }
 }
 
@@ -137,5 +204,8 @@ message Response {
     TorrentDiagnoseResponse torrent_diagnose = 30;
     StorageListResponse storage_list = 31;
     StorageStatusResponse storage_status = 32;
+    OperationListResponse operation_list = 33;
+    OperationGetResponse operation_get = 34;
+    OperationRecoverResponse operation_recover = 35;
   }
 }

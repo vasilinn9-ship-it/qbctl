@@ -1,5 +1,6 @@
 pub mod admission;
 pub mod cleanup;
+pub mod completion;
 pub mod incoming;
 pub mod mutation;
 pub mod registry;
@@ -8,7 +9,7 @@ pub mod storage;
 pub mod system;
 pub mod torrent;
 
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, sync::Arc};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PortError {
@@ -33,7 +34,22 @@ impl fmt::Display for PortError {
 
 impl Error for PortError {}
 
+pub type MutationLane = Arc<tokio::sync::Mutex<()>>;
+
+pub fn mutation_lane() -> MutationLane {
+    Arc::new(tokio::sync::Mutex::new(()))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryBlocker {
+    pub kind: String,
+    pub state: String,
+    pub problem_code: Option<String>,
+    pub count: u64,
+}
+
 pub trait JournalHealthPort: Send + Sync {
     fn schema_version(&self) -> Result<u32, PortError>;
     fn quick_check(&self) -> Result<(), PortError>;
+    fn recovery_blockers(&self) -> Result<Vec<RecoveryBlocker>, PortError>;
 }

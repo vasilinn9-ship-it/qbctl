@@ -6,6 +6,7 @@ use std::{
 use anyhow::{Context as _, Result};
 use qb_application::{
     cleanup::IncomingCleanupState,
+    completion::CompletionExecutionStatus,
     mutation::MutationExecutionStatus,
     release::ReleaseExecutionStatus,
     system::{DaemonPhase, RuntimeHealthPort, RuntimeSnapshot},
@@ -109,6 +110,8 @@ pub async fn run(runtime_override: Option<PathBuf>) -> Result<()> {
                         let storage = bootstrap.storage_status.as_ref().map(Arc::clone);
                         let torrents = bootstrap.torrents.as_ref().map(Arc::clone);
                         let mutations = Arc::clone(&bootstrap.mutations);
+                        let completion = bootstrap.completion.as_ref().map(Arc::clone);
+                        let completion_journal = Arc::clone(&bootstrap.completion_journal);
                         let qbit_startup_problem =
                             bootstrap.qbit_startup_problem.as_deref().map(Arc::<str>::from);
                         tasks.spawn(async move {
@@ -118,7 +121,11 @@ pub async fn run(runtime_override: Option<PathBuf>) -> Result<()> {
                                 system,
                                 storage,
                                 torrents,
-                                mutations,
+                                protocol::OperationServices {
+                                    mutations,
+                                    completion,
+                                    completion_journal,
+                                },
                                 qbit_startup_problem,
                             )
                             .await
@@ -253,6 +260,35 @@ async fn initialize_runtime(bootstrap: &bootstrap::Bootstrap) {
             info!(
                 recovered = recovered.len(),
                 "startup durable queue release recovery completed"
+            );
+        }
+    }
+
+    if let Some(completion) = bootstrap.completion.as_ref() {
+        let recovered = match completion.recover_all().await {
+            Ok(results) => results,
+            Err(error) => {
+                bootstrap.runtime.set_phase(DaemonPhase::Degraded);
+                error!(error = %error, "startup completion recovery failed");
+                return;
+            }
+        };
+        let unresolved = recovered
+            .iter()
+            .filter(|execution| execution.status != CompletionExecutionStatus::Finished)
+            .count();
+        if unresolved > 0 {
+            bootstrap.runtime.set_phase(DaemonPhase::Degraded);
+            warn!(
+                unresolved,
+                "one or more durable completions remain unresolved after observation-first recovery"
+            );
+            return;
+        }
+        if !recovered.is_empty() {
+            info!(
+                recovered = recovered.len(),
+                "startup durable completion recovery completed"
             );
         }
     }

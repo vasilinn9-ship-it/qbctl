@@ -966,6 +966,7 @@ version = "0.1.0"
 dependencies = [
  "fs2",
  "qb-application",
+ "sha2",
  "thiserror",
  "windows-sys",
 ]

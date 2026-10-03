@@ -15,6 +15,11 @@ use qb_application::{
         IncomingCleanupIntent, IncomingCleanupJournal, IncomingCleanupRecord,
         IncomingCleanupReservation, IncomingCleanupState, INCOMING_CLEANUP_FINGERPRINT_VERSION,
     },
+    completion::{
+        CompletionFileRecord, CompletionFileState, CompletionHandoffStrategy, CompletionJournal,
+        CompletionPreflight, CompletionRecord, CompletionReservation, CompletionState,
+        COMPLETION_FINGERPRINT_VERSION,
+    },
     mutation::{
         MutationCommand, MutationDisposition, MutationJournal, MutationRecord, QueueTargetPolicy,
         RequestReservation, TorrentControlAction, FINGERPRINT_VERSION,
@@ -26,7 +31,7 @@ use qb_application::{
         ReleaseJournal, ReleaseRecord, ReleaseRequest, ReleaseReservation, ReleaseResolution,
         ReleaseState, RELEASE_FINGERPRINT_VERSION,
     },
-    JournalHealthPort, PortError,
+    JournalHealthPort, PortError, RecoveryBlocker,
 };
 use qb_domain::{
     torrent::{TorrentId, TorrentIdentity},
@@ -36,7 +41,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, Transact
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 #[derive(Debug, Error)]
 pub enum JournalError {
@@ -552,6 +557,11 @@ impl JournalHealthPort for Journal {
     fn quick_check(&self) -> Result<(), PortError> {
         Journal::quick_check(self).map_err(map_port_error)
     }
+
+    fn recovery_blockers(&self) -> Result<Vec<RecoveryBlocker>, PortError> {
+        let connection = self.connection.lock().expect("journal mutex poisoned");
+        load_recovery_blockers(&connection).map_err(map_port_error)
+    }
 }
 
 impl TorrentRegistry for Journal {
@@ -569,6 +579,11 @@ impl TorrentRegistry for Journal {
                 "torrent identity aliases resolve to multiple registry records",
             )),
         }
+    }
+
+    fn get_by_id(&self, registry_id: &str) -> Result<Option<RegistryRecord>, PortError> {
+        let connection = self.connection.lock().expect("journal mutex poisoned");
+        load_registry_record(&connection, registry_id).map_err(map_port_error)
     }
 
     fn register_incoming(
@@ -1525,6 +1540,723 @@ impl AdmissionJournal for Journal {
     }
 }
 
+impl CompletionJournal for Journal {
+    fn lookup_completion_request(
+        &self,
+        request: &qb_application::completion::CompletionRequest,
+    ) -> Result<Option<CompletionReservation>, PortError> {
+        let fingerprint = request.fingerprint();
+        let connection = self.connection.lock().expect("journal mutex poisoned");
+        let existing: Option<(String, u32, Vec<u8>)> = connection
+            .query_row(
+                "SELECT operation_id, fingerprint_version, completion_fingerprint
+                 FROM completion_operations
+                 WHERE request_id = ?1",
+                [request.request_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        let Some((operation_id, fingerprint_version, stored_fingerprint)) = existing else {
+            return Ok(None);
+        };
+        let operation_id = OperationId::new(operation_id)
+            .map_err(|error| PortError::new("JOURNAL_STATE_INVALID", error.to_string()))?;
+        if fingerprint_version != COMPLETION_FINGERPRINT_VERSION
+            || stored_fingerprint.as_slice() != fingerprint
+        {
+            return Ok(Some(CompletionReservation::Conflict { operation_id }));
+        }
+        let record = load_completion_record(&connection, operation_id.as_str())
+            .map_err(map_port_error)?
+            .ok_or_else(|| {
+                PortError::new(
+                    "JOURNAL_STATE_INVALID",
+                    "completion request references a missing operation",
+                )
+            })?;
+        Ok(Some(CompletionReservation::Replay(record)))
+    }
+
+    fn reserve_completion(
+        &self,
+        preflight: &CompletionPreflight,
+    ) -> Result<CompletionReservation, PortError> {
+        if preflight.registry_id.trim().is_empty()
+            || preflight.source_relative.trim().is_empty()
+            || preflight.working_save_path.trim().is_empty()
+            || preflight.files.is_empty()
+        {
+            return Err(PortError::new(
+                "COMPLETION_REQUEST_INVALID",
+                "completion preflight must include registry, source, Working path and files",
+            ));
+        }
+
+        let fingerprint = preflight.fingerprint();
+        let mut connection = self.connection.lock().expect("journal mutex poisoned");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+
+        let existing: Option<(String, u32, Vec<u8>)> = transaction
+            .query_row(
+                "SELECT operation_id, fingerprint_version, completion_fingerprint
+                 FROM completion_operations
+                 WHERE request_id = ?1",
+                [preflight.request_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        if let Some((operation_id, fingerprint_version, stored_fingerprint)) = existing {
+            let operation_id = OperationId::new(operation_id)
+                .map_err(|error| PortError::new("JOURNAL_STATE_INVALID", error.to_string()))?;
+            if fingerprint_version != COMPLETION_FINGERPRINT_VERSION
+                || stored_fingerprint.as_slice() != fingerprint
+            {
+                return Ok(CompletionReservation::Conflict { operation_id });
+            }
+            let record = load_completion_record(&transaction, operation_id.as_str())
+                .map_err(map_port_error)?
+                .ok_or_else(|| {
+                    PortError::new(
+                        "JOURNAL_STATE_INVALID",
+                        "completion request references a missing operation",
+                    )
+                })?;
+            transaction
+                .commit()
+                .map_err(JournalError::from)
+                .map_err(map_port_error)?;
+            return Ok(CompletionReservation::Replay(record));
+        }
+
+        let registry = load_registry_record(&transaction, &preflight.registry_id)
+            .map_err(map_port_error)?
+            .ok_or_else(|| {
+                PortError::new(
+                    "COMPLETION_TARGET_NOT_FOUND",
+                    "completion registry record does not exist",
+                )
+            })?;
+        if registry.state != RegistryState::Processing {
+            return Err(PortError::new(
+                "COMPLETION_NOT_PROCESSING",
+                "completion requires a Processing registry record",
+            ));
+        }
+        if registry.identity != preflight.identity
+            || registry.source_relative != preflight.source_relative
+            || registry.source_metainfo_digest != preflight.source_metainfo_digest
+        {
+            return Err(PortError::new(
+                "COMPLETION_PREFLIGHT_STALE",
+                "completion preflight no longer matches authoritative registry identity/source",
+            ));
+        }
+        if registry.archive_ref.is_some() || registry.handoff_receipt_count != 0 {
+            return Err(PortError::new(
+                "COMPLETION_ALREADY_STARTED",
+                "registry already contains completion handoff evidence",
+            ));
+        }
+
+        let active: Option<String> = transaction
+            .query_row(
+                "SELECT operation_id
+                 FROM completion_operations
+                 WHERE registry_id = ?1
+                   AND state NOT IN ('finished','blocked','failed')
+                 LIMIT 1",
+                [&preflight.registry_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        if let Some(operation_id) = active {
+            let operation_id = OperationId::new(operation_id)
+                .map_err(|error| PortError::new("JOURNAL_STATE_INVALID", error.to_string()))?;
+            return Ok(CompletionReservation::ActiveConflict { operation_id });
+        }
+
+        let operation_id = OperationId::new(Uuid::new_v4().to_string())
+            .map_err(|error| PortError::new("JOURNAL_STATE_INVALID", error.to_string()))?;
+        let identity_v1 = preflight.identity.v1.map(|value| value.to_vec());
+        let identity_v2 = preflight.identity.v2.map(|value| value.to_vec());
+
+        transaction
+            .execute(
+                "INSERT INTO completion_operations(
+                    operation_id,
+                    request_id,
+                    fingerprint_version,
+                    completion_fingerprint,
+                    registry_id,
+                    torrent_id,
+                    identity_v1,
+                    identity_v2,
+                    source_relative,
+                    source_volume_id,
+                    source_file_id,
+                    source_size,
+                    source_modified_marker,
+                    source_metainfo_digest,
+                    working_volume_id,
+                    completed_volume_id,
+                    archive_volume_id,
+                    working_save_path,
+                    total_bytes,
+                    payload_strategy,
+                    archive_strategy,
+                    state,
+                    problem_code,
+                    revision,
+                    created_at,
+                    updated_at,
+                    finished_at
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                    ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                    ?18, ?19, ?20, ?21, 'prepared', NULL, 1,
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    NULL
+                 )",
+                params![
+                    operation_id.as_str(),
+                    preflight.request_id.as_str(),
+                    COMPLETION_FINGERPRINT_VERSION,
+                    fingerprint.as_slice(),
+                    preflight.registry_id,
+                    preflight.torrent_id.as_str(),
+                    identity_v1,
+                    identity_v2,
+                    preflight.source_relative,
+                    preflight
+                        .source_evidence
+                        .identity
+                        .volume_id
+                        .to_be_bytes()
+                        .as_slice(),
+                    preflight
+                        .source_evidence
+                        .identity
+                        .file_id
+                        .to_be_bytes()
+                        .as_slice(),
+                    preflight.source_evidence.size.to_be_bytes().as_slice(),
+                    preflight
+                        .source_evidence
+                        .modified_marker
+                        .to_be_bytes()
+                        .as_slice(),
+                    preflight.source_metainfo_digest.as_slice(),
+                    preflight.working_volume_id.to_be_bytes().as_slice(),
+                    preflight.completed_volume_id.to_be_bytes().as_slice(),
+                    preflight.archive_volume_id.to_be_bytes().as_slice(),
+                    preflight.working_save_path,
+                    preflight.total_bytes.to_be_bytes().as_slice(),
+                    completion_strategy_name(preflight.payload_strategy()),
+                    completion_strategy_name(preflight.archive_strategy()),
+                ],
+            )
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+
+        for (index, file) in preflight.files.iter().enumerate() {
+            let file_index = u32::try_from(index).map_err(|_| {
+                PortError::new(
+                    "COMPLETION_REQUEST_INVALID",
+                    "completion manifest has more files than supported by the journal",
+                )
+            })?;
+            transaction
+                .execute(
+                    "INSERT INTO operation_files(
+                        operation_id,
+                        file_index,
+                        relative_path,
+                        expected_size,
+                        source_volume_id,
+                        source_file_id,
+                        source_size,
+                        source_modified_marker,
+                        handoff_strategy,
+                        state,
+                        temp_relative,
+                        destination_volume_id,
+                        destination_file_id,
+                        destination_size,
+                        destination_modified_marker,
+                        destination_sha256,
+                        problem_code,
+                        revision,
+                        created_at,
+                        updated_at
+                     ) VALUES (
+                        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                        'prepared', NULL, NULL, NULL, NULL, NULL, NULL, NULL, 1,
+                        strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     )",
+                    params![
+                        operation_id.as_str(),
+                        i64::from(file_index),
+                        file.relative_path,
+                        file.size.to_be_bytes().as_slice(),
+                        file.source_evidence
+                            .identity
+                            .volume_id
+                            .to_be_bytes()
+                            .as_slice(),
+                        file.source_evidence
+                            .identity
+                            .file_id
+                            .to_be_bytes()
+                            .as_slice(),
+                        file.source_evidence.size.to_be_bytes().as_slice(),
+                        file.source_evidence
+                            .modified_marker
+                            .to_be_bytes()
+                            .as_slice(),
+                        completion_strategy_name(preflight.payload_strategy()),
+                    ],
+                )
+                .map_err(JournalError::from)
+                .map_err(map_port_error)?;
+        }
+
+        insert_completion_event(&transaction, operation_id.as_str(), 1, "prepared", None)
+            .map_err(map_port_error)?;
+
+        let record = load_completion_record(&transaction, operation_id.as_str())
+            .map_err(map_port_error)?
+            .ok_or_else(|| {
+                PortError::new(
+                    "JOURNAL_STATE_INVALID",
+                    "completion operation disappeared before commit",
+                )
+            })?;
+        transaction
+            .commit()
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        Ok(CompletionReservation::New(record))
+    }
+
+    fn get_completion(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<CompletionRecord>, PortError> {
+        let connection = self.connection.lock().expect("journal mutex poisoned");
+        load_completion_record(&connection, operation_id.as_str()).map_err(map_port_error)
+    }
+
+    fn list_completions(&self) -> Result<Vec<CompletionRecord>, PortError> {
+        let connection = self.connection.lock().expect("journal mutex poisoned");
+        let mut statement = connection
+            .prepare(
+                "SELECT operation_id
+                 FROM completion_operations
+                 ORDER BY created_at, operation_id",
+            )
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            let operation_id = row.map_err(JournalError::from).map_err(map_port_error)?;
+            let record = load_completion_record(&connection, &operation_id)
+                .map_err(map_port_error)?
+                .ok_or_else(|| {
+                    PortError::new(
+                        "JOURNAL_STATE_INVALID",
+                        "completion disappeared during operation enumeration",
+                    )
+                })?;
+            records.push(record);
+        }
+        Ok(records)
+    }
+
+    fn list_recoverable_completions(&self) -> Result<Vec<CompletionRecord>, PortError> {
+        let connection = self.connection.lock().expect("journal mutex poisoned");
+        let mut statement = connection
+            .prepare(
+                "SELECT operation_id
+                 FROM completion_operations
+                 WHERE state NOT IN ('finished','blocked','failed')
+                 ORDER BY created_at, operation_id",
+            )
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            let operation_id = row.map_err(JournalError::from).map_err(map_port_error)?;
+            let record = load_completion_record(&connection, &operation_id)
+                .map_err(map_port_error)?
+                .ok_or_else(|| {
+                    PortError::new(
+                        "JOURNAL_STATE_INVALID",
+                        "recoverable completion disappeared during enumeration",
+                    )
+                })?;
+            records.push(record);
+        }
+        Ok(records)
+    }
+
+    fn mark_stop_pending(&self, operation_id: &OperationId) -> Result<CompletionRecord, PortError> {
+        transition_completion(
+            self,
+            operation_id,
+            &[CompletionState::Prepared],
+            CompletionState::StopPending,
+            None,
+        )
+    }
+
+    fn mark_unknown_stop(
+        &self,
+        operation_id: &OperationId,
+        problem_code: &str,
+    ) -> Result<CompletionRecord, PortError> {
+        transition_completion(
+            self,
+            operation_id,
+            &[CompletionState::StopPending],
+            CompletionState::UnknownStop,
+            Some(problem_code),
+        )
+    }
+
+    fn retry_stop(&self, operation_id: &OperationId) -> Result<CompletionRecord, PortError> {
+        transition_completion(
+            self,
+            operation_id,
+            &[CompletionState::UnknownStop, CompletionState::StopPending],
+            CompletionState::Prepared,
+            None,
+        )
+    }
+
+    fn mark_stopped(&self, operation_id: &OperationId) -> Result<CompletionRecord, PortError> {
+        transition_completion(
+            self,
+            operation_id,
+            &[CompletionState::StopPending, CompletionState::UnknownStop],
+            CompletionState::Stopped,
+            None,
+        )
+    }
+
+    fn mark_completion_blocked(
+        &self,
+        operation_id: &OperationId,
+        problem_code: &str,
+    ) -> Result<CompletionRecord, PortError> {
+        transition_completion(
+            self,
+            operation_id,
+            &[
+                CompletionState::Prepared,
+                CompletionState::StopPending,
+                CompletionState::UnknownStop,
+                CompletionState::Stopped,
+                CompletionState::ArchivePending,
+                CompletionState::UnknownArchive,
+                CompletionState::ArchiveSourceDeletePending,
+                CompletionState::UnknownArchiveSourceDelete,
+                CompletionState::PayloadPending,
+                CompletionState::RemoveRecordPending,
+                CompletionState::UnknownRemoveRecord,
+            ],
+            CompletionState::Blocked,
+            Some(problem_code),
+        )
+    }
+
+    fn mark_completion_failed(
+        &self,
+        operation_id: &OperationId,
+        problem_code: &str,
+    ) -> Result<CompletionRecord, PortError> {
+        transition_completion(
+            self,
+            operation_id,
+            &[
+                CompletionState::StopPending,
+                CompletionState::RemoveRecordPending,
+            ],
+            CompletionState::Failed,
+            Some(problem_code),
+        )
+    }
+
+    fn mark_archive_pending(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<CompletionRecord, PortError> {
+        transition_completion(
+            self,
+            operation_id,
+            &[CompletionState::Stopped],
+            CompletionState::ArchivePending,
+            None,
+        )
+    }
+
+    fn mark_unknown_archive(
+        &self,
+        operation_id: &OperationId,
+        problem_code: &str,
+    ) -> Result<CompletionRecord, PortError> {
+        transition_completion(
+            self,
+            operation_id,
+            &[CompletionState::ArchivePending],
+            CompletionState::UnknownArchive,
+            Some(problem_code),
+        )
+    }
+
+    fn retry_archive(&self, operation_id: &OperationId) -> Result<CompletionRecord, PortError> {
+        transition_completion(
+            self,
+            operation_id,
+            &[
+                CompletionState::ArchivePending,
+                CompletionState::UnknownArchive,
+            ],
+            CompletionState::Stopped,
+            None,
+        )
+    }
+
+    fn mark_archive_destination_receipted(
+        &self,
+        operation_id: &OperationId,
+        destination: &qb_application::storage::FileEvidence,
+        destination_sha256: [u8; 32],
+    ) -> Result<CompletionRecord, PortError> {
+        receipt_completion_archive_destination(self, operation_id, destination, destination_sha256)
+    }
+
+    fn mark_archive_source_delete_pending(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<CompletionRecord, PortError> {
+        begin_completion_archive_source_delete(self, operation_id)
+    }
+
+    fn mark_unknown_archive_source_delete(
+        &self,
+        operation_id: &OperationId,
+        problem_code: &str,
+    ) -> Result<CompletionRecord, PortError> {
+        transition_completion(
+            self,
+            operation_id,
+            &[CompletionState::ArchiveSourceDeletePending],
+            CompletionState::UnknownArchiveSourceDelete,
+            Some(problem_code),
+        )
+    }
+
+    fn retry_archive_source_delete(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<CompletionRecord, PortError> {
+        transition_completion(
+            self,
+            operation_id,
+            &[CompletionState::UnknownArchiveSourceDelete],
+            CompletionState::ArchiveSourceDeletePending,
+            None,
+        )
+    }
+
+    fn mark_archive_receipted(
+        &self,
+        operation_id: &OperationId,
+        destination: &qb_application::storage::FileEvidence,
+        destination_sha256: [u8; 32],
+    ) -> Result<CompletionRecord, PortError> {
+        receipt_completion_archive(self, operation_id, destination, destination_sha256)
+    }
+
+    fn mark_file_move_pending(
+        &self,
+        operation_id: &OperationId,
+        file_index: u32,
+    ) -> Result<CompletionRecord, PortError> {
+        transition_completion_file(
+            self,
+            operation_id,
+            file_index,
+            CompletionFileState::MovePending,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn mark_file_unknown_move(
+        &self,
+        operation_id: &OperationId,
+        file_index: u32,
+        problem_code: &str,
+    ) -> Result<CompletionRecord, PortError> {
+        transition_completion_file(
+            self,
+            operation_id,
+            file_index,
+            CompletionFileState::UnknownMove,
+            None,
+            None,
+            Some(problem_code),
+        )
+    }
+
+    fn mark_file_destination_receipted(
+        &self,
+        operation_id: &OperationId,
+        file_index: u32,
+        destination: &qb_application::storage::FileEvidence,
+        destination_sha256: [u8; 32],
+    ) -> Result<CompletionRecord, PortError> {
+        transition_completion_file(
+            self,
+            operation_id,
+            file_index,
+            CompletionFileState::DestinationReceipted,
+            Some(destination),
+            Some(destination_sha256),
+            None,
+        )
+    }
+
+    fn mark_file_source_delete_pending(
+        &self,
+        operation_id: &OperationId,
+        file_index: u32,
+    ) -> Result<CompletionRecord, PortError> {
+        transition_completion_file(
+            self,
+            operation_id,
+            file_index,
+            CompletionFileState::SourceDeletePending,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn mark_file_unknown_source_delete(
+        &self,
+        operation_id: &OperationId,
+        file_index: u32,
+        problem_code: &str,
+    ) -> Result<CompletionRecord, PortError> {
+        transition_completion_file(
+            self,
+            operation_id,
+            file_index,
+            CompletionFileState::UnknownSourceDelete,
+            None,
+            None,
+            Some(problem_code),
+        )
+    }
+
+    fn mark_file_handed_off(
+        &self,
+        operation_id: &OperationId,
+        file_index: u32,
+        destination: &qb_application::storage::FileEvidence,
+        destination_sha256: Option<[u8; 32]>,
+    ) -> Result<CompletionRecord, PortError> {
+        transition_completion_file(
+            self,
+            operation_id,
+            file_index,
+            CompletionFileState::HandedOff,
+            Some(destination),
+            destination_sha256,
+            None,
+        )
+    }
+
+    fn mark_file_blocked(
+        &self,
+        operation_id: &OperationId,
+        file_index: u32,
+        problem_code: &str,
+    ) -> Result<CompletionRecord, PortError> {
+        transition_completion_file(
+            self,
+            operation_id,
+            file_index,
+            CompletionFileState::Blocked,
+            None,
+            None,
+            Some(problem_code),
+        )
+    }
+
+    fn mark_payload_handed_off(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<CompletionRecord, PortError> {
+        finish_completion_payload(self, operation_id)
+    }
+
+    fn mark_unknown_remove_record(
+        &self,
+        operation_id: &OperationId,
+        problem_code: &str,
+    ) -> Result<CompletionRecord, PortError> {
+        transition_completion(
+            self,
+            operation_id,
+            &[CompletionState::RemoveRecordPending],
+            CompletionState::UnknownRemoveRecord,
+            Some(problem_code),
+        )
+    }
+
+    fn retry_remove_record(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<CompletionRecord, PortError> {
+        transition_completion(
+            self,
+            operation_id,
+            &[CompletionState::UnknownRemoveRecord],
+            CompletionState::RemoveRecordPending,
+            None,
+        )
+    }
+
+    fn finish_completion(&self, operation_id: &OperationId) -> Result<CompletionRecord, PortError> {
+        finish_completion_operation(self, operation_id)
+    }
+}
+
 impl ReleaseJournal for Journal {
     fn reserve_release(&self, request: &ReleaseRequest) -> Result<ReleaseReservation, PortError> {
         if request.registry_id.trim().is_empty() {
@@ -2305,6 +3037,81 @@ impl MutationJournal for Journal {
     }
 }
 
+fn load_recovery_blockers(connection: &Connection) -> Result<Vec<RecoveryBlocker>, JournalError> {
+    let mut statement = connection.prepare(
+        "SELECT kind, state, problem_code, COUNT(*)
+         FROM (
+             SELECT 'mutation:' || command_kind AS kind,
+                    disposition AS state,
+                    problem_code
+             FROM operations
+             WHERE disposition IN ('unknown','blocked')
+
+             UNION ALL
+
+             SELECT 'incoming_cleanup' AS kind,
+                    state,
+                    problem_code
+             FROM incoming_cleanup_intents
+             WHERE state = 'blocked'
+
+             UNION ALL
+
+             SELECT 'release' AS kind,
+                    state,
+                    problem_code
+             FROM release_operations
+             WHERE state IN ('unknown_stop','unknown_delete','blocked')
+
+             UNION ALL
+
+             SELECT 'completion' AS kind,
+                    state,
+                    problem_code
+             FROM completion_operations
+             WHERE state IN (
+                 'unknown_stop',
+                 'unknown_archive',
+                 'unknown_archive_source_delete',
+                 'unknown_remove_record',
+                 'blocked'
+             )
+
+             UNION ALL
+
+             SELECT 'completion_file' AS kind,
+                    state,
+                    problem_code
+             FROM operation_files
+             WHERE state IN ('unknown_move','unknown_source_delete','blocked')
+         )
+         GROUP BY kind, state, problem_code
+         ORDER BY kind, state, COALESCE(problem_code, '')",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    })?;
+
+    let mut blockers = Vec::new();
+    for row in rows {
+        let (kind, state, problem_code, count) = row?;
+        let count = u64::try_from(count)
+            .map_err(|_| JournalError::InvalidState("negative recovery blocker count".into()))?;
+        blockers.push(RecoveryBlocker {
+            kind,
+            state,
+            problem_code,
+            count,
+        });
+    }
+    Ok(blockers)
+}
+
 fn configure(connection: &Connection) -> Result<(), JournalError> {
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "synchronous", "FULL")?;
@@ -2354,6 +3161,11 @@ fn migrate(connection: &mut Connection) -> Result<(), JournalError> {
     if version == 5 {
         migrate_v5_to_v6(connection)?;
         version = 6;
+    }
+
+    if version == 6 {
+        migrate_v6_to_v7(connection)?;
+        version = 7;
     }
 
     if version != SCHEMA_VERSION {
@@ -2691,6 +3503,129 @@ fn migrate_v5_to_v6(connection: &mut Connection) -> Result<(), JournalError> {
     Ok(())
 }
 
+fn migrate_v6_to_v7(connection: &mut Connection) -> Result<(), JournalError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE completion_operations (
+            operation_id TEXT PRIMARY KEY,
+            request_id TEXT NOT NULL UNIQUE,
+            fingerprint_version INTEGER NOT NULL,
+            completion_fingerprint BLOB NOT NULL CHECK(length(completion_fingerprint) = 32),
+            registry_id TEXT NOT NULL REFERENCES torrent_registry(registry_id),
+            torrent_id TEXT NOT NULL CHECK(length(torrent_id) = 40),
+            identity_v1 BLOB CHECK(identity_v1 IS NULL OR length(identity_v1) = 20),
+            identity_v2 BLOB CHECK(identity_v2 IS NULL OR length(identity_v2) = 32),
+            source_relative TEXT NOT NULL CHECK(length(source_relative) > 0),
+            source_volume_id BLOB NOT NULL CHECK(length(source_volume_id) = 8),
+            source_file_id BLOB NOT NULL CHECK(length(source_file_id) = 8),
+            source_size BLOB NOT NULL CHECK(length(source_size) = 8),
+            source_modified_marker BLOB NOT NULL CHECK(length(source_modified_marker) = 16),
+            source_metainfo_digest BLOB NOT NULL CHECK(length(source_metainfo_digest) = 32),
+            working_volume_id BLOB NOT NULL CHECK(length(working_volume_id) = 8),
+            completed_volume_id BLOB NOT NULL CHECK(length(completed_volume_id) = 8),
+            archive_volume_id BLOB NOT NULL CHECK(length(archive_volume_id) = 8),
+            working_save_path TEXT NOT NULL CHECK(length(working_save_path) > 0),
+            total_bytes BLOB NOT NULL CHECK(length(total_bytes) = 8),
+            payload_strategy TEXT NOT NULL CHECK(payload_strategy IN ('same_volume','cross_volume')),
+            archive_strategy TEXT NOT NULL CHECK(archive_strategy IN ('same_volume','cross_volume')),
+            archive_destination_volume_id BLOB CHECK(archive_destination_volume_id IS NULL OR length(archive_destination_volume_id) = 8),
+            archive_destination_file_id BLOB CHECK(archive_destination_file_id IS NULL OR length(archive_destination_file_id) = 8),
+            archive_destination_size BLOB CHECK(archive_destination_size IS NULL OR length(archive_destination_size) = 8),
+            archive_destination_modified_marker BLOB CHECK(archive_destination_modified_marker IS NULL OR length(archive_destination_modified_marker) = 16),
+            archive_destination_sha256 BLOB CHECK(archive_destination_sha256 IS NULL OR length(archive_destination_sha256) = 32),
+            state TEXT NOT NULL CHECK(state IN (
+                'prepared',
+                'stop_pending',
+                'unknown_stop',
+                'stopped',
+                'archive_pending',
+                'unknown_archive',
+                'archive_source_delete_pending',
+                'unknown_archive_source_delete',
+                'payload_pending',
+                'remove_record_pending',
+                'unknown_remove_record',
+                'finished',
+                'blocked',
+                'failed'
+            )),
+            problem_code TEXT,
+            revision INTEGER NOT NULL CHECK(revision > 0),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            finished_at TEXT,
+            CHECK(identity_v1 IS NOT NULL OR identity_v2 IS NOT NULL)
+        );
+
+        CREATE UNIQUE INDEX completion_active_registry_idx
+        ON completion_operations(registry_id)
+        WHERE state NOT IN ('finished','blocked','failed');
+
+        CREATE INDEX completion_recovery_idx
+        ON completion_operations(state, created_at, operation_id);
+
+        CREATE TABLE completion_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operation_id TEXT NOT NULL REFERENCES completion_operations(operation_id),
+            revision INTEGER NOT NULL CHECK(revision > 0),
+            event_kind TEXT NOT NULL,
+            state TEXT NOT NULL,
+            problem_code TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(operation_id, revision)
+        );
+
+        CREATE TABLE operation_files (
+            operation_id TEXT NOT NULL REFERENCES completion_operations(operation_id),
+            file_index INTEGER NOT NULL CHECK(file_index >= 0),
+            relative_path TEXT NOT NULL CHECK(length(relative_path) > 0),
+            expected_size BLOB NOT NULL CHECK(length(expected_size) = 8),
+            source_volume_id BLOB NOT NULL CHECK(length(source_volume_id) = 8),
+            source_file_id BLOB NOT NULL CHECK(length(source_file_id) = 8),
+            source_size BLOB NOT NULL CHECK(length(source_size) = 8),
+            source_modified_marker BLOB NOT NULL CHECK(length(source_modified_marker) = 16),
+            handoff_strategy TEXT NOT NULL CHECK(handoff_strategy IN ('same_volume','cross_volume')),
+            state TEXT NOT NULL CHECK(state IN (
+                'prepared',
+                'move_pending',
+                'unknown_move',
+                'destination_receipted',
+                'source_delete_pending',
+                'unknown_source_delete',
+                'handed_off',
+                'blocked',
+                'failed'
+            )),
+            temp_relative TEXT,
+            destination_volume_id BLOB CHECK(destination_volume_id IS NULL OR length(destination_volume_id) = 8),
+            destination_file_id BLOB CHECK(destination_file_id IS NULL OR length(destination_file_id) = 8),
+            destination_size BLOB CHECK(destination_size IS NULL OR length(destination_size) = 8),
+            destination_modified_marker BLOB CHECK(destination_modified_marker IS NULL OR length(destination_modified_marker) = 16),
+            destination_sha256 BLOB CHECK(destination_sha256 IS NULL OR length(destination_sha256) = 32),
+            problem_code TEXT,
+            revision INTEGER NOT NULL CHECK(revision > 0),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(operation_id, file_index)
+        );
+
+        CREATE UNIQUE INDEX operation_files_path_idx
+        ON operation_files(operation_id, relative_path COLLATE NOCASE);
+
+        UPDATE schema_meta
+        SET schema_version = 7,
+            application_min_version = '0.1.0',
+            migrated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE singleton = 1;
+
+        PRAGMA user_version = 7;
+        "#,
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn has_user_tables(connection: &Connection) -> Result<bool, JournalError> {
     let table: Option<String> = connection
         .query_row(
@@ -2935,6 +3870,1246 @@ fn load_registry_record(
         handoff_file_count,
         handoff_receipt_count,
     }))
+}
+
+struct StoredCompletionRow {
+    request_id: String,
+    operation_id: String,
+    registry_id: String,
+    torrent_id: String,
+    identity_v1: Option<Vec<u8>>,
+    identity_v2: Option<Vec<u8>>,
+    source_relative: String,
+    source_volume_id: Vec<u8>,
+    source_file_id: Vec<u8>,
+    source_size: Vec<u8>,
+    source_modified_marker: Vec<u8>,
+    source_metainfo_digest: Vec<u8>,
+    working_volume_id: Vec<u8>,
+    completed_volume_id: Vec<u8>,
+    archive_volume_id: Vec<u8>,
+    working_save_path: String,
+    total_bytes: Vec<u8>,
+    archive_destination_volume_id: Option<Vec<u8>>,
+    archive_destination_file_id: Option<Vec<u8>>,
+    archive_destination_size: Option<Vec<u8>>,
+    archive_destination_modified_marker: Option<Vec<u8>>,
+    archive_destination_sha256: Option<Vec<u8>>,
+    state: String,
+    problem_code: Option<String>,
+    revision: u64,
+}
+
+fn load_completion_record(
+    connection: &Connection,
+    operation_id: &str,
+) -> Result<Option<CompletionRecord>, JournalError> {
+    let row: Option<StoredCompletionRow> = connection
+        .query_row(
+            "SELECT request_id,
+                    operation_id,
+                    registry_id,
+                    torrent_id,
+                    identity_v1,
+                    identity_v2,
+                    source_relative,
+                    source_volume_id,
+                    source_file_id,
+                    source_size,
+                    source_modified_marker,
+                    source_metainfo_digest,
+                    working_volume_id,
+                    completed_volume_id,
+                    archive_volume_id,
+                    working_save_path,
+                    total_bytes,
+                    archive_destination_volume_id,
+                    archive_destination_file_id,
+                    archive_destination_size,
+                    archive_destination_modified_marker,
+                    archive_destination_sha256,
+                    state,
+                    problem_code,
+                    revision
+             FROM completion_operations
+             WHERE operation_id = ?1",
+            [operation_id],
+            |row| {
+                Ok(StoredCompletionRow {
+                    request_id: row.get(0)?,
+                    operation_id: row.get(1)?,
+                    registry_id: row.get(2)?,
+                    torrent_id: row.get(3)?,
+                    identity_v1: row.get(4)?,
+                    identity_v2: row.get(5)?,
+                    source_relative: row.get(6)?,
+                    source_volume_id: row.get(7)?,
+                    source_file_id: row.get(8)?,
+                    source_size: row.get(9)?,
+                    source_modified_marker: row.get(10)?,
+                    source_metainfo_digest: row.get(11)?,
+                    working_volume_id: row.get(12)?,
+                    completed_volume_id: row.get(13)?,
+                    archive_volume_id: row.get(14)?,
+                    working_save_path: row.get(15)?,
+                    total_bytes: row.get(16)?,
+                    archive_destination_volume_id: row.get(17)?,
+                    archive_destination_file_id: row.get(18)?,
+                    archive_destination_size: row.get(19)?,
+                    archive_destination_modified_marker: row.get(20)?,
+                    archive_destination_sha256: row.get(21)?,
+                    state: row.get(22)?,
+                    problem_code: row.get(23)?,
+                    revision: row.get(24)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let request_id = RequestId::new(row.request_id)
+        .map_err(|error| JournalError::InvalidState(error.to_string()))?;
+    let operation_id = OperationId::new(row.operation_id)
+        .map_err(|error| JournalError::InvalidState(error.to_string()))?;
+    let torrent_id = TorrentId::new(row.torrent_id)
+        .map_err(|error| JournalError::InvalidState(error.to_string()))?;
+    let identity_v1 = row
+        .identity_v1
+        .map(|value| {
+            value.try_into().map_err(|value: Vec<u8>| {
+                JournalError::InvalidState(format!(
+                    "completion v1 identity has {} bytes instead of 20",
+                    value.len()
+                ))
+            })
+        })
+        .transpose()?;
+    let identity_v2 = row
+        .identity_v2
+        .map(|value| {
+            value.try_into().map_err(|value: Vec<u8>| {
+                JournalError::InvalidState(format!(
+                    "completion v2 identity has {} bytes instead of 32",
+                    value.len()
+                ))
+            })
+        })
+        .transpose()?;
+    let identity = TorrentIdentity::new(identity_v1, identity_v2)
+        .ok_or_else(|| JournalError::InvalidState("completion has no torrent identity".into()))?;
+    let source_metainfo_digest: [u8; 32] =
+        row.source_metainfo_digest
+            .try_into()
+            .map_err(|value: Vec<u8>| {
+                JournalError::InvalidState(format!(
+                    "completion source digest has {} bytes instead of 32",
+                    value.len()
+                ))
+            })?;
+    let state = parse_completion_state(&row.state).ok_or_else(|| {
+        JournalError::InvalidState(format!("unknown completion state '{}'", row.state))
+    })?;
+
+    let mut statement = connection.prepare(
+        "SELECT file_index,
+                relative_path,
+                expected_size,
+                source_volume_id,
+                source_file_id,
+                source_size,
+                source_modified_marker,
+                handoff_strategy,
+                state,
+                destination_volume_id,
+                destination_file_id,
+                destination_size,
+                destination_modified_marker,
+                destination_sha256,
+                problem_code,
+                revision
+         FROM operation_files
+         WHERE operation_id = ?1
+         ORDER BY file_index",
+    )?;
+    let rows = statement.query_map([operation_id.as_str()], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+            row.get::<_, Vec<u8>>(3)?,
+            row.get::<_, Vec<u8>>(4)?,
+            row.get::<_, Vec<u8>>(5)?,
+            row.get::<_, Vec<u8>>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, String>(8)?,
+            row.get::<_, Option<Vec<u8>>>(9)?,
+            row.get::<_, Option<Vec<u8>>>(10)?,
+            row.get::<_, Option<Vec<u8>>>(11)?,
+            row.get::<_, Option<Vec<u8>>>(12)?,
+            row.get::<_, Option<Vec<u8>>>(13)?,
+            row.get::<_, Option<String>>(14)?,
+            row.get::<_, u64>(15)?,
+        ))
+    })?;
+
+    let mut files = Vec::new();
+    for row in rows {
+        let (
+            file_index,
+            relative_path,
+            expected_size,
+            source_volume_id,
+            source_file_id,
+            source_size,
+            source_modified_marker,
+            strategy,
+            state,
+            destination_volume_id,
+            destination_file_id,
+            destination_size,
+            destination_modified_marker,
+            destination_sha256,
+            problem_code,
+            revision,
+        ) = row?;
+        let index = u32::try_from(file_index)
+            .map_err(|_| JournalError::InvalidState("completion file index is negative".into()))?;
+        let strategy = parse_completion_strategy(&strategy).ok_or_else(|| {
+            JournalError::InvalidState(format!("unknown completion handoff strategy '{strategy}'"))
+        })?;
+        let state = parse_completion_file_state(&state).ok_or_else(|| {
+            JournalError::InvalidState(format!("unknown completion file state '{state}'"))
+        })?;
+        files.push(CompletionFileRecord {
+            index,
+            relative_path,
+            size: decode_u64_blob(&expected_size, "expected_size")?,
+            source_evidence: qb_application::storage::FileEvidence {
+                identity: qb_application::storage::FileIdentity {
+                    volume_id: decode_u64_blob(&source_volume_id, "source_volume_id")?,
+                    file_id: decode_u64_blob(&source_file_id, "source_file_id")?,
+                },
+                size: decode_u64_blob(&source_size, "source_size")?,
+                modified_marker: decode_u128_blob(
+                    &source_modified_marker,
+                    "source_modified_marker",
+                )?,
+            },
+            strategy,
+            state,
+            destination_evidence: decode_optional_file_evidence(
+                destination_volume_id.as_deref(),
+                destination_file_id.as_deref(),
+                destination_size.as_deref(),
+                destination_modified_marker.as_deref(),
+                "destination",
+            )?,
+            destination_sha256: destination_sha256
+                .map(|value| {
+                    value.try_into().map_err(|value: Vec<u8>| {
+                        JournalError::InvalidState(format!(
+                            "completion destination sha256 has {} bytes instead of 32",
+                            value.len()
+                        ))
+                    })
+                })
+                .transpose()?,
+            problem_code,
+            revision,
+        });
+    }
+
+    Ok(Some(CompletionRecord {
+        request_id,
+        operation_id,
+        registry_id: row.registry_id,
+        torrent_id,
+        identity,
+        source_relative: row.source_relative,
+        source_evidence: qb_application::storage::FileEvidence {
+            identity: qb_application::storage::FileIdentity {
+                volume_id: decode_u64_blob(&row.source_volume_id, "source_volume_id")?,
+                file_id: decode_u64_blob(&row.source_file_id, "source_file_id")?,
+            },
+            size: decode_u64_blob(&row.source_size, "source_size")?,
+            modified_marker: decode_u128_blob(
+                &row.source_modified_marker,
+                "source_modified_marker",
+            )?,
+        },
+        source_metainfo_digest,
+        working_volume_id: decode_u64_blob(&row.working_volume_id, "working_volume_id")?,
+        completed_volume_id: decode_u64_blob(&row.completed_volume_id, "completed_volume_id")?,
+        archive_volume_id: decode_u64_blob(&row.archive_volume_id, "archive_volume_id")?,
+        working_save_path: row.working_save_path,
+        total_bytes: decode_u64_blob(&row.total_bytes, "total_bytes")?,
+        archive_destination_evidence: decode_optional_file_evidence(
+            row.archive_destination_volume_id.as_deref(),
+            row.archive_destination_file_id.as_deref(),
+            row.archive_destination_size.as_deref(),
+            row.archive_destination_modified_marker.as_deref(),
+            "archive_destination",
+        )?,
+        archive_sha256: row
+            .archive_destination_sha256
+            .map(|value| {
+                value.try_into().map_err(|value: Vec<u8>| {
+                    JournalError::InvalidState(format!(
+                        "archive destination sha256 has {} bytes instead of 32",
+                        value.len()
+                    ))
+                })
+            })
+            .transpose()?,
+        state,
+        problem_code: row.problem_code,
+        revision: row.revision,
+        files,
+    }))
+}
+
+fn completion_strategy_name(strategy: CompletionHandoffStrategy) -> &'static str {
+    match strategy {
+        CompletionHandoffStrategy::SameVolume => "same_volume",
+        CompletionHandoffStrategy::CrossVolume => "cross_volume",
+    }
+}
+
+fn parse_completion_strategy(value: &str) -> Option<CompletionHandoffStrategy> {
+    match value {
+        "same_volume" => Some(CompletionHandoffStrategy::SameVolume),
+        "cross_volume" => Some(CompletionHandoffStrategy::CrossVolume),
+        _ => None,
+    }
+}
+
+fn completion_state_name(state: CompletionState) -> &'static str {
+    match state {
+        CompletionState::Prepared => "prepared",
+        CompletionState::StopPending => "stop_pending",
+        CompletionState::UnknownStop => "unknown_stop",
+        CompletionState::Stopped => "stopped",
+        CompletionState::ArchivePending => "archive_pending",
+        CompletionState::UnknownArchive => "unknown_archive",
+        CompletionState::ArchiveSourceDeletePending => "archive_source_delete_pending",
+        CompletionState::UnknownArchiveSourceDelete => "unknown_archive_source_delete",
+        CompletionState::PayloadPending => "payload_pending",
+        CompletionState::RemoveRecordPending => "remove_record_pending",
+        CompletionState::UnknownRemoveRecord => "unknown_remove_record",
+        CompletionState::Finished => "finished",
+        CompletionState::Blocked => "blocked",
+        CompletionState::Failed => "failed",
+    }
+}
+
+fn parse_completion_state(value: &str) -> Option<CompletionState> {
+    match value {
+        "prepared" => Some(CompletionState::Prepared),
+        "stop_pending" => Some(CompletionState::StopPending),
+        "unknown_stop" => Some(CompletionState::UnknownStop),
+        "stopped" => Some(CompletionState::Stopped),
+        "archive_pending" => Some(CompletionState::ArchivePending),
+        "unknown_archive" => Some(CompletionState::UnknownArchive),
+        "archive_source_delete_pending" => Some(CompletionState::ArchiveSourceDeletePending),
+        "unknown_archive_source_delete" => Some(CompletionState::UnknownArchiveSourceDelete),
+        "payload_pending" => Some(CompletionState::PayloadPending),
+        "remove_record_pending" => Some(CompletionState::RemoveRecordPending),
+        "unknown_remove_record" => Some(CompletionState::UnknownRemoveRecord),
+        "finished" => Some(CompletionState::Finished),
+        "blocked" => Some(CompletionState::Blocked),
+        "failed" => Some(CompletionState::Failed),
+        _ => None,
+    }
+}
+
+fn parse_completion_file_state(value: &str) -> Option<CompletionFileState> {
+    match value {
+        "prepared" => Some(CompletionFileState::Prepared),
+        "move_pending" => Some(CompletionFileState::MovePending),
+        "unknown_move" => Some(CompletionFileState::UnknownMove),
+        "destination_receipted" => Some(CompletionFileState::DestinationReceipted),
+        "source_delete_pending" => Some(CompletionFileState::SourceDeletePending),
+        "unknown_source_delete" => Some(CompletionFileState::UnknownSourceDelete),
+        "handed_off" => Some(CompletionFileState::HandedOff),
+        "blocked" => Some(CompletionFileState::Blocked),
+        "failed" => Some(CompletionFileState::Failed),
+        _ => None,
+    }
+}
+
+fn insert_completion_event(
+    transaction: &Transaction<'_>,
+    operation_id: &str,
+    revision: u64,
+    state: &str,
+    problem_code: Option<&str>,
+) -> Result<(), JournalError> {
+    transaction.execute(
+        "INSERT INTO completion_events(
+            operation_id, revision, event_kind, state, problem_code, created_at
+         ) VALUES (
+            ?1, ?2, ?3, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        params![operation_id, revision, state, problem_code],
+    )?;
+    Ok(())
+}
+
+fn transition_completion(
+    journal: &Journal,
+    operation_id: &OperationId,
+    expected: &[CompletionState],
+    next: CompletionState,
+    problem_code: Option<&str>,
+) -> Result<CompletionRecord, PortError> {
+    let mut connection = journal.connection.lock().expect("journal mutex poisoned");
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    let current = load_completion_record(&transaction, operation_id.as_str())
+        .map_err(map_port_error)?
+        .ok_or_else(|| PortError::new("COMPLETION_NOT_FOUND", operation_id.to_string()))?;
+
+    if current.state == next && current.problem_code.as_deref() == problem_code {
+        transaction
+            .commit()
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        return Ok(current);
+    }
+    if !expected.contains(&current.state) {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            format!(
+                "completion {} cannot move from {} to {}",
+                operation_id,
+                completion_state_name(current.state),
+                completion_state_name(next)
+            ),
+        ));
+    }
+
+    let revision = current
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| PortError::new("JOURNAL_STATE_INVALID", "completion revision overflow"))?;
+    let terminal = matches!(
+        next,
+        CompletionState::Finished | CompletionState::Blocked | CompletionState::Failed
+    );
+    let changed = transaction
+        .execute(
+            "UPDATE completion_operations
+             SET state = ?1,
+                 problem_code = ?2,
+                 revision = ?3,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 finished_at = CASE
+                     WHEN ?4 != 0 THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     ELSE NULL
+                 END
+             WHERE operation_id = ?5
+               AND revision = ?6
+               AND state = ?7",
+            params![
+                completion_state_name(next),
+                problem_code,
+                revision,
+                if terminal { 1_i64 } else { 0_i64 },
+                operation_id.as_str(),
+                current.revision,
+                completion_state_name(current.state),
+            ],
+        )
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    if changed != 1 {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            "completion operation changed concurrently",
+        ));
+    }
+
+    insert_completion_event(
+        &transaction,
+        operation_id.as_str(),
+        revision,
+        completion_state_name(next),
+        problem_code,
+    )
+    .map_err(map_port_error)?;
+    let record = load_completion_record(&transaction, operation_id.as_str())
+        .map_err(map_port_error)?
+        .ok_or_else(|| {
+            PortError::new(
+                "JOURNAL_STATE_INVALID",
+                "completion operation disappeared after transition",
+            )
+        })?;
+    transaction
+        .commit()
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    Ok(record)
+}
+
+fn finish_completion_payload(
+    journal: &Journal,
+    operation_id: &OperationId,
+) -> Result<CompletionRecord, PortError> {
+    let mut connection = journal.connection.lock().expect("journal mutex poisoned");
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    let current = load_completion_record(&transaction, operation_id.as_str())
+        .map_err(map_port_error)?
+        .ok_or_else(|| PortError::new("COMPLETION_NOT_FOUND", operation_id.to_string()))?;
+    if current.state != CompletionState::PayloadPending {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            "payload completion requires PayloadPending state",
+        ));
+    }
+    if current.files.is_empty()
+        || current
+            .files
+            .iter()
+            .any(|file| file.state != CompletionFileState::HandedOff)
+    {
+        return Err(PortError::new(
+            "PAYLOAD_RECEIPTS_INCOMPLETE",
+            "every completion file must be HandedOff before qBittorrent record removal",
+        ));
+    }
+
+    let revision = current
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| PortError::new("JOURNAL_STATE_INVALID", "completion revision overflow"))?;
+    let changed = transaction
+        .execute(
+            "UPDATE completion_operations
+             SET state = 'remove_record_pending',
+                 problem_code = NULL,
+                 revision = ?1,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE operation_id = ?2
+               AND revision = ?3
+               AND state = 'payload_pending'",
+            params![revision, operation_id.as_str(), current.revision],
+        )
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    if changed != 1 {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            "completion payload receipt gate changed concurrently",
+        ));
+    }
+    insert_completion_event(
+        &transaction,
+        operation_id.as_str(),
+        revision,
+        "remove_record_pending",
+        None,
+    )
+    .map_err(map_port_error)?;
+    let record = load_completion_record(&transaction, operation_id.as_str())
+        .map_err(map_port_error)?
+        .ok_or_else(|| {
+            PortError::new(
+                "JOURNAL_STATE_INVALID",
+                "completion disappeared after payload receipt gate",
+            )
+        })?;
+    transaction
+        .commit()
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    Ok(record)
+}
+
+fn finish_completion_operation(
+    journal: &Journal,
+    operation_id: &OperationId,
+) -> Result<CompletionRecord, PortError> {
+    let mut connection = journal.connection.lock().expect("journal mutex poisoned");
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    let current = load_completion_record(&transaction, operation_id.as_str())
+        .map_err(map_port_error)?
+        .ok_or_else(|| PortError::new("COMPLETION_NOT_FOUND", operation_id.to_string()))?;
+
+    if current.state == CompletionState::Finished {
+        transaction
+            .commit()
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        return Ok(current);
+    }
+    if !matches!(
+        current.state,
+        CompletionState::RemoveRecordPending | CompletionState::UnknownRemoveRecord
+    ) {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            "completion can finish only after qBittorrent record-removal intent",
+        ));
+    }
+    if current.archive_destination_evidence.is_none()
+        || current.archive_sha256.is_none()
+        || current.files.is_empty()
+        || current.files.iter().any(|file| {
+            file.state != CompletionFileState::HandedOff || file.destination_evidence.is_none()
+        })
+    {
+        return Err(PortError::new(
+            "HANDOFF_RECEIPTS_INCOMPLETE",
+            "completion cannot finish before Archive and every payload file have durable receipts",
+        ));
+    }
+
+    let registry = load_registry_record(&transaction, &current.registry_id)
+        .map_err(map_port_error)?
+        .ok_or_else(|| {
+            PortError::new(
+                "JOURNAL_STATE_INVALID",
+                "completion registry record disappeared before finish",
+            )
+        })?;
+    if registry.state != RegistryState::Processing
+        || registry.identity != current.identity
+        || registry.source_relative != current.source_relative
+        || registry.source_metainfo_digest != current.source_metainfo_digest
+    {
+        return Err(PortError::new(
+            "COMPLETION_REGISTRY_STALE",
+            "registry no longer matches the durable completion operation",
+        ));
+    }
+    let admission_operation_id = registry.operation_id.as_deref().ok_or_else(|| {
+        PortError::new(
+            "CAPACITY_OWNERSHIP_CONFLICT",
+            "processing registry has no admission capacity owner",
+        )
+    })?;
+
+    let active_reservation: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*)
+             FROM admission_reservations
+             WHERE operation_id = ?1
+               AND reservation_state = 'active'",
+            [admission_operation_id],
+            |row| row.get(0),
+        )
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    let retained_capacity: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*)
+             FROM retained_capacity
+             WHERE registry_id = ?1",
+            [&current.registry_id],
+            |row| row.get(0),
+        )
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    match (active_reservation, retained_capacity) {
+        (1, 0) => {
+            let changed = transaction
+                .execute(
+                    "UPDATE admission_reservations
+                     SET reservation_state = 'released',
+                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     WHERE operation_id = ?1
+                       AND reservation_state = 'active'",
+                    [admission_operation_id],
+                )
+                .map_err(JournalError::from)
+                .map_err(map_port_error)?;
+            if changed != 1 {
+                return Err(PortError::new(
+                    "CAPACITY_OWNERSHIP_CONFLICT",
+                    "completion could not release active Working capacity",
+                ));
+            }
+        }
+        (0, 1) => {
+            let changed = transaction
+                .execute(
+                    "DELETE FROM retained_capacity
+                     WHERE registry_id = ?1",
+                    [&current.registry_id],
+                )
+                .map_err(JournalError::from)
+                .map_err(map_port_error)?;
+            if changed != 1 {
+                return Err(PortError::new(
+                    "CAPACITY_OWNERSHIP_CONFLICT",
+                    "completion could not release retained Working capacity",
+                ));
+            }
+        }
+        _ => {
+            return Err(PortError::new(
+                "CAPACITY_OWNERSHIP_CONFLICT",
+                "completion requires exactly one active or retained Working capacity owner",
+            ));
+        }
+    }
+
+    let file_count = i64::try_from(current.files.len()).map_err(|_| {
+        PortError::new(
+            "JOURNAL_STATE_INVALID",
+            "completion file count does not fit registry storage",
+        )
+    })?;
+    let registry_changed = transaction
+        .execute(
+            "UPDATE torrent_registry
+             SET state = 'finished',
+                 operation_id = NULL,
+                 archive_ref = ?1,
+                 handoff_file_count = ?2,
+                 handoff_receipt_count = ?2,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE registry_id = ?3
+               AND state = 'processing'
+               AND operation_id = ?4",
+            params![
+                current.source_relative,
+                file_count,
+                current.registry_id,
+                admission_operation_id,
+            ],
+        )
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    if registry_changed != 1 {
+        return Err(PortError::new(
+            "JOURNAL_STATE_INVALID",
+            "completion could not atomically mark registry Finished",
+        ));
+    }
+
+    let revision = current
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| PortError::new("JOURNAL_STATE_INVALID", "completion revision overflow"))?;
+    let changed = transaction
+        .execute(
+            "UPDATE completion_operations
+             SET state = 'finished',
+                 problem_code = NULL,
+                 revision = ?1,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE operation_id = ?2
+               AND revision = ?3
+               AND state IN ('remove_record_pending','unknown_remove_record')",
+            params![revision, operation_id.as_str(), current.revision],
+        )
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    if changed != 1 {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            "completion changed concurrently while finishing",
+        ));
+    }
+    insert_completion_event(
+        &transaction,
+        operation_id.as_str(),
+        revision,
+        "finished",
+        None,
+    )
+    .map_err(map_port_error)?;
+
+    let record = load_completion_record(&transaction, operation_id.as_str())
+        .map_err(map_port_error)?
+        .ok_or_else(|| {
+            PortError::new(
+                "JOURNAL_STATE_INVALID",
+                "completion disappeared after finish",
+            )
+        })?;
+    transaction
+        .commit()
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    Ok(record)
+}
+
+fn receipt_completion_archive_destination(
+    journal: &Journal,
+    operation_id: &OperationId,
+    destination: &qb_application::storage::FileEvidence,
+    destination_sha256: [u8; 32],
+) -> Result<CompletionRecord, PortError> {
+    let mut connection = journal.connection.lock().expect("journal mutex poisoned");
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    let current = load_completion_record(&transaction, operation_id.as_str())
+        .map_err(map_port_error)?
+        .ok_or_else(|| PortError::new("COMPLETION_NOT_FOUND", operation_id.to_string()))?;
+    if !matches!(
+        current.state,
+        CompletionState::ArchivePending | CompletionState::UnknownArchive
+    ) {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            "Archive destination receipt requires ArchivePending or UnknownArchive",
+        ));
+    }
+    if destination.identity.volume_id != current.archive_volume_id
+        || destination.size != current.source_evidence.size
+    {
+        return Err(PortError::new(
+            "ARCHIVE_RECEIPT_INVALID",
+            "Archive destination evidence does not match the completion source",
+        ));
+    }
+    if current.archive_destination_evidence.as_ref() == Some(destination)
+        && current.archive_sha256 == Some(destination_sha256)
+    {
+        transaction
+            .commit()
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        return Ok(current);
+    }
+    if current.archive_destination_evidence.is_some() || current.archive_sha256.is_some() {
+        return Err(PortError::new(
+            "ARCHIVE_RECEIPT_CONFLICT",
+            "Archive destination receipt already exists with different evidence",
+        ));
+    }
+
+    let revision = current
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| PortError::new("JOURNAL_STATE_INVALID", "completion revision overflow"))?;
+    let changed = transaction
+        .execute(
+            "UPDATE completion_operations
+             SET archive_destination_volume_id = ?1,
+                 archive_destination_file_id = ?2,
+                 archive_destination_size = ?3,
+                 archive_destination_modified_marker = ?4,
+                 archive_destination_sha256 = ?5,
+                 problem_code = NULL,
+                 revision = ?6,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE operation_id = ?7
+               AND revision = ?8
+               AND state IN ('archive_pending','unknown_archive')",
+            params![
+                destination.identity.volume_id.to_be_bytes().as_slice(),
+                destination.identity.file_id.to_be_bytes().as_slice(),
+                destination.size.to_be_bytes().as_slice(),
+                destination.modified_marker.to_be_bytes().as_slice(),
+                destination_sha256.as_slice(),
+                revision,
+                operation_id.as_str(),
+                current.revision,
+            ],
+        )
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    if changed != 1 {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            "Archive destination receipt changed concurrently",
+        ));
+    }
+    insert_completion_event(
+        &transaction,
+        operation_id.as_str(),
+        revision,
+        completion_state_name(current.state),
+        None,
+    )
+    .map_err(map_port_error)?;
+    let record = load_completion_record(&transaction, operation_id.as_str())
+        .map_err(map_port_error)?
+        .ok_or_else(|| {
+            PortError::new(
+                "JOURNAL_STATE_INVALID",
+                "completion disappeared after Archive destination receipt",
+            )
+        })?;
+    transaction
+        .commit()
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    Ok(record)
+}
+
+fn begin_completion_archive_source_delete(
+    journal: &Journal,
+    operation_id: &OperationId,
+) -> Result<CompletionRecord, PortError> {
+    let mut connection = journal.connection.lock().expect("journal mutex poisoned");
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    let current = load_completion_record(&transaction, operation_id.as_str())
+        .map_err(map_port_error)?
+        .ok_or_else(|| PortError::new("COMPLETION_NOT_FOUND", operation_id.to_string()))?;
+
+    if current.state == CompletionState::ArchiveSourceDeletePending {
+        transaction
+            .commit()
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        return Ok(current);
+    }
+    if !matches!(
+        current.state,
+        CompletionState::ArchivePending | CompletionState::UnknownArchive
+    ) {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            "Archive source-delete intent requires ArchivePending or evidence-resolved UnknownArchive",
+        ));
+    }
+    if current.archive_destination_evidence.is_none() || current.archive_sha256.is_none() {
+        return Err(PortError::new(
+            "ARCHIVE_RECEIPT_INCOMPLETE",
+            "Archive source-delete intent requires a durable destination receipt",
+        ));
+    }
+
+    let revision = current
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| PortError::new("JOURNAL_STATE_INVALID", "completion revision overflow"))?;
+    let changed = transaction
+        .execute(
+            "UPDATE completion_operations
+             SET state = 'archive_source_delete_pending',
+                 problem_code = NULL,
+                 revision = ?1,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE operation_id = ?2
+               AND revision = ?3
+               AND state IN ('archive_pending','unknown_archive')
+               AND archive_destination_file_id IS NOT NULL
+               AND archive_destination_sha256 IS NOT NULL",
+            params![revision, operation_id.as_str(), current.revision],
+        )
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    if changed != 1 {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            "Archive source-delete intent changed concurrently",
+        ));
+    }
+    insert_completion_event(
+        &transaction,
+        operation_id.as_str(),
+        revision,
+        "archive_source_delete_pending",
+        None,
+    )
+    .map_err(map_port_error)?;
+    let record = load_completion_record(&transaction, operation_id.as_str())
+        .map_err(map_port_error)?
+        .ok_or_else(|| {
+            PortError::new(
+                "JOURNAL_STATE_INVALID",
+                "completion disappeared after Archive source-delete intent",
+            )
+        })?;
+    transaction
+        .commit()
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    Ok(record)
+}
+
+fn receipt_completion_archive(
+    journal: &Journal,
+    operation_id: &OperationId,
+    destination: &qb_application::storage::FileEvidence,
+    destination_sha256: [u8; 32],
+) -> Result<CompletionRecord, PortError> {
+    let mut connection = journal.connection.lock().expect("journal mutex poisoned");
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    let current = load_completion_record(&transaction, operation_id.as_str())
+        .map_err(map_port_error)?
+        .ok_or_else(|| PortError::new("COMPLETION_NOT_FOUND", operation_id.to_string()))?;
+    if !matches!(
+        current.state,
+        CompletionState::ArchivePending
+            | CompletionState::UnknownArchive
+            | CompletionState::ArchiveSourceDeletePending
+            | CompletionState::UnknownArchiveSourceDelete
+    ) {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            "archive receipt requires an Archive handoff/delete state",
+        ));
+    }
+    if destination.identity.volume_id != current.archive_volume_id
+        || destination.size != current.source_evidence.size
+    {
+        return Err(PortError::new(
+            "ARCHIVE_RECEIPT_INVALID",
+            "archive destination evidence does not match the completion source",
+        ));
+    }
+
+    let revision = current
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| PortError::new("JOURNAL_STATE_INVALID", "completion revision overflow"))?;
+    let changed = transaction
+        .execute(
+            "UPDATE completion_operations
+             SET archive_destination_volume_id = ?1,
+                 archive_destination_file_id = ?2,
+                 archive_destination_size = ?3,
+                 archive_destination_modified_marker = ?4,
+                 archive_destination_sha256 = ?5,
+                 state = 'payload_pending',
+                 problem_code = NULL,
+                 revision = ?6,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE operation_id = ?7
+               AND revision = ?8
+               AND state IN (
+                   'archive_pending',
+                   'unknown_archive',
+                   'archive_source_delete_pending',
+                   'unknown_archive_source_delete'
+               )",
+            params![
+                destination.identity.volume_id.to_be_bytes().as_slice(),
+                destination.identity.file_id.to_be_bytes().as_slice(),
+                destination.size.to_be_bytes().as_slice(),
+                destination.modified_marker.to_be_bytes().as_slice(),
+                destination_sha256.as_slice(),
+                revision,
+                operation_id.as_str(),
+                current.revision,
+            ],
+        )
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    if changed != 1 {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            "completion archive receipt changed concurrently",
+        ));
+    }
+    insert_completion_event(
+        &transaction,
+        operation_id.as_str(),
+        revision,
+        "payload_pending",
+        None,
+    )
+    .map_err(map_port_error)?;
+    let record = load_completion_record(&transaction, operation_id.as_str())
+        .map_err(map_port_error)?
+        .ok_or_else(|| {
+            PortError::new(
+                "JOURNAL_STATE_INVALID",
+                "completion disappeared after archive receipt",
+            )
+        })?;
+    transaction
+        .commit()
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    Ok(record)
+}
+
+fn transition_completion_file(
+    journal: &Journal,
+    operation_id: &OperationId,
+    file_index: u32,
+    next: CompletionFileState,
+    destination: Option<&qb_application::storage::FileEvidence>,
+    destination_sha256: Option<[u8; 32]>,
+    problem_code: Option<&str>,
+) -> Result<CompletionRecord, PortError> {
+    let mut connection = journal.connection.lock().expect("journal mutex poisoned");
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    let current = load_completion_record(&transaction, operation_id.as_str())
+        .map_err(map_port_error)?
+        .ok_or_else(|| PortError::new("COMPLETION_NOT_FOUND", operation_id.to_string()))?;
+    if current.state != CompletionState::PayloadPending {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            "file handoff requires completion PayloadPending state",
+        ));
+    }
+    let file = current
+        .files
+        .iter()
+        .find(|file| file.index == file_index)
+        .ok_or_else(|| PortError::new("COMPLETION_FILE_NOT_FOUND", file_index.to_string()))?;
+
+    if file.state == next
+        && file.problem_code.as_deref() == problem_code
+        && file.destination_evidence.as_ref() == destination
+        && file.destination_sha256 == destination_sha256
+    {
+        transaction
+            .commit()
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        return Ok(current);
+    }
+    let allowed = match next {
+        CompletionFileState::MovePending => matches!(
+            file.state,
+            CompletionFileState::Prepared | CompletionFileState::UnknownMove
+        ),
+        CompletionFileState::UnknownMove => file.state == CompletionFileState::MovePending,
+        CompletionFileState::DestinationReceipted => matches!(
+            file.state,
+            CompletionFileState::MovePending | CompletionFileState::UnknownMove
+        ),
+        CompletionFileState::SourceDeletePending => matches!(
+            file.state,
+            CompletionFileState::DestinationReceipted | CompletionFileState::UnknownSourceDelete
+        ),
+        CompletionFileState::UnknownSourceDelete => {
+            file.state == CompletionFileState::SourceDeletePending
+        }
+        CompletionFileState::HandedOff => matches!(
+            file.state,
+            CompletionFileState::MovePending
+                | CompletionFileState::UnknownMove
+                | CompletionFileState::SourceDeletePending
+                | CompletionFileState::UnknownSourceDelete
+        ),
+        CompletionFileState::Blocked => matches!(
+            file.state,
+            CompletionFileState::Prepared
+                | CompletionFileState::MovePending
+                | CompletionFileState::UnknownMove
+                | CompletionFileState::DestinationReceipted
+                | CompletionFileState::SourceDeletePending
+                | CompletionFileState::UnknownSourceDelete
+        ),
+        _ => false,
+    };
+    if !allowed {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            format!(
+                "completion file {} cannot move from {} to {}",
+                file.relative_path,
+                completion_file_state_name(file.state),
+                completion_file_state_name(next)
+            ),
+        ));
+    }
+
+    let revision = file.revision.checked_add(1).ok_or_else(|| {
+        PortError::new("JOURNAL_STATE_INVALID", "completion file revision overflow")
+    })?;
+    let (destination_volume_id, destination_file_id, destination_size, destination_modified_marker) =
+        match destination {
+            Some(destination) => (
+                Some(destination.identity.volume_id.to_be_bytes().to_vec()),
+                Some(destination.identity.file_id.to_be_bytes().to_vec()),
+                Some(destination.size.to_be_bytes().to_vec()),
+                Some(destination.modified_marker.to_be_bytes().to_vec()),
+            ),
+            None => (None, None, None, None),
+        };
+    let destination_sha256 = destination_sha256.map(|value| value.to_vec());
+
+    let changed = transaction
+        .execute(
+            "UPDATE operation_files
+             SET state = ?1,
+                 destination_volume_id = COALESCE(?2, destination_volume_id),
+                 destination_file_id = COALESCE(?3, destination_file_id),
+                 destination_size = COALESCE(?4, destination_size),
+                 destination_modified_marker = COALESCE(?5, destination_modified_marker),
+                 destination_sha256 = COALESCE(?6, destination_sha256),
+                 problem_code = ?7,
+                 revision = ?8,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE operation_id = ?9
+               AND file_index = ?10
+               AND revision = ?11
+               AND state = ?12",
+            params![
+                completion_file_state_name(next),
+                destination_volume_id,
+                destination_file_id,
+                destination_size,
+                destination_modified_marker,
+                destination_sha256,
+                problem_code,
+                revision,
+                operation_id.as_str(),
+                i64::from(file_index),
+                file.revision,
+                completion_file_state_name(file.state),
+            ],
+        )
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    if changed != 1 {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            "completion file changed concurrently",
+        ));
+    }
+
+    let record = load_completion_record(&transaction, operation_id.as_str())
+        .map_err(map_port_error)?
+        .ok_or_else(|| {
+            PortError::new(
+                "JOURNAL_STATE_INVALID",
+                "completion disappeared after file transition",
+            )
+        })?;
+    transaction
+        .commit()
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    Ok(record)
+}
+
+fn completion_file_state_name(state: CompletionFileState) -> &'static str {
+    match state {
+        CompletionFileState::Prepared => "prepared",
+        CompletionFileState::MovePending => "move_pending",
+        CompletionFileState::UnknownMove => "unknown_move",
+        CompletionFileState::DestinationReceipted => "destination_receipted",
+        CompletionFileState::SourceDeletePending => "source_delete_pending",
+        CompletionFileState::UnknownSourceDelete => "unknown_source_delete",
+        CompletionFileState::HandedOff => "handed_off",
+        CompletionFileState::Blocked => "blocked",
+        CompletionFileState::Failed => "failed",
+    }
 }
 
 struct StoredCleanupRow {
@@ -3767,6 +5942,34 @@ fn load_admission_record(
     }))
 }
 
+fn decode_optional_file_evidence(
+    volume_id: Option<&[u8]>,
+    file_id: Option<&[u8]>,
+    size: Option<&[u8]>,
+    modified_marker: Option<&[u8]>,
+    prefix: &str,
+) -> Result<Option<qb_application::storage::FileEvidence>, JournalError> {
+    match (volume_id, file_id, size, modified_marker) {
+        (None, None, None, None) => Ok(None),
+        (Some(volume_id), Some(file_id), Some(size), Some(modified_marker)) => {
+            Ok(Some(qb_application::storage::FileEvidence {
+                identity: qb_application::storage::FileIdentity {
+                    volume_id: decode_u64_blob(volume_id, &format!("{prefix}_volume_id"))?,
+                    file_id: decode_u64_blob(file_id, &format!("{prefix}_file_id"))?,
+                },
+                size: decode_u64_blob(size, &format!("{prefix}_size"))?,
+                modified_marker: decode_u128_blob(
+                    modified_marker,
+                    &format!("{prefix}_modified_marker"),
+                )?,
+            }))
+        }
+        _ => Err(JournalError::InvalidState(format!(
+            "{prefix} evidence columns must be either all null or all present"
+        ))),
+    }
+}
+
 fn decode_u64_blob(bytes: &[u8], field: &str) -> Result<u64, JournalError> {
     let value: [u8; 8] = bytes
         .try_into()
@@ -4185,13 +6388,16 @@ mod tests {
                     'incoming_cleanup_events',
                     'release_operations',
                     'release_events',
-                    'retained_capacity'
+                    'retained_capacity',
+                    'completion_operations',
+                    'completion_events',
+                    'operation_files'
                  )",
                 [],
                 |row| row.get(0),
             )
             .expect("table count");
-        assert_eq!(table_count, 12);
+        assert_eq!(table_count, 15);
     }
 
     fn cleanup_intent() -> IncomingCleanupIntent {
@@ -4692,6 +6898,302 @@ mod tests {
             .expect("admission finished")
     }
 
+    fn completion_preflight(
+        admission: &AdmissionRecord,
+        request_id_value: &str,
+    ) -> CompletionPreflight {
+        CompletionPreflight {
+            request_id: RequestId::new(request_id_value).expect("request id"),
+            registry_id: admission.registry_id.clone(),
+            torrent_id: admission
+                .identity
+                .qbit_selector_ids()
+                .into_iter()
+                .next()
+                .expect("selector"),
+            identity: admission.identity.clone(),
+            source_relative: admission.source_relative.clone(),
+            source_evidence: admission.source_evidence.clone(),
+            source_metainfo_digest: admission.source_metainfo_digest,
+            working_volume_id: admission.working_volume_id,
+            completed_volume_id: admission.working_volume_id,
+            archive_volume_id: admission.source_evidence.identity.volume_id,
+            working_save_path: admission.working_save_path.clone(),
+            total_bytes: 4096,
+            files: vec![
+                qb_application::completion::CompletionFilePlan {
+                    relative_path: "dir/a.bin".into(),
+                    size: 1024,
+                    source_evidence: qb_application::storage::FileEvidence {
+                        identity: qb_application::storage::FileIdentity {
+                            volume_id: admission.working_volume_id,
+                            file_id: 101,
+                        },
+                        size: 1024,
+                        modified_marker: 1001,
+                    },
+                },
+                qb_application::completion::CompletionFilePlan {
+                    relative_path: "dir/b.bin".into(),
+                    size: 3072,
+                    source_evidence: qb_application::storage::FileEvidence {
+                        identity: qb_application::storage::FileIdentity {
+                            volume_id: admission.working_volume_id,
+                            file_id: 102,
+                        },
+                        size: 3072,
+                        modified_marker: 1002,
+                    },
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn completion_reservation_is_atomic_replayable_and_persists_file_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.sqlite");
+        let admission = {
+            let journal = Journal::open(&path).expect("journal");
+            finished_admission(&journal, "completion-admission")
+        };
+        let preflight = completion_preflight(&admission, "completion-request");
+
+        let operation_id = {
+            let journal = Journal::open(&path).expect("reopen");
+            let record = match journal
+                .reserve_completion(&preflight)
+                .expect("reserve completion")
+            {
+                CompletionReservation::New(record) => record,
+                other => panic!("unexpected completion reservation: {other:?}"),
+            };
+            assert_eq!(record.state, CompletionState::Prepared);
+            assert_eq!(record.registry_id, admission.registry_id);
+            assert_eq!(record.files.len(), 2);
+            assert_eq!(record.files[0].relative_path, "dir/a.bin");
+            assert_eq!(
+                record.files[0].strategy,
+                CompletionHandoffStrategy::SameVolume
+            );
+            assert_eq!(record.files[0].state, CompletionFileState::Prepared);
+
+            match journal
+                .reserve_completion(&preflight)
+                .expect("completion replay")
+            {
+                CompletionReservation::Replay(existing) => {
+                    assert_eq!(existing.operation_id, record.operation_id);
+                    assert_eq!(existing.files, record.files);
+                }
+                other => panic!("unexpected completion replay: {other:?}"),
+            }
+
+            let mut conflict = preflight.clone();
+            conflict.registry_id = "different-registry".into();
+            assert!(matches!(
+                journal
+                    .reserve_completion(&conflict)
+                    .expect("request conflict"),
+                CompletionReservation::Conflict { .. }
+            ));
+
+            let mut active = preflight.clone();
+            active.request_id = RequestId::new("completion-active-conflict").expect("request id");
+            assert!(matches!(
+                journal
+                    .reserve_completion(&active)
+                    .expect("active conflict"),
+                CompletionReservation::ActiveConflict { .. }
+            ));
+
+            record.operation_id
+        };
+
+        let reopened = Journal::open(&path).expect("reopen again");
+        let record = reopened
+            .get_completion(&operation_id)
+            .expect("get completion")
+            .expect("completion");
+        assert_eq!(record.files.len(), 2);
+        assert_eq!(record.total_bytes, 4096);
+
+        let recoverable = reopened
+            .list_recoverable_completions()
+            .expect("recoverable completions");
+        assert_eq!(recoverable.len(), 1);
+        assert_eq!(recoverable[0].operation_id, operation_id);
+    }
+
+    #[test]
+    fn completion_finish_atomically_closes_registry_and_capacity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.sqlite");
+        let admission = {
+            let journal = Journal::open(&path).expect("journal");
+            finished_admission(&journal, "completion-finish-admission")
+        };
+        let preflight = completion_preflight(&admission, "completion-finish-request");
+
+        let operation_id = {
+            let journal = Journal::open(&path).expect("reopen");
+            let record = match CompletionJournal::reserve_completion(&journal, &preflight)
+                .expect("reserve completion")
+            {
+                CompletionReservation::New(record) => record,
+                other => panic!("unexpected completion reservation: {other:?}"),
+            };
+
+            CompletionJournal::mark_stop_pending(&journal, &record.operation_id)
+                .expect("stop pending");
+            CompletionJournal::mark_stopped(&journal, &record.operation_id).expect("stopped");
+            CompletionJournal::mark_archive_pending(&journal, &record.operation_id)
+                .expect("archive pending");
+            CompletionJournal::mark_archive_receipted(
+                &journal,
+                &record.operation_id,
+                &record.source_evidence,
+                record.source_metainfo_digest,
+            )
+            .expect("archive receipted");
+
+            for file in &record.files {
+                CompletionJournal::mark_file_move_pending(
+                    &journal,
+                    &record.operation_id,
+                    file.index,
+                )
+                .expect("file pending");
+                CompletionJournal::mark_file_handed_off(
+                    &journal,
+                    &record.operation_id,
+                    file.index,
+                    &file.source_evidence,
+                    None,
+                )
+                .expect("file handed off");
+            }
+            let remove_pending =
+                CompletionJournal::mark_payload_handed_off(&journal, &record.operation_id)
+                    .expect("payload handed off");
+            assert_eq!(remove_pending.state, CompletionState::RemoveRecordPending);
+
+            let finished = CompletionJournal::finish_completion(&journal, &record.operation_id)
+                .expect("finish completion");
+            assert_eq!(finished.state, CompletionState::Finished);
+            record.operation_id
+        };
+
+        let reopened = Journal::open(&path).expect("reopen finished");
+        let completion = CompletionJournal::get_completion(&reopened, &operation_id)
+            .expect("completion lookup")
+            .expect("completion record");
+        assert_eq!(completion.state, CompletionState::Finished);
+
+        let registry = reopened
+            .find_by_identity(&admission.identity)
+            .expect("registry")
+            .expect("registry record");
+        assert_eq!(registry.state, RegistryState::Finished);
+        assert!(registry.operation_id.is_none());
+        assert_eq!(
+            registry.archive_ref.as_deref(),
+            Some(admission.source_relative.as_str())
+        );
+        assert_eq!(registry.handoff_file_count, 2);
+        assert_eq!(registry.handoff_receipt_count, 2);
+
+        assert!(reopened
+            .capacity_reservations(admission.working_volume_id)
+            .expect("capacity")
+            .is_empty());
+        assert!(CompletionJournal::list_recoverable_completions(&reopened)
+            .expect("recoverable completions")
+            .is_empty());
+    }
+
+    #[test]
+    fn completion_stop_transitions_are_durable_and_observation_driven() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.sqlite");
+        let admission = {
+            let journal = Journal::open(&path).expect("journal");
+            finished_admission(&journal, "completion-stop-admission")
+        };
+        let preflight = completion_preflight(&admission, "completion-stop-request");
+
+        let operation_id = {
+            let journal = Journal::open(&path).expect("reopen");
+            match journal
+                .reserve_completion(&preflight)
+                .expect("reserve completion")
+            {
+                CompletionReservation::New(record) => record.operation_id,
+                other => panic!("unexpected completion reservation: {other:?}"),
+            }
+        };
+
+        let journal = Journal::open(&path).expect("reopen transitions");
+        let pending =
+            CompletionJournal::mark_stop_pending(&journal, &operation_id).expect("stop pending");
+        assert_eq!(pending.state, CompletionState::StopPending);
+
+        let unknown =
+            CompletionJournal::mark_unknown_stop(&journal, &operation_id, "QBIT_STOP_UNCERTAIN")
+                .expect("unknown stop");
+        assert_eq!(unknown.state, CompletionState::UnknownStop);
+        assert_eq!(unknown.problem_code.as_deref(), Some("QBIT_STOP_UNCERTAIN"));
+
+        let retry = CompletionJournal::retry_stop(&journal, &operation_id).expect("retry stop");
+        assert_eq!(retry.state, CompletionState::Prepared);
+        assert!(retry.problem_code.is_none());
+
+        CompletionJournal::mark_stop_pending(&journal, &operation_id).expect("stop pending again");
+        let stopped = CompletionJournal::mark_stopped(&journal, &operation_id).expect("stopped");
+        assert_eq!(stopped.state, CompletionState::Stopped);
+
+        drop(journal);
+        let reopened = Journal::open(&path).expect("reopen stopped");
+        let recovered = reopened
+            .get_completion(&operation_id)
+            .expect("get completion")
+            .expect("completion");
+        assert_eq!(recovered.state, CompletionState::Stopped);
+        assert_eq!(recovered.files.len(), 2);
+    }
+
+    #[test]
+    fn recovery_blockers_report_durable_unknown_completion_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.sqlite");
+        let admission = {
+            let journal = Journal::open(&path).expect("journal");
+            finished_admission(&journal, "recovery-blocker-admission")
+        };
+        let preflight = completion_preflight(&admission, "recovery-blocker-request");
+
+        let journal = Journal::open(&path).expect("reopen");
+        let record = match CompletionJournal::reserve_completion(&journal, &preflight)
+            .expect("reserve completion")
+        {
+            CompletionReservation::New(record) => record,
+            other => panic!("unexpected completion reservation: {other:?}"),
+        };
+        CompletionJournal::mark_stop_pending(&journal, &record.operation_id).expect("stop pending");
+        CompletionJournal::mark_unknown_stop(&journal, &record.operation_id, "QBIT_STOP_UNCERTAIN")
+            .expect("unknown stop");
+
+        let blockers = JournalHealthPort::recovery_blockers(&journal).expect("recovery blockers");
+        assert_eq!(blockers.len(), 1);
+        assert_eq!(blockers[0].kind, "completion");
+        assert_eq!(blockers[0].state, "unknown_stop");
+        assert_eq!(
+            blockers[0].problem_code.as_deref(),
+            Some("QBIT_STOP_UNCERTAIN")
+        );
+        assert_eq!(blockers[0].count, 1);
+    }
+
     #[test]
     fn release_is_durable_and_transfers_capacity_without_losing_it() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4738,21 +7240,19 @@ mod tests {
         assert_eq!(recoverable.len(), 1);
         assert_eq!(recoverable[0].operation_id, release_operation);
 
-        let stop_pending = reopened
-            .mark_stop_pending(&release_operation)
-            .expect("stop pending");
+        let stop_pending =
+            ReleaseJournal::mark_stop_pending(&reopened, &release_operation).expect("stop pending");
         assert_eq!(stop_pending.state, ReleaseState::StopPending);
-        let unknown = reopened
-            .mark_unknown_stop(&release_operation, "QBIT_STOP_UNCERTAIN")
-            .expect("unknown stop");
+        let unknown =
+            ReleaseJournal::mark_unknown_stop(&reopened, &release_operation, "QBIT_STOP_UNCERTAIN")
+                .expect("unknown stop");
         assert_eq!(unknown.state, ReleaseState::UnknownStop);
-        let retry = reopened.retry_stop(&release_operation).expect("retry stop");
+        let retry = ReleaseJournal::retry_stop(&reopened, &release_operation).expect("retry stop");
         assert_eq!(retry.state, ReleaseState::Prepared);
 
-        reopened
-            .mark_stop_pending(&release_operation)
+        ReleaseJournal::mark_stop_pending(&reopened, &release_operation)
             .expect("stop pending again");
-        let stopped = reopened.mark_stopped(&release_operation).expect("stopped");
+        let stopped = ReleaseJournal::mark_stopped(&reopened, &release_operation).expect("stopped");
         assert_eq!(stopped.state, ReleaseState::Stopped);
         reopened
             .mark_delete_pending(&release_operation)
