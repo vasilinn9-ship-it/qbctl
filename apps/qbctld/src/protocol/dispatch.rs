@@ -20,18 +20,25 @@ use qb_proto::{
     PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 
+#[derive(Clone, Copy, Default)]
+pub struct OperationServices<'a> {
+    pub mutations: Option<&'a MutationService>,
+    pub completion: Option<&'a CompletionService>,
+}
+
 pub async fn dispatch(
     request: Request,
     system: &SystemService,
     storage: Option<&StorageStatusService>,
     torrents: Option<&TorrentService>,
-    mutations: Option<&MutationService>,
-    completion: Option<&CompletionService>,
+    operations: OperationServices<'_>,
     mutation_admission_enabled: bool,
     qbit_startup_problem: Option<&str>,
 ) -> Response {
     let sequence = request.sequence;
     let request_id = request.request_id.clone();
+    let mutations = operations.mutations;
+    let completion = operations.completion;
 
     match request.command {
         Some(request::Command::Capabilities(_)) => success(
@@ -946,7 +953,7 @@ mod tests {
     };
     use qb_proto::v1::{request, response, PauseTorrentRequest, Request, Status, StatusRequest};
 
-    use super::dispatch;
+    use super::{dispatch, OperationServices};
 
     struct FakeJournal;
 
@@ -991,7 +998,7 @@ mod tests {
             &system(),
             None,
             None,
-            None,
+            OperationServices::default(),
             false,
             None,
         )
@@ -1022,7 +1029,7 @@ mod tests {
             &system(),
             None,
             None,
-            None,
+            OperationServices::default(),
             false,
             None,
         )
@@ -1046,7 +1053,7 @@ mod tests {
             &system(),
             None,
             None,
-            None,
+            OperationServices::default(),
             false,
             None,
         )
