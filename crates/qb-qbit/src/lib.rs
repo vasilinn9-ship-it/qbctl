@@ -465,8 +465,12 @@ fn validate_base_url(value: &str) -> Result<Url, QbitBuildError> {
     let host = url
         .host_str()
         .ok_or_else(|| QbitBuildError::InvalidUrl("host is required".into()))?;
+    let ip_host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
     let loopback = host.eq_ignore_ascii_case("localhost")
-        || IpAddr::from_str(host).is_ok_and(|address| address.is_loopback());
+        || IpAddr::from_str(ip_host).is_ok_and(|address| address.is_loopback());
     if !loopback {
         return Err(QbitBuildError::InvalidUrl(
             "qBittorrent URL must use a loopback host".into(),
@@ -793,7 +797,11 @@ mod tests {
     fn tracker_identity_removes_path_and_passkey() {
         assert_eq!(
             redact_tracker_identity("https://tracker.example:443/announce/secret-passkey"),
-            "https://tracker.example:443"
+            "https://tracker.example"
+        );
+        assert_eq!(
+            redact_tracker_identity("https://tracker.example:8443/announce/secret-passkey"),
+            "https://tracker.example:8443"
         );
     }
 
@@ -828,11 +836,23 @@ mod tests {
         let requests = server.finish().await;
         assert_eq!(requests.len(), 3);
         assert!(requests[0].starts_with("POST /api/v2/auth/login HTTP/1.1"));
-        assert!(requests[0].contains("origin: http://127.0.0.1:"));
+        assert!(
+            requests[0]
+                .to_ascii_lowercase()
+                .contains("origin: http://127.0.0.1:")
+        );
         assert!(requests[0].contains("username=admin"));
         assert!(requests[0].contains("password=secret"));
-        assert!(requests[1].contains("cookie: SID=test-session"));
-        assert!(requests[2].contains("cookie: SID=test-session"));
+        assert!(
+            requests[1]
+                .to_ascii_lowercase()
+                .contains("cookie: sid=test-session")
+        );
+        assert!(
+            requests[2]
+                .to_ascii_lowercase()
+                .contains("cookie: sid=test-session")
+        );
     }
 
     #[tokio::test]
@@ -861,8 +881,16 @@ mod tests {
 
         let requests = server.finish().await;
         assert_eq!(requests.len(), 4);
-        assert!(requests[1].contains("cookie: SID=first"));
-        assert!(requests[3].contains("cookie: SID=second"));
+        assert!(
+            requests[1]
+                .to_ascii_lowercase()
+                .contains("cookie: sid=first")
+        );
+        assert!(
+            requests[3]
+                .to_ascii_lowercase()
+                .contains("cookie: sid=second")
+        );
     }
 
     #[tokio::test]
@@ -1166,7 +1194,7 @@ mod tests {
             data.extend_from_slice(&buffer[..read]);
         }
 
-        String::from_utf8_lossy(&data).to_ascii_lowercase()
+        String::from_utf8_lossy(&data).into_owned()
     }
 
     fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
