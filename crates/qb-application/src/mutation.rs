@@ -26,6 +26,7 @@ pub struct MutationRecord {
     pub disposition: MutationDisposition,
     pub pending_effect_kind: Option<String>,
     pub problem_code: Option<String>,
+    pub revision: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
