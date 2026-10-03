@@ -4,8 +4,7 @@ use qb_domain::torrent::{TorrentId, TorrentState};
 
 use crate::PortError;
 
-pub type PortFuture<'a, T> =
-    Pin<Box<dyn Future<Output = Result<T, PortError>> + Send + 'a>>;
+pub type PortFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, PortError>> + Send + 'a>>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QbitProbe {
@@ -105,7 +104,6 @@ pub trait TorrentClient: Send + Sync {
     fn network_preferences(&self) -> PortFuture<'_, NetworkPreferences>;
     fn trackers(&self, id: &TorrentId) -> PortFuture<'_, Vec<TrackerEvidence>>;
 }
-
 
 pub struct TorrentService {
     client: std::sync::Arc<dyn TorrentClient>,
