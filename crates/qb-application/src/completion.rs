@@ -129,6 +129,8 @@ pub trait CompletionJournal: Send + Sync {
         operation_id: &OperationId,
     ) -> Result<Option<CompletionRecord>, PortError>;
 
+    fn list_completions(&self) -> Result<Vec<CompletionRecord>, PortError>;
+
     fn list_recoverable_completions(&self) -> Result<Vec<CompletionRecord>, PortError>;
 
     fn mark_stop_pending(&self, operation_id: &OperationId) -> Result<CompletionRecord, PortError>;
@@ -720,6 +722,28 @@ impl CompletionService {
             executions.push(self.advance(record, true, false).await?);
         }
         Ok(executions)
+    }
+
+    pub fn list_operations(&self) -> Result<Vec<CompletionRecord>, PortError> {
+        self.journal.list_completions()
+    }
+
+    pub fn get_operation(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<CompletionRecord>, PortError> {
+        self.journal.get_completion(operation_id)
+    }
+
+    pub async fn recover_operation(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<CompletionExecution>, PortError> {
+        let _guard = self.lane.lock().await;
+        let Some(record) = self.journal.get_completion(operation_id)? else {
+            return Ok(None);
+        };
+        self.advance(record, true, true).await.map(Some)
     }
 
     async fn advance_reservation(
@@ -3325,6 +3349,16 @@ mod tests {
                 .as_ref()
                 .filter(|record| &record.operation_id == operation_id)
                 .cloned())
+        }
+
+        fn list_completions(&self) -> Result<Vec<CompletionRecord>, PortError> {
+            Ok(self
+                .record
+                .lock()
+                .expect("completion journal mutex")
+                .clone()
+                .into_iter()
+                .collect())
         }
 
         fn list_recoverable_completions(&self) -> Result<Vec<CompletionRecord>, PortError> {
