@@ -98,6 +98,7 @@ pub trait ReleaseJournal: Send + Sync {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReleaseExecutionStatus {
     Finished,
+    Retryable,
     Blocked,
     UnknownStop,
     UnknownDelete,
@@ -363,7 +364,13 @@ impl ReleaseService {
                     let pending = self.journal.mark_stop_pending(&record.operation_id)?;
                     match self.client.stop(&torrent.id).await {
                         EffectAttempt::NotSent(problem) => {
-                            return self.block(pending, problem, replayed);
+                            let retry = self.journal.retry_stop(&pending.operation_id)?;
+                            return Ok(execution(
+                                ReleaseExecutionStatus::Retryable,
+                                retry,
+                                Some(problem),
+                                replayed,
+                            ));
                         }
                         EffectAttempt::Rejected(problem) => {
                             let failed = self
@@ -401,7 +408,13 @@ impl ReleaseService {
                     let pending = self.journal.mark_delete_pending(&record.operation_id)?;
                     match self.client.remove_keep_files(&torrent.id).await {
                         EffectAttempt::NotSent(problem) => {
-                            return self.block(pending, problem, replayed);
+                            let retry = self.journal.retry_delete(&pending.operation_id)?;
+                            return Ok(execution(
+                                ReleaseExecutionStatus::Retryable,
+                                retry,
+                                Some(problem),
+                                replayed,
+                            ));
                         }
                         EffectAttempt::Rejected(problem) => {
                             let failed = self
