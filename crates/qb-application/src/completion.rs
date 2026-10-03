@@ -94,6 +94,8 @@ pub struct CompletionRecord {
     pub archive_volume_id: u64,
     pub working_save_path: String,
     pub total_bytes: u64,
+    pub archive_destination_evidence: Option<FileEvidence>,
+    pub archive_sha256: Option<[u8; 32]>,
     pub state: CompletionState,
     pub problem_code: Option<String>,
     pub revision: u64,
@@ -150,9 +152,24 @@ pub trait CompletionJournal: Send + Sync {
         problem_code: &str,
     ) -> Result<CompletionRecord, PortError>;
 
-    fn mark_payload_pending(
+    fn mark_archive_pending(
         &self,
         operation_id: &OperationId,
+    ) -> Result<CompletionRecord, PortError>;
+
+    fn mark_unknown_archive(
+        &self,
+        operation_id: &OperationId,
+        problem_code: &str,
+    ) -> Result<CompletionRecord, PortError>;
+
+    fn retry_archive(&self, operation_id: &OperationId) -> Result<CompletionRecord, PortError>;
+
+    fn mark_archive_receipted(
+        &self,
+        operation_id: &OperationId,
+        destination: &FileEvidence,
+        destination_sha256: [u8; 32],
     ) -> Result<CompletionRecord, PortError>;
 
     fn mark_file_move_pending(
@@ -1353,6 +1370,8 @@ mod tests {
                 archive_volume_id: preflight.archive_volume_id,
                 working_save_path: preflight.working_save_path.clone(),
                 total_bytes: preflight.total_bytes,
+                archive_destination_evidence: None,
+                archive_sha256: None,
                 state: CompletionState::Prepared,
                 problem_code: None,
                 revision: 1,
@@ -1484,16 +1503,70 @@ mod tests {
             )
         }
 
-        fn mark_payload_pending(
+        fn mark_archive_pending(
             &self,
             operation_id: &OperationId,
         ) -> Result<CompletionRecord, PortError> {
             self.transition(
                 operation_id,
                 &[CompletionState::Stopped],
-                CompletionState::PayloadPending,
+                CompletionState::ArchivePending,
                 None,
             )
+        }
+
+        fn mark_unknown_archive(
+            &self,
+            operation_id: &OperationId,
+            problem_code: &str,
+        ) -> Result<CompletionRecord, PortError> {
+            self.transition(
+                operation_id,
+                &[CompletionState::ArchivePending],
+                CompletionState::UnknownArchive,
+                Some(problem_code),
+            )
+        }
+
+        fn retry_archive(
+            &self,
+            operation_id: &OperationId,
+        ) -> Result<CompletionRecord, PortError> {
+            self.transition(
+                operation_id,
+                &[CompletionState::ArchivePending, CompletionState::UnknownArchive],
+                CompletionState::Stopped,
+                None,
+            )
+        }
+
+        fn mark_archive_receipted(
+            &self,
+            operation_id: &OperationId,
+            destination: &FileEvidence,
+            destination_sha256: [u8; 32],
+        ) -> Result<CompletionRecord, PortError> {
+            let mut state = self.record.lock().expect("completion journal mutex");
+            let record = state
+                .as_mut()
+                .ok_or_else(|| PortError::new("COMPLETION_NOT_FOUND", operation_id.to_string()))?;
+            if &record.operation_id != operation_id
+                || !matches!(
+                    record.state,
+                    CompletionState::ArchivePending | CompletionState::UnknownArchive
+                )
+            {
+                return Err(PortError::new(
+                    "OPERATION_TRANSITION_INVALID",
+                    "invalid fake archive receipt transition",
+                ));
+            }
+            record.archive_destination_evidence = Some(destination.clone());
+            record.archive_sha256 = Some(destination_sha256);
+            record.state = CompletionState::PayloadPending;
+            record.problem_code = None;
+            record.revision += 1;
+            Ok(record.clone())
         }
 
         fn mark_file_move_pending(
