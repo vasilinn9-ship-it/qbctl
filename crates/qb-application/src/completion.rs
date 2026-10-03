@@ -3618,7 +3618,10 @@ mod tests {
         ) -> Result<CompletionRecord, PortError> {
             self.transition(
                 operation_id,
-                &[CompletionState::ArchivePending],
+                &[
+                    CompletionState::ArchivePending,
+                    CompletionState::UnknownArchive,
+                ],
                 CompletionState::ArchiveSourceDeletePending,
                 None,
             )
@@ -3662,7 +3665,10 @@ mod tests {
             if &record.operation_id != operation_id
                 || !matches!(
                     record.state,
-                    CompletionState::ArchivePending | CompletionState::UnknownArchive
+                    CompletionState::ArchivePending
+                        | CompletionState::UnknownArchive
+                        | CompletionState::ArchiveSourceDeletePending
+                        | CompletionState::UnknownArchiveSourceDelete
                 )
             {
                 return Err(PortError::new(
@@ -4145,8 +4151,14 @@ mod tests {
                 .await
                 .expect("first cross-volume Archive completion"),
         );
-        assert_eq!(first.status, CompletionExecutionStatus::UnknownArchive);
-        assert_eq!(first.record.state, CompletionState::UnknownArchive);
+        assert_eq!(
+            first.status,
+            CompletionExecutionStatus::UnknownArchiveSourceDelete
+        );
+        assert_eq!(
+            first.record.state,
+            CompletionState::UnknownArchiveSourceDelete
+        );
         assert!(first.record.archive_destination_evidence.is_some());
         assert_eq!(storage.delete_calls.load(Ordering::SeqCst), 1);
 
@@ -4157,9 +4169,12 @@ mod tests {
         assert_eq!(recovered.len(), 1);
         assert_eq!(
             recovered[0].status,
-            CompletionExecutionStatus::UnknownArchive
+            CompletionExecutionStatus::UnknownArchiveSourceDelete
         );
-        assert_eq!(recovered[0].record.state, CompletionState::UnknownArchive);
+        assert_eq!(
+            recovered[0].record.state,
+            CompletionState::UnknownArchiveSourceDelete
+        );
         assert_eq!(storage.delete_calls.load(Ordering::SeqCst), 1);
 
         let replay = execution(
