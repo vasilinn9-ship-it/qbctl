@@ -8,6 +8,7 @@ fn main() {
                 "../../proto/common.proto",
                 "../../proto/torrent.proto",
                 "../../proto/system.proto",
+                "../../proto/storage.proto",
             ],
             &["../../proto"],
         )
@@ -16,4 +17,5 @@ fn main() {
     println!("cargo:rerun-if-changed=../../proto/common.proto");
     println!("cargo:rerun-if-changed=../../proto/torrent.proto");
     println!("cargo:rerun-if-changed=../../proto/system.proto");
+    println!("cargo:rerun-if-changed=../../proto/storage.proto");
 }
