@@ -1,6 +1,7 @@
 use std::{env, time::Duration};
 
-use qb_application::torrent::TorrentClient;
+use qb_application::torrent::{AddTorrentRequest, EffectAttempt, TorrentClient};
+use qb_domain::torrent::{TorrentId, TorrentState};
 use qb_qbit::{QbitClient, QbitCredentials};
 
 #[tokio::test]
@@ -56,4 +57,33 @@ async fn disposable_qbittorrent_authenticates_and_probes() {
         .await
         .expect("real network preferences");
     assert!(network.listen_port > 0, "real listen port must be non-zero");
+
+    let mut metainfo =
+        b"d4:infod6:lengthi4e4:name8:file.bin12:piece lengthi16384e6:pieces20:".to_vec();
+    metainfo.extend_from_slice(&[0_u8; 20]);
+    metainfo.extend_from_slice(b"ee");
+    let request = AddTorrentRequest {
+        metainfo,
+        save_path: "/downloads".into(),
+        stopped: true,
+    };
+    assert!(matches!(
+        client.add_torrent(&request).await,
+        EffectAttempt::Accepted
+    ));
+
+    let id = TorrentId::new("9a3b4b94ae398193bcc849dd8b2024f607c5c27a")
+        .expect("fixture torrent id");
+    let mut observed = None;
+    for _ in 0..30 {
+        if let Some(torrent) = client.get(&id).await.expect("observe added torrent") {
+            observed = Some(torrent);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let observed = observed.expect("added torrent must become observable");
+    assert_eq!(observed.id, id);
+    assert_eq!(observed.state, TorrentState::Stopped);
+    assert_eq!(observed.save_path.trim_end_matches('/'), "/downloads");
 }

@@ -16,6 +16,13 @@ pub enum EffectAttempt {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AddTorrentRequest {
+    pub metainfo: Vec<u8>,
+    pub save_path: String,
+    pub stopped: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QbitProbe {
     pub application_version: String,
     pub webapi_version: String,
@@ -65,6 +72,7 @@ pub struct NetworkPreferences {
 pub struct TorrentView {
     pub id: TorrentId,
     pub name: String,
+    pub save_path: String,
     pub state: TorrentState,
     pub total_bytes: u64,
     pub remaining_bytes: u64,
@@ -128,6 +136,7 @@ pub trait TorrentClient: Send + Sync {
     fn network_preferences(&self) -> PortFuture<'_, NetworkPreferences>;
     fn trackers<'a>(&'a self, id: &'a TorrentId) -> PortFuture<'a, Vec<TrackerEvidence>>;
     fn files<'a>(&'a self, id: &'a TorrentId) -> PortFuture<'a, Vec<FileObservation>>;
+    fn add_torrent<'a>(&'a self, request: &'a AddTorrentRequest) -> EffectFuture<'a>;
     fn stop<'a>(&'a self, id: &'a TorrentId) -> EffectFuture<'a>;
     fn start<'a>(&'a self, id: &'a TorrentId) -> EffectFuture<'a>;
     fn set_active_downloads(&self, value: u32) -> EffectFuture<'_>;
@@ -174,6 +183,10 @@ impl TorrentService {
 
     pub async fn files(&self, id: &TorrentId) -> Result<Vec<FileObservation>, PortError> {
         self.client.files(id).await
+    }
+
+    pub async fn add_torrent(&self, request: &AddTorrentRequest) -> EffectAttempt {
+        self.client.add_torrent(request).await
     }
 
     pub async fn stop(&self, id: &TorrentId) -> EffectAttempt {

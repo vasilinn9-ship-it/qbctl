@@ -2,15 +2,16 @@ use std::{net::IpAddr, str::FromStr, time::Duration};
 
 use qb_application::{
     torrent::{
-        ConnectionStatus, EffectAttempt, EffectFuture, FileObservation, NetworkPreferences,
-        PortFuture, QbitProbe, QueueSettings, TorrentClient, TorrentView, TrackerEvidence,
+        AddTorrentRequest, ConnectionStatus, EffectAttempt, EffectFuture, FileObservation,
+        NetworkPreferences, PortFuture, QbitProbe, QueueSettings, TorrentClient, TorrentView,
+        TrackerEvidence,
         TrackerStatus, TransferInfo,
     },
     PortError,
 };
 use qb_domain::torrent::{TorrentId, TorrentState};
 use reqwest::{
-    header::{COOKIE, ORIGIN, SET_COOKIE},
+    header::{CONTENT_TYPE, COOKIE, ORIGIN, SET_COOKIE},
     redirect::Policy,
     Response, StatusCode, Url,
 };
@@ -302,6 +303,71 @@ impl QbitClient {
         ))
     }
 
+    async fn add_torrent_inner(&self, request: &AddTorrentRequest) -> EffectAttempt {
+        let (content_type, body) = match build_add_multipart(request) {
+            Ok(value) => value,
+            Err(error) => return EffectAttempt::NotSent(error),
+        };
+
+        for attempt in 0..2 {
+            let session_cookie = match self.ensure_session().await {
+                Ok(session_cookie) => session_cookie,
+                Err(error) => return EffectAttempt::NotSent(map_port_error(error)),
+            };
+
+            let response = self
+                .http
+                .post(self.endpoint("torrents/add"))
+                .header(ORIGIN, &self.origin)
+                .header(COOKIE, session_cookie)
+                .header(CONTENT_TYPE, &content_type)
+                .body(body.clone())
+                .send()
+                .await;
+
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    return EffectAttempt::Uncertain(PortError::new(
+                        "QBIT_MUTATION_UNCERTAIN",
+                        error.to_string(),
+                    ));
+                }
+            };
+
+            if response.status() == StatusCode::FORBIDDEN && attempt == 0 {
+                *self.session_cookie.write().await = None;
+                continue;
+            }
+
+            if response.status().is_success() {
+                return EffectAttempt::Accepted;
+            }
+
+            if response.status().is_server_error() {
+                return EffectAttempt::Uncertain(PortError::new(
+                    "QBIT_MUTATION_UNCERTAIN",
+                    format!("qBittorrent returned HTTP {}", response.status()),
+                ));
+            }
+
+            let code = if response.status() == StatusCode::FORBIDDEN {
+                "QBIT_AUTH_FAILED"
+            } else {
+                "QBIT_MUTATION_REJECTED"
+            };
+            return EffectAttempt::Rejected(PortError::new(
+                code,
+                format!("qBittorrent returned HTTP {}", response.status()),
+            ));
+        }
+
+        EffectAttempt::Rejected(PortError::new(
+            "QBIT_AUTH_FAILED",
+            "qBittorrent authentication failed",
+        ))
+    }
+
     async fn stop_inner(&self, id: &TorrentId) -> EffectAttempt {
         let form = [("hashes", id.as_str().to_string())];
         self.mutation_post_form("torrents/stop", &form).await
@@ -422,6 +488,10 @@ impl TorrentClient for QbitClient {
         Box::pin(async move { self.files_inner(id).await.map_err(map_files_error) })
     }
 
+    fn add_torrent<'a>(&'a self, request: &'a AddTorrentRequest) -> EffectFuture<'a> {
+        Box::pin(async move { self.add_torrent_inner(request).await })
+    }
+
     fn stop<'a>(&'a self, id: &'a TorrentId) -> EffectFuture<'a> {
         Box::pin(async move { self.stop_inner(id).await })
     }
@@ -441,6 +511,66 @@ impl TorrentClient for QbitClient {
     fn set_upload_limit(&self, bytes_per_sec: u64) -> EffectFuture<'_> {
         Box::pin(async move { self.set_upload_limit_inner(bytes_per_sec).await })
     }
+}
+
+fn build_add_multipart(request: &AddTorrentRequest) -> Result<(String, Vec<u8>), PortError> {
+    const MAX_METAINFO_UPLOAD_BYTES: usize = 32 * 1024 * 1024;
+
+    if request.metainfo.is_empty() || request.metainfo.len() > MAX_METAINFO_UPLOAD_BYTES {
+        return Err(PortError::new(
+            "QBIT_REQUEST_INVALID",
+            "torrent metainfo is empty or exceeds the upload limit",
+        ));
+    }
+    if request.save_path.is_empty() || request.save_path.chars().any(char::is_control) {
+        return Err(PortError::new(
+            "QBIT_REQUEST_INVALID",
+            "managed qBittorrent save path is empty or contains control characters",
+        ));
+    }
+
+    let boundary = multipart_boundary(&request.metainfo);
+    let mut body = Vec::with_capacity(request.metainfo.len() + 1024);
+    append_text_part(&mut body, &boundary, "savepath", &request.save_path);
+    append_text_part(&mut body, &boundary, "autoTMM", "false");
+    append_text_part(
+        &mut body,
+        &boundary,
+        "stopped",
+        if request.stopped { "true" } else { "false" },
+    );
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        b"Content-Disposition: form-data; name=\"torrents\"; filename=\"upload.torrent\"\r\n",
+    );
+    body.extend_from_slice(b"Content-Type: application/x-bittorrent\r\n\r\n");
+    body.extend_from_slice(&request.metainfo);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+    Ok((format!("multipart/form-data; boundary={boundary}"), body))
+}
+
+fn multipart_boundary(bytes: &[u8]) -> String {
+    for nonce in 0_u32.. {
+        let boundary = format!("qbctl-v1-{:016x}-{nonce:08x}", bytes.len());
+        let marker = format!("\r\n--{boundary}");
+        if !bytes
+            .windows(marker.len())
+            .any(|window| window == marker.as_bytes())
+        {
+            return boundary;
+        }
+    }
+    unreachable!("u32 multipart boundary space exhausted")
+}
+
+fn append_text_part(body: &mut Vec<u8>, boundary: &str, name: &str, value: &str) {
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+    );
+    body.extend_from_slice(value.as_bytes());
+    body.extend_from_slice(b"\r\n");
 }
 
 fn validate_base_url(value: &str) -> Result<Url, QbitBuildError> {
@@ -544,6 +674,7 @@ fn map_torrent(row: TorrentDto) -> Result<TorrentView, QbitError> {
     Ok(TorrentView {
         id,
         name: sanitize_untrusted_text(&row.name, 1024),
+        save_path: sanitize_untrusted_text(&row.save_path, 32 * 1024),
         state: map_state(&row.state),
         total_bytes: nonnegative(row.total_size),
         remaining_bytes: nonnegative(row.amount_left),
@@ -719,6 +850,7 @@ fn map_port_error(error: QbitError) -> PortError {
 struct TorrentDto {
     hash: String,
     name: String,
+    save_path: String,
     state: String,
     total_size: i64,
     amount_left: i64,
@@ -998,7 +1130,7 @@ mod tests {
         let server = FakeHttpServer::spawn(vec![
             FakeResponse::ok("Ok.").with_header("Set-Cookie", "SID=test; HttpOnly"),
             FakeResponse::ok(
-                r#"[{"hash":"abcdef0123456789abcdef0123456789abcdef01","name":"sample","state":"futureState","total_size":100,"amount_left":25,"dlspeed":7,"upspeed":3,"progress":0.75,"availability":1.5,"peers":2,"peers_total":4,"seeds":1,"seeds_total":3}]"#,
+                r#"[{"hash":"abcdef0123456789abcdef0123456789abcdef01","name":"sample","save_path":"C:\\\\Working","state":"futureState","total_size":100,"amount_left":25,"dlspeed":7,"upspeed":3,"progress":0.75,"availability":1.5,"peers":2,"peers_total":4,"seeds":1,"seeds_total":3}]"#,
             ),
         ])
         .await;
@@ -1048,6 +1180,45 @@ mod tests {
         assert!(requests[1].to_ascii_lowercase().starts_with(
             "get /api/v2/torrents/files?hash=abcdef0123456789abcdef0123456789abcdef01 http/1.1"
         ));
+    }
+
+    #[tokio::test]
+    async fn add_uses_safe_multipart_fields_without_source_filename() {
+        let server = FakeHttpServer::spawn(vec![
+            FakeResponse::ok("Ok.").with_header("Set-Cookie", "SID=test; HttpOnly"),
+            FakeResponse::ok(r#"{"success_count":1,"pending_count":0,"failure_count":0,"added_torrent_ids":["abcdef0123456789abcdef0123456789abcdef01"]}"#),
+        ])
+        .await;
+        let client = QbitClient::new(
+            &server.url,
+            QbitCredentials::new("admin", "secret"),
+            Duration::from_secs(2),
+        )
+        .expect("client");
+        let request = AddTorrentRequest {
+            metainfo: b"d4:infod4:name4:testee".to_vec(),
+            save_path: r"C:\Managed\Working".into(),
+            stopped: true,
+        };
+
+        assert!(matches!(
+            client.add_torrent_inner(&request).await,
+            EffectAttempt::Accepted
+        ));
+
+        let requests = server.finish().await;
+        assert_eq!(requests.len(), 2);
+        let wire = &requests[1];
+        let lower = wire.to_ascii_lowercase();
+        assert!(lower.starts_with("post /api/v2/torrents/add http/1.1"));
+        assert!(lower.contains("content-type: multipart/form-data; boundary="));
+        assert!(wire.contains("name=\"torrents\"; filename=\"upload.torrent\""));
+        assert!(wire.contains("name=\"savepath\""));
+        assert!(wire.contains(r"C:\Managed\Working"));
+        assert!(wire.contains("name=\"autoTMM\""));
+        assert!(wire.contains("name=\"stopped\""));
+        assert!(wire.contains("\r\ntrue\r\n"));
+        assert!(!wire.contains("skip_checking"));
     }
 
     #[tokio::test]
