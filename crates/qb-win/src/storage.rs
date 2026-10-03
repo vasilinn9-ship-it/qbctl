@@ -167,13 +167,7 @@ impl ManagedStorage {
 
 impl Storage for ManagedStorage {
     fn volume_status(&self, root: ManagedRoot) -> Result<StorageVolumeStatus, PortError> {
-        let role = match root {
-            ManagedRoot::Incoming => ManagedRootRole::Incoming,
-            ManagedRoot::Archive => ManagedRootRole::Archive,
-            ManagedRoot::Working => ManagedRootRole::Working,
-            ManagedRoot::Completed => ManagedRootRole::Completed,
-            ManagedRoot::Runtime => ManagedRootRole::Runtime,
-        };
+        let role = managed_root_role(root);
         self.revalidate_root(role)?;
         let volume = self
             .roots
@@ -185,6 +179,21 @@ impl Storage for ManagedStorage {
             free_bytes: volume.free_bytes,
             total_bytes: volume.total_bytes,
         })
+    }
+
+    fn root_path(&self, root: ManagedRoot) -> Result<String, PortError> {
+        let role = managed_root_role(root);
+        self.revalidate_root(role)?;
+        self.roots
+            .path(role)
+            .to_str()
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                PortError::new(
+                    "STORAGE_PATH_INVALID",
+                    format!("{role:?} root cannot be represented as Unicode"),
+                )
+            })
     }
 
     fn list_incoming(&self) -> Result<Vec<String>, PortError> {
@@ -297,6 +306,16 @@ impl Storage for ManagedStorage {
             evidence: before,
             bytes,
         })
+    }
+}
+
+fn managed_root_role(root: ManagedRoot) -> ManagedRootRole {
+    match root {
+        ManagedRoot::Incoming => ManagedRootRole::Incoming,
+        ManagedRoot::Archive => ManagedRootRole::Archive,
+        ManagedRoot::Working => ManagedRootRole::Working,
+        ManagedRoot::Completed => ManagedRootRole::Completed,
+        ManagedRoot::Runtime => ManagedRootRole::Runtime,
     }
 }
 
@@ -978,6 +997,10 @@ mod tests {
         assert!(status.total_bytes > 0);
         assert!(status.free_bytes <= status.total_bytes);
         assert_eq!(status.total_bytes, volume.total_bytes);
+        let working_path = storage
+            .root_path(ManagedRoot::Working)
+            .expect("validated Working root path");
+        assert_eq!(Path::new(&working_path), storage.roots().path(ManagedRootRole::Working));
 
         fs::remove_dir_all(temp).expect("cleanup");
     }

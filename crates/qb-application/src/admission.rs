@@ -328,6 +328,11 @@ mod tests {
             })
         }
 
+        fn root_path(&self, root: ManagedRoot) -> Result<String, PortError> {
+            assert_eq!(root, ManagedRoot::Working);
+            Ok(r"C:\Managed\Working".into())
+        }
+
         fn list_incoming(&self) -> Result<Vec<String>, PortError> {
             Err(PortError::new(
                 "INTERNAL_INVARIANT_VIOLATION",

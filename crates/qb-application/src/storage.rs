@@ -49,6 +49,8 @@ pub struct StorageVolumeStatus {
 pub trait Storage: Send + Sync {
     fn volume_status(&self, root: ManagedRoot) -> Result<StorageVolumeStatus, PortError>;
 
+    fn root_path(&self, root: ManagedRoot) -> Result<String, PortError>;
+
     fn list_incoming(&self) -> Result<Vec<String>, PortError>;
 
     fn read_incoming(
@@ -444,6 +446,17 @@ mod tests {
             })
         }
 
+        fn root_path(&self, root: ManagedRoot) -> Result<String, PortError> {
+            Ok(match root {
+                ManagedRoot::Incoming => r"C:\Managed\Incoming",
+                ManagedRoot::Archive => r"C:\Managed\Archive",
+                ManagedRoot::Working => r"C:\Managed\Working",
+                ManagedRoot::Completed => r"C:\Managed\Completed",
+                ManagedRoot::Runtime => r"C:\Managed\Runtime",
+            }
+            .into())
+        }
+
         fn list_incoming(&self) -> Result<Vec<String>, PortError> {
             Ok(self
                 .files
@@ -483,6 +496,17 @@ mod tests {
                 free_bytes: 1_000_000,
                 total_bytes: 2_000_000,
             })
+        }
+
+        fn root_path(&self, root: ManagedRoot) -> Result<String, PortError> {
+            Ok(match root {
+                ManagedRoot::Incoming => r"C:\Managed\Incoming",
+                ManagedRoot::Archive => r"C:\Managed\Archive",
+                ManagedRoot::Working => r"C:\Managed\Working",
+                ManagedRoot::Completed => r"C:\Managed\Completed",
+                ManagedRoot::Runtime => r"C:\Managed\Runtime",
+            }
+            .into())
         }
 
         fn list_incoming(&self) -> Result<Vec<String>, PortError> {
