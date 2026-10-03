@@ -3,6 +3,7 @@ use qb_application::{
         MutationCommand, MutationExecution, MutationExecutionResult, MutationExecutionStatus,
         MutationService, TorrentControlAction,
     },
+    storage::StorageStatusService,
     system::SystemService,
     torrent::TorrentService,
     PortError,
@@ -20,6 +21,7 @@ use qb_proto::{
 pub async fn dispatch(
     request: Request,
     system: &SystemService,
+    storage: Option<&StorageStatusService>,
     torrents: Option<&TorrentService>,
     mutations: Option<&MutationService>,
     mutation_admission_enabled: bool,
@@ -47,6 +49,42 @@ pub async fn dispatch(
             ),
             Err(error) => port_error(sequence, request_id, error),
         },
+        Some(request::Command::StorageList(_)) => {
+            let Some(service) = storage else {
+                return state_problem(
+                    sequence,
+                    request_id,
+                    "STORAGE_NOT_CONFIGURED",
+                    "managed storage is not configured",
+                );
+            };
+            match service.list() {
+                Ok(roots) => success(
+                    sequence,
+                    request_id,
+                    response::Payload::StorageList(super::encode::storage_list(roots)),
+                ),
+                Err(error) => port_error(sequence, request_id, error),
+            }
+        }
+        Some(request::Command::StorageStatus(_)) => {
+            let Some(service) = storage else {
+                return state_problem(
+                    sequence,
+                    request_id,
+                    "STORAGE_NOT_CONFIGURED",
+                    "managed storage is not configured",
+                );
+            };
+            match service.status() {
+                Ok(status) => success(
+                    sequence,
+                    request_id,
+                    response::Payload::StorageStatus(super::encode::storage_status(status)),
+                ),
+                Err(error) => port_error(sequence, request_id, error),
+            }
+        }
         Some(request::Command::Doctor(_)) => success(
             sequence,
             request_id,
