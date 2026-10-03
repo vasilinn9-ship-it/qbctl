@@ -1330,7 +1330,8 @@ impl CompletionService {
         original_file: &CompletionFileRecord,
         explicit_request: bool,
     ) -> Result<HandoffProgress, PortError> {
-        let temp_relative = Self::completion_temp_relative(&record.operation_id, original_file.index);
+        let temp_relative =
+            Self::completion_temp_relative(&record.operation_id, original_file.index);
         let mut delete_intent_created_now = false;
 
         loop {
@@ -2369,12 +2370,9 @@ mod tests {
             drop(failures);
 
             let mut files = self.files.lock().expect("files mutex");
-            let Some(index) = files
-                .iter()
-                .position(|(candidate_root, path, _)| {
-                    *candidate_root == root && path == relative_path
-                })
-            else {
+            let Some(index) = files.iter().position(|(candidate_root, path, _)| {
+                *candidate_root == root && path == relative_path
+            }) else {
                 return Ok(ManagedDeleteOutcome::Missing);
             };
             if &files[index].2 != expected_evidence {
@@ -3256,7 +3254,9 @@ mod tests {
                 .count(),
             2
         );
-        assert!(!files.iter().any(|(_, path, _)| path.starts_with("_qbctl_tmp/")));
+        assert!(!files
+            .iter()
+            .any(|(_, path, _)| path.starts_with("_qbctl_tmp/")));
     }
 
     #[tokio::test]
@@ -3272,10 +3272,7 @@ mod tests {
                 .await
                 .expect("first cross-volume completion"),
         );
-        assert_eq!(
-            first.status,
-            CompletionExecutionStatus::UnknownSourceDelete
-        );
+        assert_eq!(first.status, CompletionExecutionStatus::UnknownSourceDelete);
         assert_eq!(
             first.record.files[0].state,
             CompletionFileState::UnknownSourceDelete
@@ -3300,7 +3297,10 @@ mod tests {
                 .expect("explicit replay"),
         );
         assert!(replay.replayed);
-        assert_eq!(replay.status, CompletionExecutionStatus::RemoveRecordPending);
+        assert_eq!(
+            replay.status,
+            CompletionExecutionStatus::RemoveRecordPending
+        );
         assert_eq!(replay.record.state, CompletionState::RemoveRecordPending);
         assert_eq!(storage.delete_calls.load(Ordering::SeqCst), 3);
     }
