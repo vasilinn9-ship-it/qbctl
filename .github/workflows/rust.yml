@@ -53,14 +53,15 @@ jobs:
           image="qbittorrentofficial/qbittorrent-nox:5.2.3-1@sha256:9ebb534fe30bab98622cb84a8c3acecfd88319b2d540f52ecdec7b9f866374d7"
           docker run -d \
             --name qbctl-real-qbit \
+            --network host \
             --read-only \
             --tmpfs /tmp \
             --tmpfs /config:rw,uid=1000,gid=1000,mode=1770 \
             --tmpfs /downloads:rw,uid=1000,gid=1000,mode=1770 \
             --stop-timeout 1800 \
             -e QBT_LEGAL_NOTICE=confirm \
-            -e QBT_WEBUI_PORT=8080 \
-            -p 127.0.0.1:18080:8080 \
+            -e QBT_WEBUI_PORT=18080 \
+            -e QBT_TORRENTING_PORT=16881 \
             "$image"
 
           password=""
