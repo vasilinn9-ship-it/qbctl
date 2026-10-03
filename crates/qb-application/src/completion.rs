@@ -350,15 +350,11 @@ fn normalize_qbit_path(value: &str) -> Result<String, PortError> {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use qb_domain::torrent::{
-        ManifestFile, TorrentManifest, TorrentState,
-    };
+    use qb_domain::torrent::{ManifestFile, TorrentManifest, TorrentState};
 
     use crate::{
         registry::{RegisterIncoming, RegisterIncomingResult, RegistryRecord},
-        storage::{
-            FileIdentity, IncomingDeleteOutcome, IncomingFileSnapshot, StorageVolumeStatus,
-        },
+        storage::{FileIdentity, IncomingDeleteOutcome, IncomingFileSnapshot, StorageVolumeStatus},
         torrent::{
             AddTorrentRequest, EffectAttempt, EffectFuture, NetworkPreferences, PortFuture,
             QbitProbe, QueueSettings, TrackerEvidence, TransferInfo,
@@ -436,16 +432,8 @@ mod tests {
         fn populated() -> Arc<Self> {
             Arc::new(Self {
                 files: Mutex::new(vec![
-                    (
-                        ManagedRoot::Working,
-                        "dir/a.bin".into(),
-                        evidence(2, 2, 10),
-                    ),
-                    (
-                        ManagedRoot::Working,
-                        "dir/b.bin".into(),
-                        evidence(2, 3, 20),
-                    ),
+                    (ManagedRoot::Working, "dir/a.bin".into(), evidence(2, 2, 10)),
+                    (ManagedRoot::Working, "dir/b.bin".into(), evidence(2, 3, 20)),
                 ]),
             })
         }
@@ -470,11 +458,7 @@ mod tests {
             Ok(format!("{root:?}"))
         }
 
-        fn matches_root_path(
-            &self,
-            root: ManagedRoot,
-            observed: &str,
-        ) -> Result<bool, PortError> {
+        fn matches_root_path(&self, root: ManagedRoot, observed: &str) -> Result<bool, PortError> {
             Ok(root == ManagedRoot::Working && observed == "Working")
         }
 
@@ -533,8 +517,7 @@ mod tests {
         fn complete() -> Arc<Self> {
             Arc::new(Self {
                 torrent: TorrentView {
-                    id: TorrentId::new("1111111111111111111111111111111111111111")
-                        .expect("id"),
+                    id: TorrentId::new("1111111111111111111111111111111111111111").expect("id"),
                     name: "sample".into(),
                     save_path: "Working".into(),
                     state: TorrentState::Uploading,
@@ -583,9 +566,7 @@ mod tests {
         }
 
         fn get<'a>(&'a self, id: &'a TorrentId) -> PortFuture<'a, Option<TorrentView>> {
-            Box::pin(async move {
-                Ok((id == &self.torrent.id).then(|| self.torrent.clone()))
-            })
+            Box::pin(async move { Ok((id == &self.torrent.id).then(|| self.torrent.clone())) })
         }
 
         fn transfer_info(&self) -> PortFuture<'_, TransferInfo> {
@@ -653,10 +634,7 @@ mod tests {
         }
     }
 
-    fn service(
-        storage: Arc<FakeStorage>,
-        client: Arc<FakeClient>,
-    ) -> CompletionPreflightService {
+    fn service(storage: Arc<FakeStorage>, client: Arc<FakeClient>) -> CompletionPreflightService {
         CompletionPreflightService::new(
             Arc::new(FakeRegistry(registry())),
             storage,
@@ -702,15 +680,11 @@ mod tests {
     #[tokio::test]
     async fn existing_completed_destination_blocks_before_any_mutation() {
         let storage = FakeStorage::populated();
-        storage
-            .files
-            .lock()
-            .expect("files mutex")
-            .push((
-                ManagedRoot::Completed,
-                "dir/a.bin".into(),
-                evidence(2, 9, 10),
-            ));
+        storage.files.lock().expect("files mutex").push((
+            ManagedRoot::Completed,
+            "dir/a.bin".into(),
+            evidence(2, 9, 10),
+        ));
 
         let error = service(storage, FakeClient::complete())
             .preflight(&request())
@@ -723,5 +697,4 @@ mod tests {
     fn unused() -> PortError {
         PortError::new("UNUSED", "unused in completion preflight test")
     }
-
 }
