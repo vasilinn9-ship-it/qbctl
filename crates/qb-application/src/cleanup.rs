@@ -206,9 +206,7 @@ impl IncomingCleanupService {
 mod tests {
     use std::sync::Mutex;
 
-    use crate::storage::{
-        FileIdentity, IncomingFileSnapshot, ManagedRoot, StorageVolumeStatus,
-    };
+    use crate::storage::{FileIdentity, IncomingFileSnapshot, ManagedRoot, StorageVolumeStatus};
 
     use super::*;
 
@@ -387,10 +385,7 @@ mod tests {
         let records = service.execute(&[copy]).await.expect("cleanup");
 
         assert_eq!(records[0].state, IncomingCleanupState::Blocked);
-        assert_eq!(
-            records[0].problem_code.as_deref(),
-            Some("SOURCE_AMBIGUOUS")
-        );
+        assert_eq!(records[0].problem_code.as_deref(), Some("SOURCE_AMBIGUOUS"));
         assert_eq!(*storage.delete_calls.lock().expect("delete mutex"), 0);
     }
 
@@ -408,10 +403,7 @@ mod tests {
         let records = service.execute(&[copy]).await.expect("cleanup");
 
         assert_eq!(records[0].state, IncomingCleanupState::Blocked);
-        assert_eq!(
-            records[0].problem_code.as_deref(),
-            Some("SOURCE_AMBIGUOUS")
-        );
+        assert_eq!(records[0].problem_code.as_deref(), Some("SOURCE_AMBIGUOUS"));
         assert_eq!(*storage.delete_calls.lock().expect("delete mutex"), 1);
     }
 
