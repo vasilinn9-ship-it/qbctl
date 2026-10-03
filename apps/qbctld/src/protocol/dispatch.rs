@@ -1,8 +1,4 @@
-use qb_application::{
-    system::SystemService,
-    torrent::TorrentService,
-    PortError,
-};
+use qb_application::{system::SystemService, torrent::TorrentService, PortError};
 use qb_domain::torrent::TorrentId;
 use qb_proto::{
     v1::{
@@ -158,12 +154,7 @@ fn invalid_request(sequence: u64, request_id: Option<String>, message: &str) -> 
     )
 }
 
-fn state_problem(
-    sequence: u64,
-    request_id: Option<String>,
-    code: &str,
-    message: &str,
-) -> Response {
+fn state_problem(sequence: u64, request_id: Option<String>, code: &str, message: &str) -> Response {
     problem_response(
         sequence,
         request_id,
@@ -179,11 +170,7 @@ fn state_problem(
     )
 }
 
-fn qbit_unavailable(
-    sequence: u64,
-    request_id: Option<String>,
-    problem: Option<&str>,
-) -> Response {
+fn qbit_unavailable(sequence: u64, request_id: Option<String>, problem: Option<&str>) -> Response {
     problem_response(
         sequence,
         request_id,
@@ -193,7 +180,9 @@ fn qbit_unavailable(
             category: ProblemCategory::Availability as i32,
             retry_guidance: RetryGuidance::RetryAfterStateChange as i32,
             mutation_certainty: MutationCertainty::NoMutation as i32,
-            message_key: problem.unwrap_or("qBittorrent service is unavailable").into(),
+            message_key: problem
+                .unwrap_or("qBittorrent service is unavailable")
+                .into(),
             details: Vec::new(),
         },
     )
