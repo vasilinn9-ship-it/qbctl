@@ -9,7 +9,7 @@ pub mod storage;
 pub mod system;
 pub mod torrent;
 
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, sync::Arc};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PortError {
@@ -33,6 +33,12 @@ impl fmt::Display for PortError {
 }
 
 impl Error for PortError {}
+
+pub type MutationLane = Arc<tokio::sync::Mutex<()>>;
+
+pub fn mutation_lane() -> MutationLane {
+    Arc::new(tokio::sync::Mutex::new(()))
+}
 
 pub trait JournalHealthPort: Send + Sync {
     fn schema_version(&self) -> Result<u32, PortError>;
