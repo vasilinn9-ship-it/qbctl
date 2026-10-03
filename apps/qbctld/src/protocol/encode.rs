@@ -11,8 +11,8 @@ use qb_application::{
 use qb_domain::torrent::TorrentState;
 use qb_proto::v1::{
     DaemonState, DoctorCheck, DoctorResponse, IncomingStatusEntry, ManagedRootView,
-    QbitProbeResponse, QueueSettingsResponse, StatusResponse, StorageListResponse,
-    StorageRootView, StorageStatusResponse, TorrentListResponse, TorrentStateView, TorrentSummary,
+    QbitProbeResponse, QueueSettingsResponse, StatusResponse, StorageListResponse, StorageRootView,
+    StorageStatusResponse, TorrentListResponse, TorrentStateView, TorrentSummary,
     TrackerEvidenceView, TrackerStatusView, TransferLimitsResponse,
 };
 
@@ -57,29 +57,31 @@ pub fn storage_status(status: StorageStatusSnapshot) -> StorageStatusResponse {
             + status.incoming.rejected.len(),
     );
 
-    incoming.extend(status.incoming.eligible.into_iter().map(|entry| IncomingStatusEntry {
-        relative_path: entry.relative_path,
-        classification: "eligible".into(),
-        registry_id: None,
-        problem_code: None,
-        detail: None,
-    }));
     incoming.extend(
         status
             .incoming
-            .already_processed
+            .eligible
             .into_iter()
             .map(|entry| IncomingStatusEntry {
                 relative_path: entry.relative_path,
-                classification: "already_processed".into(),
-                registry_id: Some(entry.registry_id),
+                classification: "eligible".into(),
+                registry_id: None,
                 problem_code: None,
-                detail: Some(format!(
-                    "state={:?}; source={}",
-                    entry.registry_state, entry.registered_source_relative
-                )),
+                detail: None,
             }),
     );
+    incoming.extend(status.incoming.already_processed.into_iter().map(|entry| {
+        IncomingStatusEntry {
+            relative_path: entry.relative_path,
+            classification: "already_processed".into(),
+            registry_id: Some(entry.registry_id),
+            problem_code: None,
+            detail: Some(format!(
+                "state={:?}; source={}",
+                entry.registry_state, entry.registered_source_relative
+            )),
+        }
+    }));
     incoming.extend(
         status
             .incoming
@@ -93,13 +95,19 @@ pub fn storage_status(status: StorageStatusSnapshot) -> StorageStatusResponse {
                 detail: Some(format!("canonical={}", entry.canonical_path)),
             }),
     );
-    incoming.extend(status.incoming.rejected.into_iter().map(|entry| IncomingStatusEntry {
-        relative_path: entry.relative_path,
-        classification: "rejected".into(),
-        registry_id: None,
-        problem_code: Some(entry.problem_code.into()),
-        detail: Some(entry.message),
-    }));
+    incoming.extend(
+        status
+            .incoming
+            .rejected
+            .into_iter()
+            .map(|entry| IncomingStatusEntry {
+                relative_path: entry.relative_path,
+                classification: "rejected".into(),
+                registry_id: None,
+                problem_code: Some(entry.problem_code.into()),
+                detail: Some(entry.message),
+            }),
+    );
 
     StorageStatusResponse {
         roots: status.roots.into_iter().map(storage_root).collect(),
