@@ -7,8 +7,8 @@ use std::{
 
 use qb_application::{
     mutation::{
-        MutationCommand, MutationDisposition, MutationJournal, MutationRecord, RequestReservation,
-        TorrentControlAction, FINGERPRINT_VERSION,
+        MutationCommand, MutationDisposition, MutationJournal, MutationRecord, QueueTargetPolicy,
+        RequestReservation, TorrentControlAction, FINGERPRINT_VERSION,
     },
     JournalHealthPort, PortError,
 };
@@ -621,17 +621,21 @@ impl MutationJournal for Journal {
         Ok(records)
     }
 
-    fn queue_target(&self) -> Result<Option<u32>, PortError> {
+    fn queue_target(&self) -> Result<QueueTargetPolicy, PortError> {
         let connection = self.connection.lock().expect("journal mutex poisoned");
-        let value: Option<i64> = connection
+        let (revision, value): (i64, Option<i64>) = connection
             .query_row(
-                "SELECT target_client_count FROM controller_policy WHERE singleton = 1",
+                "SELECT revision, target_client_count FROM controller_policy WHERE singleton = 1",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(JournalError::from)
             .map_err(map_port_error)?;
-        value
+
+        let revision = u64::try_from(revision).map_err(|_| {
+            PortError::new("JOURNAL_STATE_INVALID", "policy revision is negative")
+        })?;
+        let target_client_count = value
             .map(|value| {
                 u32::try_from(value).map_err(|_| {
                     PortError::new(
@@ -640,7 +644,12 @@ impl MutationJournal for Journal {
                     )
                 })
             })
-            .transpose()
+            .transpose()?;
+
+        Ok(QueueTargetPolicy {
+            revision,
+            target_client_count,
+        })
     }
 
     fn apply_queue_target(
