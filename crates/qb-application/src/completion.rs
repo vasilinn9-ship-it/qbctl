@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use qb_domain::{
     torrent::{TorrentId, TorrentIdentity, TorrentMetainfo},
@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     registry::{RegistryState, TorrentRegistry},
     storage::{FileEvidence, ManagedRoot, Storage},
-    torrent::{FileObservation, MetainfoReader, TorrentClient, TorrentView},
+    torrent::{EffectAttempt, FileObservation, MetainfoReader, TorrentClient, TorrentView},
     PortError,
 };
 
@@ -197,6 +197,35 @@ impl CompletionPreflight {
             CompletionHandoffStrategy::CrossVolume
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompletionExecutionStatus {
+    Stopped,
+    Blocked,
+    UnknownStop,
+    Failed,
+}
+
+#[derive(Debug)]
+pub struct CompletionExecution {
+    pub status: CompletionExecutionStatus,
+    pub record: CompletionRecord,
+    pub problem: Option<PortError>,
+    pub replayed: bool,
+}
+
+#[derive(Debug)]
+pub enum CompletionExecutionResult {
+    Execution(Box<CompletionExecution>),
+    Conflict { operation_id: OperationId },
+    ActiveConflict { operation_id: OperationId },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StopObservation {
+    Stopped,
+    Running,
 }
 
 pub struct CompletionPreflightService {
@@ -500,6 +529,403 @@ fn normalize_qbit_path(value: &str) -> Result<String, PortError> {
         ));
     }
     Ok(normalized)
+}
+
+pub struct CompletionService {
+    preflight: CompletionPreflightService,
+    journal: Arc<dyn CompletionJournal>,
+    client: Arc<dyn TorrentClient>,
+    observation_attempts: usize,
+    observation_delay: Duration,
+    lane: tokio::sync::Mutex<()>,
+}
+
+impl CompletionService {
+    pub fn new(
+        journal: Arc<dyn CompletionJournal>,
+        registry: Arc<dyn TorrentRegistry>,
+        storage: Arc<dyn Storage>,
+        metainfo: Arc<dyn MetainfoReader>,
+        client: Arc<dyn TorrentClient>,
+        max_metainfo_bytes: usize,
+    ) -> Self {
+        Self {
+            preflight: CompletionPreflightService::new(
+                registry,
+                storage,
+                metainfo,
+                client.clone(),
+                max_metainfo_bytes,
+            ),
+            journal,
+            client,
+            observation_attempts: 30,
+            observation_delay: Duration::from_millis(100),
+            lane: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    pub fn with_observation_policy(mut self, attempts: usize, delay: Duration) -> Self {
+        self.observation_attempts = attempts.max(1);
+        self.observation_delay = delay;
+        self
+    }
+
+    pub async fn execute(
+        &self,
+        request: &CompletionRequest,
+    ) -> Result<CompletionExecutionResult, PortError> {
+        let _guard = self.lane.lock().await;
+
+        if let Some(reservation) = self.journal.lookup_completion_request(request)? {
+            return self.advance_reservation(reservation, true, true).await;
+        }
+
+        let preflight = self.preflight.preflight(request).await?;
+        self.advance_reservation(self.journal.reserve_completion(&preflight)?, false, true)
+            .await
+    }
+
+    pub async fn recover_all(&self) -> Result<Vec<CompletionExecution>, PortError> {
+        let _guard = self.lane.lock().await;
+        let records = self.journal.list_recoverable_completions()?;
+        let mut executions = Vec::with_capacity(records.len());
+        for record in records {
+            executions.push(self.advance(record, true, false).await?);
+        }
+        Ok(executions)
+    }
+
+    async fn advance_reservation(
+        &self,
+        reservation: CompletionReservation,
+        replayed: bool,
+        explicit_request: bool,
+    ) -> Result<CompletionExecutionResult, PortError> {
+        match reservation {
+            CompletionReservation::New(record) | CompletionReservation::Replay(record) => self
+                .advance(record, replayed, explicit_request)
+                .await
+                .map(|execution| CompletionExecutionResult::Execution(Box::new(execution))),
+            CompletionReservation::Conflict { operation_id } => {
+                Ok(CompletionExecutionResult::Conflict { operation_id })
+            }
+            CompletionReservation::ActiveConflict { operation_id } => {
+                Ok(CompletionExecutionResult::ActiveConflict { operation_id })
+            }
+        }
+    }
+
+    async fn advance(
+        &self,
+        mut record: CompletionRecord,
+        replayed: bool,
+        explicit_request: bool,
+    ) -> Result<CompletionExecution, PortError> {
+        match record.state {
+            CompletionState::Blocked => {
+                return Ok(completion_execution(
+                    CompletionExecutionStatus::Blocked,
+                    record,
+                    completion_problem("COMPLETION_BLOCKED", "completion is blocked"),
+                    replayed,
+                ));
+            }
+            CompletionState::Failed => {
+                return Ok(completion_execution(
+                    CompletionExecutionStatus::Failed,
+                    record,
+                    completion_problem("COMPLETION_FAILED", "completion failed"),
+                    replayed,
+                ));
+            }
+            CompletionState::Stopped
+            | CompletionState::ArchivePending
+            | CompletionState::UnknownArchive
+            | CompletionState::PayloadPending
+            | CompletionState::RemoveRecordPending
+            | CompletionState::UnknownRemoveRecord
+            | CompletionState::Finished => {
+                return Ok(completion_execution(
+                    CompletionExecutionStatus::Stopped,
+                    record,
+                    None,
+                    replayed,
+                ));
+            }
+            CompletionState::StopPending | CompletionState::UnknownStop => {
+                match self.observe_stop_bounded(&record).await {
+                    Ok(StopObservation::Stopped) => {
+                        let stopped = self.journal.mark_stopped(&record.operation_id)?;
+                        return Ok(completion_execution(
+                            CompletionExecutionStatus::Stopped,
+                            stopped,
+                            None,
+                            replayed,
+                        ));
+                    }
+                    Ok(StopObservation::Running) if !explicit_request => {
+                        let unknown = if record.state == CompletionState::UnknownStop {
+                            record
+                        } else {
+                            self.journal.mark_unknown_stop(
+                                &record.operation_id,
+                                "QBIT_STOP_UNCERTAIN",
+                            )?
+                        };
+                        return Ok(completion_execution(
+                            CompletionExecutionStatus::UnknownStop,
+                            unknown,
+                            Some(PortError::new(
+                                "QBIT_STOP_UNCERTAIN",
+                                "completion stop remains unconfirmed after recovery observation; explicit replay is required before another stop request",
+                            )),
+                            replayed,
+                        ));
+                    }
+                    Ok(StopObservation::Running) => {
+                        record = self.journal.retry_stop(&record.operation_id)?;
+                    }
+                    Err(problem) => {
+                        let unknown = if record.state == CompletionState::UnknownStop {
+                            record
+                        } else {
+                            self.journal.mark_unknown_stop(
+                                &record.operation_id,
+                                "QBIT_STOP_UNCERTAIN",
+                            )?
+                        };
+                        return Ok(completion_execution(
+                            CompletionExecutionStatus::UnknownStop,
+                            unknown,
+                            Some(problem),
+                            replayed,
+                        ));
+                    }
+                }
+            }
+            CompletionState::Prepared => {}
+        }
+
+        if let Err(problem) = self.revalidate_record(&record).await {
+            let blocked = self
+                .journal
+                .mark_completion_blocked(&record.operation_id, problem.code)?;
+            return Ok(completion_execution(
+                CompletionExecutionStatus::Blocked,
+                blocked,
+                Some(problem),
+                replayed,
+            ));
+        }
+
+        let pending = self.journal.mark_stop_pending(&record.operation_id)?;
+        match self.observe_stop_once(&pending).await {
+            Ok(StopObservation::Stopped) => {
+                let stopped = self.journal.mark_stopped(&pending.operation_id)?;
+                return Ok(completion_execution(
+                    CompletionExecutionStatus::Stopped,
+                    stopped,
+                    None,
+                    replayed,
+                ));
+            }
+            Ok(StopObservation::Running) => {}
+            Err(problem) => {
+                let unknown = self
+                    .journal
+                    .mark_unknown_stop(&pending.operation_id, "QBIT_STOP_UNCERTAIN")?;
+                return Ok(completion_execution(
+                    CompletionExecutionStatus::UnknownStop,
+                    unknown,
+                    Some(problem),
+                    replayed,
+                ));
+            }
+        }
+
+        match self.client.stop(&pending.torrent_id).await {
+            EffectAttempt::NotSent(problem) => {
+                let prepared = self.journal.retry_stop(&pending.operation_id)?;
+                Ok(completion_execution(
+                    CompletionExecutionStatus::Blocked,
+                    prepared,
+                    Some(problem),
+                    replayed,
+                ))
+            }
+            EffectAttempt::Rejected(problem) => {
+                let failed = self
+                    .journal
+                    .mark_completion_failed(&pending.operation_id, problem.code)?;
+                Ok(completion_execution(
+                    CompletionExecutionStatus::Failed,
+                    failed,
+                    Some(problem),
+                    replayed,
+                ))
+            }
+            EffectAttempt::Uncertain(problem) => {
+                let unknown = self
+                    .journal
+                    .mark_unknown_stop(&pending.operation_id, "QBIT_STOP_UNCERTAIN")?;
+                Ok(completion_execution(
+                    CompletionExecutionStatus::UnknownStop,
+                    unknown,
+                    Some(problem),
+                    replayed,
+                ))
+            }
+            EffectAttempt::Accepted => match self.observe_stop_bounded(&pending).await {
+                Ok(StopObservation::Stopped) => {
+                    let stopped = self.journal.mark_stopped(&pending.operation_id)?;
+                    Ok(completion_execution(
+                        CompletionExecutionStatus::Stopped,
+                        stopped,
+                        None,
+                        replayed,
+                    ))
+                }
+                Ok(StopObservation::Running) => {
+                    let unknown = self.journal.mark_unknown_stop(
+                        &pending.operation_id,
+                        "QBIT_STOP_POSTCONDITION_UNCONFIRMED",
+                    )?;
+                    Ok(completion_execution(
+                        CompletionExecutionStatus::UnknownStop,
+                        unknown,
+                        Some(PortError::new(
+                            "QBIT_STOP_POSTCONDITION_UNCONFIRMED",
+                            "qBittorrent accepted stop but fresh bounded observation did not confirm stopped state",
+                        )),
+                        replayed,
+                    ))
+                }
+                Err(problem) => {
+                    let unknown = self
+                        .journal
+                        .mark_unknown_stop(&pending.operation_id, "QBIT_STOP_UNCERTAIN")?;
+                    Ok(completion_execution(
+                        CompletionExecutionStatus::UnknownStop,
+                        unknown,
+                        Some(problem),
+                        replayed,
+                    ))
+                }
+            },
+        }
+    }
+
+    async fn revalidate_record(&self, record: &CompletionRecord) -> Result<(), PortError> {
+        let fresh = self
+            .preflight
+            .preflight(&CompletionRequest {
+                request_id: record.request_id.clone(),
+                registry_id: record.registry_id.clone(),
+            })
+            .await?;
+
+        if fresh.torrent_id != record.torrent_id
+            || fresh.identity != record.identity
+            || fresh.source_relative != record.source_relative
+            || fresh.source_evidence != record.source_evidence
+            || fresh.source_metainfo_digest != record.source_metainfo_digest
+            || fresh.working_volume_id != record.working_volume_id
+            || fresh.completed_volume_id != record.completed_volume_id
+            || fresh.archive_volume_id != record.archive_volume_id
+            || !fresh
+                .working_save_path
+                .eq_ignore_ascii_case(&record.working_save_path)
+            || fresh.total_bytes != record.total_bytes
+            || fresh.files.len() != record.files.len()
+        {
+            return Err(PortError::new(
+                "COMPLETION_PREFLIGHT_STALE",
+                "fresh completion preflight no longer matches the durable operation",
+            ));
+        }
+
+        for (fresh_file, durable_file) in fresh.files.iter().zip(&record.files) {
+            if fresh_file.relative_path != durable_file.relative_path
+                || fresh_file.size != durable_file.size
+                || fresh_file.source_evidence != durable_file.source_evidence
+            {
+                return Err(PortError::new(
+                    "COMPLETION_PREFLIGHT_STALE",
+                    format!(
+                        "fresh completion file evidence changed for {}",
+                        durable_file.relative_path
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    async fn observe_stop_once(
+        &self,
+        record: &CompletionRecord,
+    ) -> Result<StopObservation, PortError> {
+        let torrent = self.client.get(&record.torrent_id).await?.ok_or_else(|| {
+            PortError::new(
+                "TORRENT_NOT_FOUND",
+                "qBittorrent record disappeared before completion handoff",
+            )
+        })?;
+        if !torrent.is_complete() {
+            return Err(PortError::new(
+                "TORRENT_NOT_COMPLETE",
+                "torrent is no longer complete during completion stop observation",
+            ));
+        }
+        if !torrent.save_path.eq_ignore_ascii_case(&record.working_save_path) {
+            return Err(PortError::new(
+                "WORKING_OWNERSHIP_MISMATCH",
+                "qBittorrent save path changed during completion stop observation",
+            ));
+        }
+        Ok(if torrent.state.is_stopped() {
+            StopObservation::Stopped
+        } else {
+            StopObservation::Running
+        })
+    }
+
+    async fn observe_stop_bounded(
+        &self,
+        record: &CompletionRecord,
+    ) -> Result<StopObservation, PortError> {
+        for attempt in 0..self.observation_attempts {
+            if self.observe_stop_once(record).await? == StopObservation::Stopped {
+                return Ok(StopObservation::Stopped);
+            }
+            if attempt + 1 < self.observation_attempts {
+                tokio::time::sleep(self.observation_delay).await;
+            }
+        }
+        Ok(StopObservation::Running)
+    }
+}
+
+fn completion_problem(
+    fallback_code: &'static str,
+    fallback_message: &'static str,
+) -> Option<PortError> {
+    Some(PortError::new(fallback_code, fallback_message))
+}
+
+fn completion_execution(
+    status: CompletionExecutionStatus,
+    record: CompletionRecord,
+    problem: Option<PortError>,
+    replayed: bool,
+) -> CompletionExecution {
+    CompletionExecution {
+        status,
+        record,
+        problem,
+        replayed,
+    }
 }
 
 #[cfg(test)]
