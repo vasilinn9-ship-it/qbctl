@@ -1,4 +1,5 @@
 pub mod credentials;
+pub mod storage;
 
 use std::{
     env,
