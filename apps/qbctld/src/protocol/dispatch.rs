@@ -305,20 +305,24 @@ fn mutation_execution_response(
             sequence,
             request_id,
             operation_id,
-            Status::Blocked,
             execution.problem,
-            MutationCertainty::ConfirmedNotApplied,
-            RetryGuidance::RetryAfterStateChange,
+            MutationProblemSpec {
+                status: Status::Blocked,
+                certainty: MutationCertainty::ConfirmedNotApplied,
+                retry: RetryGuidance::RetryAfterStateChange,
+            },
             payload,
         ),
         MutationExecutionStatus::Unknown => mutation_problem(
             sequence,
             request_id,
             operation_id.clone(),
-            Status::Unknown,
             execution.problem,
-            MutationCertainty::MayHaveApplied,
-            RetryGuidance::ObserveOrRecover,
+            MutationProblemSpec {
+                status: Status::Unknown,
+                certainty: MutationCertainty::MayHaveApplied,
+                retry: RetryGuidance::ObserveOrRecover,
+            },
             payload,
         )
         .with_next_action("recover_operation", operation_id),
@@ -326,10 +330,12 @@ fn mutation_execution_response(
             sequence,
             request_id,
             operation_id,
-            Status::Error,
             execution.problem,
-            MutationCertainty::ConfirmedNotApplied,
-            RetryGuidance::NewRequestRequired,
+            MutationProblemSpec {
+                status: Status::Error,
+                certainty: MutationCertainty::ConfirmedNotApplied,
+                retry: RetryGuidance::NewRequestRequired,
+            },
             payload,
         ),
     }
@@ -349,28 +355,32 @@ impl ResponseNextAction for Response {
     }
 }
 
+struct MutationProblemSpec {
+    status: Status,
+    certainty: MutationCertainty,
+    retry: RetryGuidance,
+}
+
 fn mutation_problem(
     sequence: u64,
     request_id: Option<String>,
     operation_id: Option<String>,
-    status: Status,
     problem: Option<PortError>,
-    certainty: MutationCertainty,
-    retry: RetryGuidance,
+    spec: MutationProblemSpec,
     payload: Option<response::Payload>,
 ) -> Response {
     let problem = problem.unwrap_or_else(|| PortError::new("MUTATION_FAILED", "mutation failed"));
     Response {
         sequence,
-        status: status as i32,
+        status: spec.status as i32,
         request_id,
         operation_id,
         job_id: None,
         problems: vec![Problem {
             code: problem.code.into(),
             category: problem_category(problem.code) as i32,
-            retry_guidance: retry as i32,
-            mutation_certainty: certainty as i32,
+            retry_guidance: spec.retry as i32,
+            mutation_certainty: spec.certainty as i32,
             message_key: problem.message,
             details: Vec::new(),
         }],
