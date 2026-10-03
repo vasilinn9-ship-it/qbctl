@@ -1123,6 +1123,43 @@ mod tests {
                 .map(|(_, _, evidence)| evidence.clone()))
         }
 
+        fn move_same_volume_no_replace(
+            &self,
+            source_root: ManagedRoot,
+            destination_root: ManagedRoot,
+            relative_path: &str,
+            expected_source: &FileEvidence,
+        ) -> Result<SameVolumeMoveOutcome, PortError> {
+            let mut files = self.files.lock().expect("files mutex");
+            let Some(source_index) = files.iter().position(|(root, path, _)| {
+                *root == source_root && path == relative_path
+            }) else {
+                return Ok(SameVolumeMoveOutcome::SourceMissing);
+            };
+            let source_evidence = files[source_index].2.clone();
+            if &source_evidence != expected_source {
+                return Ok(SameVolumeMoveOutcome::SourceChanged {
+                    observed: source_evidence,
+                });
+            }
+            if let Some((_, _, observed)) = files.iter().find(|(root, path, _)| {
+                *root == destination_root && path == relative_path
+            }) {
+                return Ok(SameVolumeMoveOutcome::DestinationExists {
+                    observed: observed.clone(),
+                });
+            }
+            files.remove(source_index);
+            files.push((
+                destination_root,
+                relative_path.to_owned(),
+                source_evidence.clone(),
+            ));
+            Ok(SameVolumeMoveOutcome::Moved {
+                destination: source_evidence,
+            })
+        }
+
         fn list_incoming(&self) -> Result<Vec<String>, PortError> {
             Ok(vec!["sample.torrent".into()])
         }
@@ -1320,6 +1357,46 @@ mod tests {
     }
 
     impl FakeCompletionJournal {
+        fn transition_file(
+            &self,
+            operation_id: &OperationId,
+            file_index: u32,
+            expected: &[CompletionFileState],
+            next: CompletionFileState,
+            destination: Option<&FileEvidence>,
+            destination_sha256: Option<[u8; 32]>,
+            problem_code: Option<&str>,
+        ) -> Result<CompletionRecord, PortError> {
+            let mut state = self.record.lock().expect("completion journal mutex");
+            let record = state
+                .as_mut()
+                .ok_or_else(|| PortError::new("COMPLETION_NOT_FOUND", operation_id.to_string()))?;
+            if &record.operation_id != operation_id || record.state != CompletionState::PayloadPending
+            {
+                return Err(PortError::new(
+                    "OPERATION_TRANSITION_INVALID",
+                    "fake file transition requires PayloadPending",
+                ));
+            }
+            let file = record
+                .files
+                .iter_mut()
+                .find(|file| file.index == file_index)
+                .ok_or_else(|| PortError::new("COMPLETION_FILE_NOT_FOUND", file_index.to_string()))?;
+            if !expected.contains(&file.state) {
+                return Err(PortError::new(
+                    "OPERATION_TRANSITION_INVALID",
+                    "invalid fake completion file transition",
+                ));
+            }
+            file.state = next;
+            file.destination_evidence = destination.cloned();
+            file.destination_sha256 = destination_sha256;
+            file.problem_code = problem_code.map(str::to_owned);
+            file.revision += 1;
+            Ok(record.clone())
+        }
+
         fn transition(
             &self,
             operation_id: &OperationId,
@@ -1589,38 +1666,74 @@ mod tests {
 
         fn mark_file_move_pending(
             &self,
-            _operation_id: &OperationId,
-            _file_index: u32,
+            operation_id: &OperationId,
+            file_index: u32,
         ) -> Result<CompletionRecord, PortError> {
-            Err(unused())
+            self.transition_file(
+                operation_id,
+                file_index,
+                &[CompletionFileState::Prepared, CompletionFileState::UnknownMove],
+                CompletionFileState::MovePending,
+                None,
+                None,
+                None,
+            )
         }
 
         fn mark_file_unknown_move(
             &self,
-            _operation_id: &OperationId,
-            _file_index: u32,
-            _problem_code: &str,
+            operation_id: &OperationId,
+            file_index: u32,
+            problem_code: &str,
         ) -> Result<CompletionRecord, PortError> {
-            Err(unused())
+            self.transition_file(
+                operation_id,
+                file_index,
+                &[CompletionFileState::MovePending],
+                CompletionFileState::UnknownMove,
+                None,
+                None,
+                Some(problem_code),
+            )
         }
 
         fn mark_file_handed_off(
             &self,
-            _operation_id: &OperationId,
-            _file_index: u32,
-            _destination: &FileEvidence,
-            _destination_sha256: Option<[u8; 32]>,
+            operation_id: &OperationId,
+            file_index: u32,
+            destination: &FileEvidence,
+            destination_sha256: Option<[u8; 32]>,
         ) -> Result<CompletionRecord, PortError> {
-            Err(unused())
+            self.transition_file(
+                operation_id,
+                file_index,
+                &[CompletionFileState::MovePending, CompletionFileState::UnknownMove],
+                CompletionFileState::HandedOff,
+                Some(destination),
+                destination_sha256,
+                None,
+            )
         }
 
         fn mark_file_blocked(
             &self,
-            _operation_id: &OperationId,
-            _file_index: u32,
-            _problem_code: &str,
+            operation_id: &OperationId,
+            file_index: u32,
+            problem_code: &str,
         ) -> Result<CompletionRecord, PortError> {
-            Err(unused())
+            self.transition_file(
+                operation_id,
+                file_index,
+                &[
+                    CompletionFileState::Prepared,
+                    CompletionFileState::MovePending,
+                    CompletionFileState::UnknownMove,
+                ],
+                CompletionFileState::Blocked,
+                None,
+                None,
+                Some(problem_code),
+            )
         }
 
         fn mark_payload_handed_off(
