@@ -503,9 +503,7 @@ impl MutationService {
         ))
     }
 
-    fn qbit_client(
-        &self,
-    ) -> Result<&std::sync::Arc<dyn crate::torrent::TorrentClient>, PortError> {
+    fn qbit_client(&self) -> Result<&std::sync::Arc<dyn crate::torrent::TorrentClient>, PortError> {
         self.client.as_ref().ok_or_else(|| {
             PortError::new(
                 "QBIT_UNAVAILABLE",
@@ -529,10 +527,10 @@ impl MutationService {
 
         match command {
             MutationCommand::TorrentControl { torrent_id, .. } => {
-                let torrent =
-                    client.get(torrent_id).await?.ok_or_else(|| {
-                        PortError::new("TORRENT_NOT_FOUND", "torrent was not found")
-                    })?;
+                let torrent = client
+                    .get(torrent_id)
+                    .await?
+                    .ok_or_else(|| PortError::new("TORRENT_NOT_FOUND", "torrent was not found"))?;
                 if torrent.state == qb_domain::torrent::TorrentState::Unknown {
                     return Err(PortError::new(
                         "TORRENT_STATE_UNKNOWN",
@@ -561,9 +559,10 @@ impl MutationService {
 
         match command {
             MutationCommand::TorrentControl { torrent_id, action } => {
-                let torrent = client.get(torrent_id).await?.ok_or_else(|| {
-                    PortError::new("TORRENT_NOT_FOUND", "torrent was not found")
-                })?;
+                let torrent = client
+                    .get(torrent_id)
+                    .await?
+                    .ok_or_else(|| PortError::new("TORRENT_NOT_FOUND", "torrent was not found"))?;
                 if torrent.state == qb_domain::torrent::TorrentState::Unknown {
                     return Err(PortError::new(
                         "TORRENT_STATE_UNKNOWN",
