@@ -103,8 +103,19 @@ pub async fn run(runtime_override: Option<PathBuf>) -> Result<()> {
                     Ok(connection) => {
                         let runtime = Arc::clone(&bootstrap.runtime);
                         let system = Arc::clone(&bootstrap.system);
+                        let torrents = bootstrap.torrents.as_ref().map(Arc::clone);
+                        let qbit_startup_problem =
+                            bootstrap.qbit_startup_problem.as_deref().map(Arc::<str>::from);
                         tasks.spawn(async move {
-                            if let Err(error) = protocol::serve_connection(connection, runtime, system).await {
+                            if let Err(error) = protocol::serve_connection(
+                                connection,
+                                runtime,
+                                system,
+                                torrents,
+                                qbit_startup_problem,
+                            )
+                            .await
+                            {
                                 warn!(error = %error, "client connection ended with error");
                             }
                         });
