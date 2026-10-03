@@ -41,7 +41,7 @@ pub struct QbitClient {
     base_url: Url,
     origin: String,
     credentials: QbitCredentials,
-    sid: RwLock<Option<String>>,
+    session_cookie: RwLock<Option<String>>,
 }
 
 #[derive(Debug, Error)]
@@ -88,7 +88,7 @@ impl QbitClient {
             base_url,
             origin,
             credentials,
-            sid: RwLock::new(None),
+            session_cookie: RwLock::new(None),
         })
     }
 
@@ -229,18 +229,18 @@ impl QbitClient {
         query: &[(&str, String)],
     ) -> Result<Response, QbitError> {
         for attempt in 0..2 {
-            let sid = self.ensure_session().await?;
+            let session_cookie = self.ensure_session().await?;
             let response = self
                 .http
                 .get(self.endpoint(endpoint))
                 .header(ORIGIN, &self.origin)
-                .header(COOKIE, format!("SID={sid}"))
+                .header(COOKIE, session_cookie)
                 .query(query)
                 .send()
                 .await?;
 
             if response.status() == StatusCode::FORBIDDEN && attempt == 0 {
-                *self.sid.write().await = None;
+                *self.session_cookie.write().await = None;
                 continue;
             }
 
@@ -261,7 +261,7 @@ impl QbitClient {
                 .http
                 .post(self.endpoint(endpoint))
                 .header(ORIGIN, &self.origin)
-                .header(COOKIE, format!("SID={sid}"))
+                .header(COOKIE, session_cookie)
                 .form(form)
                 .send()
                 .await;
@@ -277,7 +277,7 @@ impl QbitClient {
             };
 
             if response.status() == StatusCode::FORBIDDEN && attempt == 0 {
-                *self.sid.write().await = None;
+                *self.session_cookie.write().await = None;
                 continue;
             }
 
@@ -338,13 +338,13 @@ impl QbitClient {
     }
 
     async fn ensure_session(&self) -> Result<String, QbitError> {
-        if let Some(sid) = self.sid.read().await.clone() {
-            return Ok(sid);
+        if let Some(session_cookie) = self.session_cookie.read().await.clone() {
+            return Ok(session_cookie);
         }
 
-        let mut guard = self.sid.write().await;
-        if let Some(sid) = guard.clone() {
-            return Ok(sid);
+        let mut guard = self.session_cookie.write().await;
+        if let Some(session_cookie) = guard.clone() {
+            return Ok(session_cookie);
         }
 
         let response = self
@@ -362,12 +362,12 @@ impl QbitClient {
             return Err(QbitError::Authentication);
         }
 
-        let sid = response
+        let session_cookie = response
             .headers()
             .get_all(SET_COOKIE)
             .iter()
             .filter_map(|value| value.to_str().ok())
-            .find_map(extract_sid)
+            .find_map(extract_session_cookie)
             .ok_or(QbitError::Authentication)?;
 
         let body = read_bounded_body(response).await?;
@@ -375,8 +375,8 @@ impl QbitClient {
             return Err(QbitError::Authentication);
         }
 
-        *guard = Some(sid.clone());
-        Ok(sid)
+        *guard = Some(session_cookie.clone());
+        Ok(session_cookie)
     }
 
     fn endpoint(&self, endpoint: &str) -> Url {
@@ -513,13 +513,13 @@ async fn read_bounded_body(mut response: Response) -> Result<Vec<u8>, QbitError>
     Ok(body)
 }
 
-fn extract_sid(header: &str) -> Option<String> {
-    header.split(';').find_map(|part| {
-        part.trim()
-            .strip_prefix("SID=")
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-    })
+fn extract_session_cookie(header: &str) -> Option<String> {
+    let cookie = header.split(';').next()?.trim();
+    let (name, value) = cookie.split_once('=')?;
+    if !matches!(name, "SID" | "QBT_SID") || value.is_empty() {
+        return None;
+    }
+    Some(format!("{name}={value}"))
 }
 
 fn is_supported_mutation_version(application: &str, webapi: &str) -> bool {
@@ -840,7 +840,7 @@ mod tests {
     #[tokio::test]
     async fn probe_authenticates_and_reads_versions() {
         let server = FakeHttpServer::spawn(vec![
-            FakeResponse::ok("Ok.").with_header("Set-Cookie", "SID=test-session; HttpOnly"),
+            FakeResponse::ok("Ok.").with_header("Set-Cookie", "QBT_SID=test-session; HttpOnly"),
             FakeResponse::ok("v5.2.4"),
             FakeResponse::ok("2.16.2"),
         ])
@@ -868,10 +868,10 @@ mod tests {
         assert!(requests[0].contains("password=secret"));
         assert!(requests[1]
             .to_ascii_lowercase()
-            .contains("cookie: sid=test-session"));
+            .contains("cookie: qbt_sid=test-session"));
         assert!(requests[2]
             .to_ascii_lowercase()
-            .contains("cookie: sid=test-session"));
+            .contains("cookie: qbt_sid=test-session"));
     }
 
     #[tokio::test]
