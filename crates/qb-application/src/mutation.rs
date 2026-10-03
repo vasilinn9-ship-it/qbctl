@@ -139,6 +139,12 @@ pub trait MutationJournal: Send + Sync {
         problem_code: &str,
     ) -> Result<MutationRecord, PortError>;
 
+    fn mark_blocked(
+        &self,
+        operation_id: &OperationId,
+        problem_code: &str,
+    ) -> Result<MutationRecord, PortError>;
+
     fn mark_failed(
         &self,
         operation_id: &OperationId,
@@ -256,7 +262,7 @@ impl MutationService {
             }
         };
 
-        self.advance(record, replayed)
+        self.advance(record, replayed, true)
             .await
             .map(|execution| MutationExecutionResult::Execution(Box::new(execution)))
     }
@@ -267,7 +273,7 @@ impl MutationService {
         let mut results = Vec::with_capacity(records.len());
 
         for record in records {
-            results.push(self.advance(record, true).await?);
+            results.push(self.advance(record, true, false).await?);
         }
 
         Ok(results)
@@ -281,7 +287,13 @@ impl MutationService {
         &self,
         record: MutationRecord,
         replayed: bool,
+        explicit_request: bool,
     ) -> Result<MutationExecution, PortError> {
+        let record = if explicit_request && record.disposition == MutationDisposition::Blocked {
+            self.journal.mark_retry_ready(&record.operation_id)?
+        } else {
+            record
+        };
         let local_queue_target = match &record.command {
             MutationCommand::SetQueueTarget {
                 target_client_count,
@@ -369,11 +381,12 @@ impl MutationService {
         }
 
         if let Err(problem) = self.preflight(&record.command).await {
+            let blocked = self
+                .journal
+                .mark_blocked(&record.operation_id, problem.code)?;
             return Ok(execution(
                 MutationExecutionStatus::Blocked,
-                self.journal
-                    .get_operation(&record.operation_id)?
-                    .unwrap_or(record),
+                blocked,
                 Some(problem),
                 replayed,
             ));
