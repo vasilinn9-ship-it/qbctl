@@ -9,8 +9,9 @@ use qb_application::{
         MutationService, TorrentControlAction,
     },
     torrent::{
-        ConnectionStatus, EffectAttempt, EffectFuture, NetworkPreferences, PortFuture, QbitProbe,
-        QueueSettings, TorrentClient, TorrentView, TrackerEvidence, TransferInfo,
+        ConnectionStatus, EffectAttempt, EffectFuture, FileObservation, NetworkPreferences,
+        PortFuture, QbitProbe, QueueSettings, TorrentClient, TorrentView, TrackerEvidence,
+        TransferInfo,
     },
     PortError,
 };
@@ -128,6 +129,10 @@ impl TorrentClient for FakeTorrentClient {
     }
 
     fn trackers<'a>(&'a self, _id: &'a TorrentId) -> PortFuture<'a, Vec<TrackerEvidence>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn files<'a>(&'a self, _id: &'a TorrentId) -> PortFuture<'a, Vec<FileObservation>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 
