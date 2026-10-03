@@ -98,9 +98,14 @@ fn decode_secret(blob: &[u8]) -> Option<String> {
         return None;
     }
 
-    let utf16: Vec<u16> = blob
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+    let (pairs, remainder) = blob.as_chunks::<2>();
+    if !remainder.is_empty() {
+        return None;
+    }
+
+    let utf16: Vec<u16> = pairs
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
         .collect();
     String::from_utf16(&utf16)
         .ok()
