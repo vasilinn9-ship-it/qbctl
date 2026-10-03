@@ -53,7 +53,7 @@ pub async fn serve_connection(
             request,
             &system,
             torrents.as_deref(),
-            &mutations,
+            Some(mutations.as_ref()),
             mutation_admission_enabled,
             qbit_startup_problem.as_deref(),
         )
