@@ -40,7 +40,16 @@ pub fn mutation_lane() -> MutationLane {
     Arc::new(tokio::sync::Mutex::new(()))
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryBlocker {
+    pub kind: String,
+    pub state: String,
+    pub problem_code: Option<String>,
+    pub count: u64,
+}
+
 pub trait JournalHealthPort: Send + Sync {
     fn schema_version(&self) -> Result<u32, PortError>;
     fn quick_check(&self) -> Result<(), PortError>;
+    fn recovery_blockers(&self) -> Result<Vec<RecoveryBlocker>, PortError>;
 }
