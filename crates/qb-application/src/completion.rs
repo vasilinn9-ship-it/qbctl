@@ -73,6 +73,8 @@ pub struct CompletionFileRecord {
     pub source_evidence: FileEvidence,
     pub strategy: CompletionHandoffStrategy,
     pub state: CompletionFileState,
+    pub destination_evidence: Option<FileEvidence>,
+    pub destination_sha256: Option<[u8; 32]>,
     pub revision: u64,
 }
 
@@ -144,6 +146,39 @@ pub trait CompletionJournal: Send + Sync {
     fn mark_completion_failed(
         &self,
         operation_id: &OperationId,
+        problem_code: &str,
+    ) -> Result<CompletionRecord, PortError>;
+
+    fn mark_payload_pending(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<CompletionRecord, PortError>;
+
+    fn mark_file_move_pending(
+        &self,
+        operation_id: &OperationId,
+        file_index: u32,
+    ) -> Result<CompletionRecord, PortError>;
+
+    fn mark_file_unknown_move(
+        &self,
+        operation_id: &OperationId,
+        file_index: u32,
+        problem_code: &str,
+    ) -> Result<CompletionRecord, PortError>;
+
+    fn mark_file_handed_off(
+        &self,
+        operation_id: &OperationId,
+        file_index: u32,
+        destination: &FileEvidence,
+        destination_sha256: Option<[u8; 32]>,
+    ) -> Result<CompletionRecord, PortError>;
+
+    fn mark_file_blocked(
+        &self,
+        operation_id: &OperationId,
+        file_index: u32,
         problem_code: &str,
     ) -> Result<CompletionRecord, PortError>;
 }
@@ -1331,6 +1366,8 @@ mod tests {
                         source_evidence: file.source_evidence.clone(),
                         strategy: preflight.payload_strategy(),
                         state: CompletionFileState::Prepared,
+                        destination_evidence: None,
+                        destination_sha256: None,
                         revision: 1,
                     })
                     .collect(),
@@ -1443,6 +1480,54 @@ mod tests {
                 CompletionState::Failed,
                 Some(problem_code),
             )
+        }
+
+        fn mark_payload_pending(
+            &self,
+            operation_id: &OperationId,
+        ) -> Result<CompletionRecord, PortError> {
+            self.transition(
+                operation_id,
+                &[CompletionState::Stopped],
+                CompletionState::PayloadPending,
+                None,
+            )
+        }
+
+        fn mark_file_move_pending(
+            &self,
+            _operation_id: &OperationId,
+            _file_index: u32,
+        ) -> Result<CompletionRecord, PortError> {
+            Err(unused())
+        }
+
+        fn mark_file_unknown_move(
+            &self,
+            _operation_id: &OperationId,
+            _file_index: u32,
+            _problem_code: &str,
+        ) -> Result<CompletionRecord, PortError> {
+            Err(unused())
+        }
+
+        fn mark_file_handed_off(
+            &self,
+            _operation_id: &OperationId,
+            _file_index: u32,
+            _destination: &FileEvidence,
+            _destination_sha256: Option<[u8; 32]>,
+        ) -> Result<CompletionRecord, PortError> {
+            Err(unused())
+        }
+
+        fn mark_file_blocked(
+            &self,
+            _operation_id: &OperationId,
+            _file_index: u32,
+            _problem_code: &str,
+        ) -> Result<CompletionRecord, PortError> {
+            Err(unused())
         }
     }
 
