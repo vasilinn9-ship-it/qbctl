@@ -851,14 +851,25 @@ fn load_operation(
 }
 
 fn operation_select_sql() -> &'static str {
-    "SELECT request_id, operation_id, command_kind, fingerprint_version,
-            command_fingerprint,
-            torrent_id, control_action, target_client_count, max_active_downloads,
-            download_limit_bps, upload_limit_bps,
-            checkpoint, disposition, pending_effect_kind, problem_code, revision
+    "SELECT operations.request_id,
+            operations.operation_id,
+            operations.command_kind,
+            requests.fingerprint_version,
+            requests.command_fingerprint,
+            operations.torrent_id,
+            operations.control_action,
+            operations.target_client_count,
+            operations.max_active_downloads,
+            operations.download_limit_bps,
+            operations.upload_limit_bps,
+            operations.checkpoint,
+            operations.disposition,
+            operations.pending_effect_kind,
+            operations.problem_code,
+            operations.revision
      FROM operations
-     JOIN requests USING(request_id)
-     WHERE operation_id = ?1"
+     JOIN requests ON requests.request_id = operations.request_id
+     WHERE operations.operation_id = ?1"
 }
 
 fn map_operation_row(row: &Row<'_>) -> rusqlite::Result<MutationRecord> {
