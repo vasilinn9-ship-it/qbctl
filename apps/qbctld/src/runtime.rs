@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use qb_application::{
+    cleanup::IncomingCleanupState,
     mutation::MutationExecutionStatus,
     system::{DaemonPhase, RuntimeHealthPort, RuntimeSnapshot},
     PortError,
@@ -166,6 +167,62 @@ async fn initialize_runtime(bootstrap: &bootstrap::Bootstrap) {
             "one or more durable mutations remain unresolved after startup recovery"
         );
         return;
+    }
+
+    if let Some(incoming) = bootstrap.incoming.as_ref() {
+        let recovered = match incoming.recover_cleanup().await {
+            Ok(records) => records,
+            Err(error) => {
+                bootstrap.runtime.set_phase(DaemonPhase::Degraded);
+                error!(error = %error, "startup Incoming cleanup recovery failed");
+                return;
+            }
+        };
+        let recovered_blocked = recovered
+            .iter()
+            .filter(|record| record.state == IncomingCleanupState::Blocked)
+            .count();
+        if recovered_blocked > 0 {
+            warn!(
+                recovered_blocked,
+                "one or more Incoming cleanup intents were blocked by changed source evidence"
+            );
+        }
+
+        if bootstrap
+            .config
+            .storage
+            .as_ref()
+            .is_some_and(|storage| storage.cleanup_exact_duplicates_on_startup)
+        {
+            let pass = match incoming.run_once().await {
+                Ok(pass) => pass,
+                Err(error) => {
+                    bootstrap.runtime.set_phase(DaemonPhase::Degraded);
+                    error!(error = %error, "startup Incoming scan/cleanup failed");
+                    return;
+                }
+            };
+            let cleanup_deleted = pass
+                .cleanup
+                .iter()
+                .filter(|record| record.state == IncomingCleanupState::Deleted)
+                .count();
+            let cleanup_blocked = pass
+                .cleanup
+                .iter()
+                .filter(|record| record.state == IncomingCleanupState::Blocked)
+                .count();
+            info!(
+                eligible = pass.scan.eligible.len(),
+                already_processed = pass.scan.already_processed.len(),
+                redundant_exact = pass.scan.redundant_identical.len(),
+                rejected = pass.scan.rejected.len(),
+                cleanup_deleted,
+                cleanup_blocked,
+                "startup Incoming scan/cleanup completed"
+            );
+        }
     }
 
     let Some(torrents) = bootstrap.torrents.as_ref() else {

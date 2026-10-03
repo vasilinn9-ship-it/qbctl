@@ -8,3 +8,12 @@ url = "http://127.0.0.1:8080"
 username = "admin"
 credential = "qbctl/qbittorrent"
 request_timeout_seconds = 4
+
+# Managed storage is opt-in. All roots must already exist, be non-overlapping,
+# local fixed Windows paths, and must not traverse reparse points.
+[storage]
+incoming = "C:\\torrents\\incoming"
+archive = "C:\\torrents\\archive"
+working = "C:\\torrents\\working"
+completed = "C:\\torrents\\completed"
+cleanup_exact_duplicates_on_startup = true

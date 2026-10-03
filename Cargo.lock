@@ -993,6 +993,7 @@ dependencies = [
  "qb-domain",
  "qb-ipc",
  "qb-journal",
+ "qb-metainfo",
  "qb-proto",
  "qb-qbit",
  "qb-win",
