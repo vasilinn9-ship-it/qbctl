@@ -60,6 +60,7 @@ message Request {
     QueueGetRequest queue_get = 22;
     TransferLimitsGetRequest transfer_limits_get = 23;
     QbitProbeRequest qbit_probe = 24;
+    TorrentDiagnoseRequest torrent_diagnose = 25;
     PauseTorrentRequest torrent_pause = 30;
     ResumeTorrentRequest torrent_resume = 31;
     QueueTargetGetRequest queue_target_get = 32;
@@ -90,5 +91,6 @@ message Response {
     QbitProbeResponse qbit_probe = 27;
     QueueTargetResponse queue_target = 28;
     MutationResultResponse mutation_result = 29;
+    TorrentDiagnoseResponse torrent_diagnose = 30;
   }
 }
