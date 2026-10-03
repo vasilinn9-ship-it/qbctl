@@ -882,6 +882,494 @@ impl CompletionService {
         }
     }
 
+    async fn advance_handoff(
+        &self,
+        mut record: CompletionRecord,
+        replayed: bool,
+        _explicit_request: bool,
+    ) -> Result<CompletionExecution, PortError> {
+        loop {
+            let progress = match record.state {
+                CompletionState::Stopped
+                | CompletionState::ArchivePending
+                | CompletionState::UnknownArchive => self.advance_archive(record).await?,
+                CompletionState::PayloadPending => self.advance_payload(record).await?,
+                CompletionState::RemoveRecordPending => {
+                    return Ok(completion_execution(
+                        CompletionExecutionStatus::RemoveRecordPending,
+                        record,
+                        None,
+                        replayed,
+                    ));
+                }
+                CompletionState::UnknownRemoveRecord => {
+                    return Ok(completion_execution(
+                        CompletionExecutionStatus::RemoveRecordPending,
+                        record,
+                        Some(PortError::new(
+                            "QBIT_REMOVE_UNCERTAIN",
+                            "qBittorrent record removal remains unresolved",
+                        )),
+                        replayed,
+                    ));
+                }
+                CompletionState::Finished => {
+                    return Ok(completion_execution(
+                        CompletionExecutionStatus::Finished,
+                        record,
+                        None,
+                        replayed,
+                    ));
+                }
+                CompletionState::Blocked => {
+                    return Ok(completion_execution(
+                        CompletionExecutionStatus::Blocked,
+                        record,
+                        Some(PortError::new(
+                            "COMPLETION_BLOCKED",
+                            "completion handoff is blocked",
+                        )),
+                        replayed,
+                    ));
+                }
+                CompletionState::Failed => {
+                    return Ok(completion_execution(
+                        CompletionExecutionStatus::Failed,
+                        record,
+                        Some(PortError::new(
+                            "COMPLETION_FAILED",
+                            "completion handoff failed",
+                        )),
+                        replayed,
+                    ));
+                }
+                other => {
+                    return Err(PortError::new(
+                        "OPERATION_TRANSITION_INVALID",
+                        format!("unexpected completion handoff state {other:?}"),
+                    ));
+                }
+            };
+
+            match progress {
+                HandoffProgress::Continue(next) => record = next,
+                HandoffProgress::Halt {
+                    status,
+                    record,
+                    problem,
+                } => return Ok(completion_execution(status, record, problem, replayed)),
+            }
+        }
+    }
+
+    async fn advance_archive(
+        &self,
+        mut record: CompletionRecord,
+    ) -> Result<HandoffProgress, PortError> {
+        if record.source_evidence.identity.volume_id != record.archive_volume_id {
+            return Ok(HandoffProgress::Halt {
+                status: CompletionExecutionStatus::ArchivePending,
+                record,
+                problem: Some(PortError::new(
+                    "CROSS_VOLUME_ARCHIVE_PENDING",
+                    "Archive is on a different volume; verified copy handoff is required",
+                )),
+            });
+        }
+
+        let observation = self.observe_same_volume_handoff(
+            ManagedRoot::Incoming,
+            ManagedRoot::Archive,
+            &record.source_relative,
+            &record.source_evidence,
+        );
+
+        match record.state {
+            CompletionState::Stopped => match observation {
+                Ok(SameVolumeObservation::SourceReady) => {
+                    record = self.journal.mark_archive_pending(&record.operation_id)?;
+                }
+                Ok(SameVolumeObservation::Applied(_)) => {
+                    return self.block_handoff(
+                        record,
+                        PortError::new(
+                            "ARCHIVE_EFFECT_WITHOUT_INTENT",
+                            "Archive destination contains the source file but no archive intent is durable",
+                        ),
+                    );
+                }
+                Err(problem) => return self.block_handoff(record, problem),
+            },
+            CompletionState::ArchivePending | CompletionState::UnknownArchive => match observation {
+                Ok(SameVolumeObservation::Applied(destination)) => {
+                    let receipted = self.journal.mark_archive_receipted(
+                        &record.operation_id,
+                        &destination,
+                        record.source_metainfo_digest,
+                    )?;
+                    return Ok(HandoffProgress::Continue(receipted));
+                }
+                Ok(SameVolumeObservation::SourceReady) => {
+                    if record.state == CompletionState::UnknownArchive {
+                        record = self.journal.retry_archive(&record.operation_id)?;
+                        record = self.journal.mark_archive_pending(&record.operation_id)?;
+                    }
+                }
+                Err(problem) => return self.block_handoff(record, problem),
+            },
+            _ => {
+                return Err(PortError::new(
+                    "OPERATION_TRANSITION_INVALID",
+                    "archive handoff requires Stopped, ArchivePending or UnknownArchive",
+                ));
+            }
+        }
+
+        match self.storage.move_same_volume_no_replace(
+            ManagedRoot::Incoming,
+            ManagedRoot::Archive,
+            &record.source_relative,
+            &record.source_evidence,
+        ) {
+            Ok(SameVolumeMoveOutcome::Moved { destination }) => {
+                let receipted = self.journal.mark_archive_receipted(
+                    &record.operation_id,
+                    &destination,
+                    record.source_metainfo_digest,
+                )?;
+                Ok(HandoffProgress::Continue(receipted))
+            }
+            Ok(SameVolumeMoveOutcome::SourceMissing) => {
+                match self.observe_same_volume_handoff(
+                    ManagedRoot::Incoming,
+                    ManagedRoot::Archive,
+                    &record.source_relative,
+                    &record.source_evidence,
+                ) {
+                    Ok(SameVolumeObservation::Applied(destination)) => {
+                        let receipted = self.journal.mark_archive_receipted(
+                            &record.operation_id,
+                            &destination,
+                            record.source_metainfo_digest,
+                        )?;
+                        Ok(HandoffProgress::Continue(receipted))
+                    }
+                    Ok(SameVolumeObservation::SourceReady) => {
+                        let unknown = self.journal.mark_unknown_archive(
+                            &record.operation_id,
+                            "ARCHIVE_MOVE_UNCERTAIN",
+                        )?;
+                        Ok(HandoffProgress::Halt {
+                            status: CompletionExecutionStatus::UnknownArchive,
+                            record: unknown,
+                            problem: Some(PortError::new(
+                                "ARCHIVE_MOVE_UNCERTAIN",
+                                "Archive move returned source-missing but evidence still shows the source",
+                            )),
+                        })
+                    }
+                    Err(problem) => self.block_handoff(record, problem),
+                }
+            }
+            Ok(SameVolumeMoveOutcome::SourceChanged { .. }) => self.block_handoff(
+                record,
+                PortError::new(
+                    "HANDOFF_SOURCE_CHANGED",
+                    "Incoming metainfo changed before archive move",
+                ),
+            ),
+            Ok(SameVolumeMoveOutcome::DestinationExists { .. }) => self.block_handoff(
+                record,
+                PortError::new(
+                    "DESTINATION_CONFLICT",
+                    "Archive destination appeared before no-replace move",
+                ),
+            ),
+            Err(problem) => {
+                let unknown = self
+                    .journal
+                    .mark_unknown_archive(&record.operation_id, problem.code)?;
+                Ok(HandoffProgress::Halt {
+                    status: CompletionExecutionStatus::UnknownArchive,
+                    record: unknown,
+                    problem: Some(problem),
+                })
+            }
+        }
+    }
+
+    async fn advance_payload(
+        &self,
+        mut record: CompletionRecord,
+    ) -> Result<HandoffProgress, PortError> {
+        for index in 0..record.files.len() {
+            let file = record.files[index].clone();
+            if file.state == CompletionFileState::HandedOff {
+                continue;
+            }
+            if file.strategy == CompletionHandoffStrategy::CrossVolume {
+                return Ok(HandoffProgress::Halt {
+                    status: CompletionExecutionStatus::PayloadPending,
+                    record,
+                    problem: Some(PortError::new(
+                        "CROSS_VOLUME_PAYLOAD_PENDING",
+                        format!(
+                            "verified cross-volume copy is required for {}",
+                            file.relative_path
+                        ),
+                    )),
+                });
+            }
+
+            let observation = self.observe_same_volume_handoff(
+                ManagedRoot::Working,
+                ManagedRoot::Completed,
+                &file.relative_path,
+                &file.source_evidence,
+            );
+
+            match file.state {
+                CompletionFileState::Prepared => match observation {
+                    Ok(SameVolumeObservation::SourceReady) => {
+                        record = self
+                            .journal
+                            .mark_file_move_pending(&record.operation_id, file.index)?;
+                    }
+                    Ok(SameVolumeObservation::Applied(_)) => {
+                        return self.block_file_handoff(
+                            record,
+                            &file,
+                            PortError::new(
+                                "HANDOFF_EFFECT_WITHOUT_INTENT",
+                                format!(
+                                    "Completed contains {} but no file move intent is durable",
+                                    file.relative_path
+                                ),
+                            ),
+                        );
+                    }
+                    Err(problem) => return self.block_file_handoff(record, &file, problem),
+                },
+                CompletionFileState::MovePending | CompletionFileState::UnknownMove => {
+                    match observation {
+                        Ok(SameVolumeObservation::Applied(destination)) => {
+                            record = self.journal.mark_file_handed_off(
+                                &record.operation_id,
+                                file.index,
+                                &destination,
+                                None,
+                            )?;
+                            continue;
+                        }
+                        Ok(SameVolumeObservation::SourceReady) => {
+                            if file.state == CompletionFileState::UnknownMove {
+                                record = self
+                                    .journal
+                                    .mark_file_move_pending(&record.operation_id, file.index)?;
+                            }
+                        }
+                        Err(problem) => return self.block_file_handoff(record, &file, problem),
+                    }
+                }
+                CompletionFileState::Blocked => {
+                    return self.block_handoff(
+                        record,
+                        PortError::new(
+                            "HANDOFF_FILE_BLOCKED",
+                            format!("file handoff is blocked: {}", file.relative_path),
+                        ),
+                    );
+                }
+                CompletionFileState::Failed => {
+                    return Ok(HandoffProgress::Halt {
+                        status: CompletionExecutionStatus::Failed,
+                        record,
+                        problem: Some(PortError::new(
+                            "HANDOFF_FILE_FAILED",
+                            format!("file handoff failed: {}", file.relative_path),
+                        )),
+                    });
+                }
+                CompletionFileState::DestinationReceipted
+                | CompletionFileState::SourceDeletePending
+                | CompletionFileState::UnknownSourceDelete => {
+                    return Ok(HandoffProgress::Halt {
+                        status: CompletionExecutionStatus::PayloadPending,
+                        record,
+                        problem: Some(PortError::new(
+                            "CROSS_VOLUME_PAYLOAD_PENDING",
+                            format!(
+                                "cross-volume source-delete stage remains pending for {}",
+                                file.relative_path
+                            ),
+                        )),
+                    });
+                }
+                CompletionFileState::HandedOff => continue,
+            }
+
+            match self.storage.move_same_volume_no_replace(
+                ManagedRoot::Working,
+                ManagedRoot::Completed,
+                &file.relative_path,
+                &file.source_evidence,
+            ) {
+                Ok(SameVolumeMoveOutcome::Moved { destination }) => {
+                    record = self.journal.mark_file_handed_off(
+                        &record.operation_id,
+                        file.index,
+                        &destination,
+                        None,
+                    )?;
+                }
+                Ok(SameVolumeMoveOutcome::SourceMissing) => {
+                    match self.observe_same_volume_handoff(
+                        ManagedRoot::Working,
+                        ManagedRoot::Completed,
+                        &file.relative_path,
+                        &file.source_evidence,
+                    ) {
+                        Ok(SameVolumeObservation::Applied(destination)) => {
+                            record = self.journal.mark_file_handed_off(
+                                &record.operation_id,
+                                file.index,
+                                &destination,
+                                None,
+                            )?;
+                        }
+                        Ok(SameVolumeObservation::SourceReady) => {
+                            record = self.journal.mark_file_unknown_move(
+                                &record.operation_id,
+                                file.index,
+                                "HANDOFF_MOVE_UNCERTAIN",
+                            )?;
+                            return Ok(HandoffProgress::Halt {
+                                status: CompletionExecutionStatus::UnknownMove,
+                                record,
+                                problem: Some(PortError::new(
+                                    "HANDOFF_MOVE_UNCERTAIN",
+                                    format!(
+                                        "move result is uncertain for {}",
+                                        file.relative_path
+                                    ),
+                                )),
+                            });
+                        }
+                        Err(problem) => return self.block_file_handoff(record, &file, problem),
+                    }
+                }
+                Ok(SameVolumeMoveOutcome::SourceChanged { .. }) => {
+                    return self.block_file_handoff(
+                        record,
+                        &file,
+                        PortError::new(
+                            "HANDOFF_SOURCE_CHANGED",
+                            format!("Working source changed: {}", file.relative_path),
+                        ),
+                    );
+                }
+                Ok(SameVolumeMoveOutcome::DestinationExists { .. }) => {
+                    return self.block_file_handoff(
+                        record,
+                        &file,
+                        PortError::new(
+                            "DESTINATION_CONFLICT",
+                            format!(
+                                "Completed destination appeared before no-replace move: {}",
+                                file.relative_path
+                            ),
+                        ),
+                    );
+                }
+                Err(problem) => {
+                    record = self.journal.mark_file_unknown_move(
+                        &record.operation_id,
+                        file.index,
+                        problem.code,
+                    )?;
+                    return Ok(HandoffProgress::Halt {
+                        status: CompletionExecutionStatus::UnknownMove,
+                        record,
+                        problem: Some(problem),
+                    });
+                }
+            }
+        }
+
+        let ready = self.journal.mark_payload_handed_off(&record.operation_id)?;
+        Ok(HandoffProgress::Continue(ready))
+    }
+
+    fn observe_same_volume_handoff(
+        &self,
+        source_root: ManagedRoot,
+        destination_root: ManagedRoot,
+        relative_path: &str,
+        expected_source: &FileEvidence,
+    ) -> Result<SameVolumeObservation, PortError> {
+        let source = self.storage.observe_file(source_root, relative_path)?;
+        let destination = self.storage.observe_file(destination_root, relative_path)?;
+
+        if let Some(source) = source.as_ref() {
+            if source != expected_source {
+                return Err(PortError::new(
+                    "HANDOFF_SOURCE_CHANGED",
+                    format!("source evidence changed for {relative_path}"),
+                ));
+            }
+        }
+        if let Some(destination) = destination.as_ref() {
+            if destination != expected_source {
+                return Err(PortError::new(
+                    "DESTINATION_CONFLICT",
+                    format!("destination evidence conflicts for {relative_path}"),
+                ));
+            }
+        }
+
+        match (source, destination) {
+            (Some(_), None) => Ok(SameVolumeObservation::SourceReady),
+            (None, Some(destination)) => Ok(SameVolumeObservation::Applied(destination)),
+            (Some(_), Some(_)) => Err(PortError::new(
+                "HANDOFF_AMBIGUOUS",
+                format!("both source and destination exist for {relative_path}"),
+            )),
+            (None, None) => Err(PortError::new(
+                "HANDOFF_EVIDENCE_MISSING",
+                format!("neither source nor destination exists for {relative_path}"),
+            )),
+        }
+    }
+
+    fn block_handoff(
+        &self,
+        record: CompletionRecord,
+        problem: PortError,
+    ) -> Result<HandoffProgress, PortError> {
+        let blocked = self
+            .journal
+            .mark_completion_blocked(&record.operation_id, problem.code)?;
+        Ok(HandoffProgress::Halt {
+            status: CompletionExecutionStatus::Blocked,
+            record: blocked,
+            problem: Some(problem),
+        })
+    }
+
+    fn block_file_handoff(
+        &self,
+        record: CompletionRecord,
+        file: &CompletionFileRecord,
+        problem: PortError,
+    ) -> Result<HandoffProgress, PortError> {
+        let updated = self.journal.mark_file_blocked(
+            &record.operation_id,
+            file.index,
+            problem.code,
+        )?;
+        self.block_handoff(updated, problem)
+    }
+
     async fn revalidate_record(&self, record: &CompletionRecord) -> Result<(), PortError> {
         let fresh = self
             .preflight
