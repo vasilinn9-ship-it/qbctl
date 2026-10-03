@@ -13,9 +13,7 @@ use qb_application::{
     JournalHealthPort, PortError,
 };
 use qb_domain::{OperationId, RequestId};
-use rusqlite::{
-    params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior,
-};
+use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -94,8 +92,7 @@ impl Journal {
         }
 
         let mut connection = self.connection.lock().expect("journal mutex poisoned");
-        let transaction =
-            connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         if let Some(existing) = load_request(&transaction, request_id.as_str())? {
             let operation_id = OperationId::new(existing.operation_id.clone())
@@ -108,13 +105,12 @@ impl Journal {
                 return Ok(RequestReservation::Conflict { operation_id });
             }
 
-            let record = load_operation(&transaction, operation_id.as_str())?
-                .ok_or_else(|| {
-                    JournalError::InvalidState(format!(
-                        "request {} references missing operation {}",
-                        request_id, operation_id
-                    ))
-                })?;
+            let record = load_operation(&transaction, operation_id.as_str())?.ok_or_else(|| {
+                JournalError::InvalidState(format!(
+                    "request {} references missing operation {}",
+                    request_id, operation_id
+                ))
+            })?;
             transaction.commit()?;
             return Ok(RequestReservation::Replay(record));
         }
@@ -178,14 +174,11 @@ impl Journal {
         finished: bool,
     ) -> Result<MutationRecord, JournalError> {
         let mut connection = self.connection.lock().expect("journal mutex poisoned");
-        let transaction =
-            connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let current = load_operation(&transaction, operation_id.as_str())?
-            .ok_or_else(|| JournalError::InvalidState(format!(
-                "operation {} does not exist",
-                operation_id
-            )))?;
+        let current = load_operation(&transaction, operation_id.as_str())?.ok_or_else(|| {
+            JournalError::InvalidState(format!("operation {} does not exist", operation_id))
+        })?;
 
         if current.disposition == next
             && current.checkpoint == checkpoint
@@ -419,8 +412,7 @@ fn migrate(connection: &mut Connection) -> Result<(), JournalError> {
 }
 
 fn create_schema_v1(connection: &mut Connection) -> Result<(), JournalError> {
-    let transaction =
-        connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(
         r#"
         CREATE TABLE schema_meta (
@@ -441,8 +433,7 @@ fn create_schema_v1(connection: &mut Connection) -> Result<(), JournalError> {
 }
 
 fn migrate_v1_to_v2(connection: &mut Connection) -> Result<(), JournalError> {
-    let transaction =
-        connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(
         r#"
         CREATE TABLE requests (
@@ -550,25 +541,17 @@ trait QueryOperation {
 
 impl QueryOperation for Connection {
     fn query_operation(&self, operation_id: &str) -> Result<Option<MutationRecord>, JournalError> {
-        self.query_row(
-            operation_select_sql(),
-            [operation_id],
-            map_operation_row,
-        )
-        .optional()
-        .map_err(JournalError::from)
+        self.query_row(operation_select_sql(), [operation_id], map_operation_row)
+            .optional()
+            .map_err(JournalError::from)
     }
 }
 
 impl QueryOperation for Transaction<'_> {
     fn query_operation(&self, operation_id: &str) -> Result<Option<MutationRecord>, JournalError> {
-        self.query_row(
-            operation_select_sql(),
-            [operation_id],
-            map_operation_row,
-        )
-        .optional()
-        .map_err(JournalError::from)
+        self.query_row(operation_select_sql(), [operation_id], map_operation_row)
+            .optional()
+            .map_err(JournalError::from)
     }
 }
 
@@ -594,18 +577,10 @@ fn map_operation_row(row: &Row<'_>) -> rusqlite::Result<MutationRecord> {
     let fingerprint: Vec<u8> = row.get(4)?;
 
     let request_id = RequestId::new(request_id).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Text,
-            Box::new(error),
-        )
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
     })?;
     let operation_id = OperationId::new(operation_id).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(
-            1,
-            rusqlite::types::Type::Text,
-            Box::new(error),
-        )
+        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(error))
     })?;
     let command_fingerprint: [u8; 32] = fingerprint.try_into().map_err(|value: Vec<u8>| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -815,10 +790,7 @@ mod tests {
         let observed = journal
             .mark_observed_applied(&operation_id)
             .expect("observed");
-        assert_eq!(
-            observed.disposition,
-            MutationDisposition::ObservedApplied
-        );
+        assert_eq!(observed.disposition, MutationDisposition::ObservedApplied);
 
         let finished = journal.finish(&operation_id).expect("finish");
         assert_eq!(finished.disposition, MutationDisposition::Finished);
