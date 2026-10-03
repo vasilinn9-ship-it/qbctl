@@ -9,6 +9,7 @@ pub type EffectFuture<'a> = Pin<Box<dyn Future<Output = EffectAttempt> + Send + 
 
 #[derive(Debug)]
 pub enum EffectAttempt {
+    NotSent(PortError),
     Accepted,
     Rejected(PortError),
     Uncertain(PortError),
