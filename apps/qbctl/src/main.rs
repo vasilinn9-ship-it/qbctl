@@ -9,7 +9,8 @@ use qb_ipc::{ClientConnection, IpcError, DEFAULT_PIPE};
 use qb_proto::{
     v1::{
         request, response, CapabilitiesRequest, ClientHello, DaemonState, DoctorRequest,
-        ManagedRootView, PauseTorrentRequest, ProblemCategory, QbitProbeRequest, QueueGetRequest,
+        ManagedRootView, OperationGetRequest, OperationListRequest, OperationRecoverRequest,
+        OperationView, PauseTorrentRequest, ProblemCategory, QbitProbeRequest, QueueGetRequest,
         QueueTargetGetRequest, Request, Response, ResumeTorrentRequest, ServerHello,
         SetActiveDownloadsRequest, SetDownloadLimitRequest, SetQueueTargetRequest,
         SetUploadLimitRequest, Status, StatusRequest, StorageListRequest, StorageStatusRequest,
@@ -65,6 +66,10 @@ enum Command {
     Storage {
         #[command(subcommand)]
         command: StorageCommand,
+    },
+    Operation {
+        #[command(subcommand)]
+        command: OperationCommand,
     },
 }
 
@@ -155,6 +160,13 @@ enum StorageCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum OperationCommand {
+    List,
+    Get { operation_id: String },
+    Recover { operation_id: String },
+}
+
+#[derive(Debug, Subcommand)]
 enum TransferLimitsCommand {
     Get,
 }
@@ -227,6 +239,7 @@ async fn execute(cli: Cli) -> Result<Response, CliError> {
             "torrent.control.v1".into(),
             "request-idempotency.v1".into(),
             "storage.read.v1".into(),
+            "operation.recovery.v1".into(),
         ],
     };
     connection.send_frame(client_hello.encode_to_vec()).await?;
@@ -266,6 +279,21 @@ fn command_request(command: Command) -> (request::Command, Option<String>) {
             command: StorageCommand::Status,
         } => (
             request::Command::StorageStatus(StorageStatusRequest {}),
+            None,
+        ),
+        Command::Operation {
+            command: OperationCommand::List,
+        } => (request::Command::OperationList(OperationListRequest {}), None),
+        Command::Operation {
+            command: OperationCommand::Get { operation_id },
+        } => (
+            request::Command::OperationGet(OperationGetRequest { operation_id }),
+            None,
+        ),
+        Command::Operation {
+            command: OperationCommand::Recover { operation_id },
+        } => (
+            request::Command::OperationRecover(OperationRecoverRequest { operation_id }),
             None,
         ),
         Command::Qbit {
@@ -493,6 +521,34 @@ fn render_human(response: &Response) -> Result<(), CliError> {
                 );
             }
         }
+        Some(response::Payload::OperationList(value)) => {
+            println!("{} completion operation(s)", value.operations.len());
+            for operation in &value.operations {
+                println!(
+                    "{} · {} · registry {} · files {}/{} · archive receipt {}",
+                    operation.operation_id,
+                    operation.state,
+                    operation.registry_id,
+                    operation.files_moved_and_receipted,
+                    operation.files_total,
+                    if operation.archive_receipted { "yes" } else { "no" }
+                );
+            }
+        }
+        Some(response::Payload::OperationGet(value)) => {
+            if let Some(operation) = value.operation.as_ref() {
+                print_operation_human(operation);
+            }
+        }
+        Some(response::Payload::OperationRecover(value)) => {
+            println!(
+                "recovery {} · replayed {}",
+                value.execution_status, value.replayed
+            );
+            if let Some(operation) = value.operation.as_ref() {
+                print_operation_human(operation);
+            }
+        }
         Some(response::Payload::QbitProbe(value)) => {
             println!(
                 "qBittorrent {} · WebAPI {} · mutations {}",
@@ -692,6 +748,26 @@ fn render_fields(response: &Response) -> Result<(), CliError> {
                 );
             }
         }
+        Some(response::Payload::OperationList(value)) => {
+            println!("operation_count={}", value.operations.len());
+            for (index, operation) in value.operations.iter().enumerate() {
+                print_operation_summary_fields(index, operation);
+            }
+        }
+        Some(response::Payload::OperationGet(value)) => {
+            println!("operation_present={}", value.operation.is_some());
+            if let Some(operation) = value.operation.as_ref() {
+                print_operation_view_fields(operation);
+            }
+        }
+        Some(response::Payload::OperationRecover(value)) => {
+            println!("execution_status={}", sanitize_field(&value.execution_status));
+            println!("replayed={}", value.replayed);
+            println!("operation_present={}", value.operation.is_some());
+            if let Some(operation) = value.operation.as_ref() {
+                print_operation_view_fields(operation);
+            }
+        }
         Some(response::Payload::QbitProbe(value)) => {
             println!("application_version={}", value.application_version);
             println!("webapi_version={}", value.webapi_version);
@@ -845,6 +921,121 @@ fn torrent_state_name(value: i32) -> &'static str {
     TorrentStateView::try_from(value)
         .unwrap_or(TorrentStateView::Unknown)
         .as_str_name()
+}
+
+fn print_operation_human(operation: &OperationView) {
+    let Some(summary) = operation.summary.as_ref() else {
+        println!("operation payload is missing its summary");
+        return;
+    };
+    println!(
+        "{} · {} · registry {} · torrent {}",
+        summary.operation_id, summary.state, summary.registry_id, summary.torrent_id
+    );
+    println!(
+        "  source: {} · archive receipt: {} · files moved+receipted: {}/{} · content audit: {}",
+        operation.source_relative,
+        if summary.archive_receipted { "yes" } else { "no" },
+        summary.files_moved_and_receipted,
+        summary.files_total,
+        if summary.post_handoff_content_audited {
+            "performed"
+        } else {
+            "not performed"
+        }
+    );
+    if let Some(problem_code) = summary.problem_code.as_deref() {
+        println!("  problem: {problem_code}");
+    }
+    for file in &operation.files {
+        println!(
+            "  file {} · {} · {} bytes · {} · {} · destination receipt {}",
+            file.index,
+            file.relative_path,
+            file.size,
+            file.strategy,
+            file.state,
+            if file.destination_receipted { "yes" } else { "no" }
+        );
+    }
+}
+
+fn print_operation_summary_fields(index: usize, operation: &qb_proto::v1::OperationSummary) {
+    println!(
+        "operation.{index}.operation_id={}",
+        sanitize_field(&operation.operation_id)
+    );
+    println!(
+        "operation.{index}.request_id={}",
+        sanitize_field(&operation.request_id)
+    );
+    println!("operation.{index}.kind={}", sanitize_field(&operation.kind));
+    println!("operation.{index}.state={}", sanitize_field(&operation.state));
+    println!(
+        "operation.{index}.registry_id={}",
+        sanitize_field(&operation.registry_id)
+    );
+    println!(
+        "operation.{index}.torrent_id={}",
+        sanitize_field(&operation.torrent_id)
+    );
+    println!(
+        "operation.{index}.problem_code={}",
+        sanitize_field(operation.problem_code.as_deref().unwrap_or(""))
+    );
+    println!("operation.{index}.revision={}", operation.revision);
+    println!("operation.{index}.files_total={}", operation.files_total);
+    println!(
+        "operation.{index}.files_moved_and_receipted={}",
+        operation.files_moved_and_receipted
+    );
+    println!(
+        "operation.{index}.archive_receipted={}",
+        operation.archive_receipted
+    );
+    println!(
+        "operation.{index}.post_handoff_content_audited={}",
+        operation.post_handoff_content_audited
+    );
+}
+
+fn print_operation_view_fields(operation: &OperationView) {
+    if let Some(summary) = operation.summary.as_ref() {
+        print_operation_summary_fields(0, summary);
+    }
+    println!(
+        "operation.source_relative={}",
+        sanitize_field(&operation.source_relative)
+    );
+    println!("operation.file_count={}", operation.files.len());
+    for file in &operation.files {
+        println!(
+            "operation.file.{}.relative_path={}",
+            file.index,
+            sanitize_field(&file.relative_path)
+        );
+        println!("operation.file.{}.size={}", file.index, file.size);
+        println!(
+            "operation.file.{}.strategy={}",
+            file.index,
+            sanitize_field(&file.strategy)
+        );
+        println!(
+            "operation.file.{}.state={}",
+            file.index,
+            sanitize_field(&file.state)
+        );
+        println!(
+            "operation.file.{}.destination_receipted={}",
+            file.index, file.destination_receipted
+        );
+        println!(
+            "operation.file.{}.problem_code={}",
+            file.index,
+            sanitize_field(file.problem_code.as_deref().unwrap_or(""))
+        );
+        println!("operation.file.{}.revision={}", file.index, file.revision);
+    }
 }
 
 fn managed_root_name(value: i32) -> &'static str {
