@@ -2024,10 +2024,6 @@ impl CompletionJournal for Journal {
             self,
             operation_id,
             file_index,
-            &[
-                CompletionFileState::Prepared,
-                CompletionFileState::UnknownMove,
-            ],
             CompletionFileState::MovePending,
             None,
             None,
@@ -2045,7 +2041,6 @@ impl CompletionJournal for Journal {
             self,
             operation_id,
             file_index,
-            &[CompletionFileState::MovePending],
             CompletionFileState::UnknownMove,
             None,
             None,
@@ -2064,10 +2059,6 @@ impl CompletionJournal for Journal {
             self,
             operation_id,
             file_index,
-            &[
-                CompletionFileState::MovePending,
-                CompletionFileState::UnknownMove,
-            ],
             CompletionFileState::HandedOff,
             Some(destination),
             destination_sha256,
@@ -2085,11 +2076,6 @@ impl CompletionJournal for Journal {
             self,
             operation_id,
             file_index,
-            &[
-                CompletionFileState::Prepared,
-                CompletionFileState::MovePending,
-                CompletionFileState::UnknownMove,
-            ],
             CompletionFileState::Blocked,
             None,
             None,
@@ -4297,7 +4283,6 @@ fn transition_completion_file(
     journal: &Journal,
     operation_id: &OperationId,
     file_index: u32,
-    expected: &[CompletionFileState],
     next: CompletionFileState,
     destination: Option<&qb_application::storage::FileEvidence>,
     destination_sha256: Option<[u8; 32]>,
@@ -4334,7 +4319,25 @@ fn transition_completion_file(
             .map_err(map_port_error)?;
         return Ok(current);
     }
-    if !expected.contains(&file.state) {
+    let allowed = match next {
+        CompletionFileState::MovePending => matches!(
+            file.state,
+            CompletionFileState::Prepared | CompletionFileState::UnknownMove
+        ),
+        CompletionFileState::UnknownMove => file.state == CompletionFileState::MovePending,
+        CompletionFileState::HandedOff => matches!(
+            file.state,
+            CompletionFileState::MovePending | CompletionFileState::UnknownMove
+        ),
+        CompletionFileState::Blocked => matches!(
+            file.state,
+            CompletionFileState::Prepared
+                | CompletionFileState::MovePending
+                | CompletionFileState::UnknownMove
+        ),
+        _ => false,
+    };
+    if !allowed {
         return Err(PortError::new(
             "OPERATION_TRANSITION_INVALID",
             format!(
