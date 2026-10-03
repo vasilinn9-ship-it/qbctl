@@ -235,6 +235,22 @@ pub trait CompletionJournal: Send + Sync {
         &self,
         operation_id: &OperationId,
     ) -> Result<CompletionRecord, PortError>;
+
+    fn mark_unknown_remove_record(
+        &self,
+        operation_id: &OperationId,
+        problem_code: &str,
+    ) -> Result<CompletionRecord, PortError>;
+
+    fn retry_remove_record(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<CompletionRecord, PortError>;
+
+    fn finish_completion(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<CompletionRecord, PortError>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -299,6 +315,7 @@ pub enum CompletionExecutionStatus {
     UnknownArchive,
     UnknownMove,
     UnknownSourceDelete,
+    UnknownRemoveRecord,
     Failed,
 }
 
@@ -928,24 +945,9 @@ impl CompletionService {
                 CompletionState::PayloadPending => {
                     self.advance_payload(record, explicit_request).await?
                 }
-                CompletionState::RemoveRecordPending => {
-                    return Ok(completion_execution(
-                        CompletionExecutionStatus::RemoveRecordPending,
-                        record,
-                        None,
-                        replayed,
-                    ));
-                }
-                CompletionState::UnknownRemoveRecord => {
-                    return Ok(completion_execution(
-                        CompletionExecutionStatus::RemoveRecordPending,
-                        record,
-                        Some(PortError::new(
-                            "QBIT_REMOVE_UNCERTAIN",
-                            "qBittorrent record removal remains unresolved",
-                        )),
-                        replayed,
-                    ));
+                CompletionState::RemoveRecordPending
+                | CompletionState::UnknownRemoveRecord => {
+                    self.advance_remove_record(record, explicit_request).await?
                 }
                 CompletionState::Finished => {
                     return Ok(completion_execution(
@@ -1926,6 +1928,118 @@ impl CompletionService {
             token.push(char::from(HEX[usize::from(byte & 0x0f)]));
         }
         format!("_qbctl_tmp/{token}/{file_index}.part")
+    }
+
+    async fn advance_remove_record(
+        &self,
+        mut record: CompletionRecord,
+        explicit_request: bool,
+    ) -> Result<HandoffProgress, PortError> {
+        match self.client.get(&record.torrent_id).await {
+            Ok(None) => {
+                let finished = self.journal.finish_completion(&record.operation_id)?;
+                return Ok(HandoffProgress::Continue(finished));
+            }
+            Ok(Some(_)) => {}
+            Err(problem) => {
+                if record.state == CompletionState::RemoveRecordPending {
+                    record = self
+                        .journal
+                        .mark_unknown_remove_record(&record.operation_id, "QBIT_REMOVE_UNCERTAIN")?;
+                }
+                return Ok(HandoffProgress::Halt {
+                    status: CompletionExecutionStatus::UnknownRemoveRecord,
+                    record,
+                    problem: Some(problem),
+                });
+            }
+        }
+
+        if !explicit_request {
+            if record.state == CompletionState::RemoveRecordPending {
+                record = self
+                    .journal
+                    .mark_unknown_remove_record(&record.operation_id, "QBIT_REMOVE_UNCERTAIN")?;
+            }
+            return Ok(HandoffProgress::Halt {
+                status: CompletionExecutionStatus::UnknownRemoveRecord,
+                record,
+                problem: Some(PortError::new(
+                    "QBIT_REMOVE_UNCERTAIN",
+                    "qBittorrent record is still present after a durable remove intent; explicit replay is required before another remove request",
+                )),
+            });
+        }
+
+        if record.state == CompletionState::UnknownRemoveRecord {
+            record = self.journal.retry_remove_record(&record.operation_id)?;
+        }
+
+        match self.client.remove_keep_files(&record.torrent_id).await {
+            EffectAttempt::NotSent(problem) => Ok(HandoffProgress::Halt {
+                status: CompletionExecutionStatus::RemoveRecordPending,
+                record,
+                problem: Some(problem),
+            }),
+            EffectAttempt::Rejected(problem) => {
+                let failed = self
+                    .journal
+                    .mark_completion_failed(&record.operation_id, problem.code)?;
+                Ok(HandoffProgress::Halt {
+                    status: CompletionExecutionStatus::Failed,
+                    record: failed,
+                    problem: Some(problem),
+                })
+            }
+            EffectAttempt::Uncertain(problem) => {
+                let unknown = self
+                    .journal
+                    .mark_unknown_remove_record(&record.operation_id, "QBIT_REMOVE_UNCERTAIN")?;
+                Ok(HandoffProgress::Halt {
+                    status: CompletionExecutionStatus::UnknownRemoveRecord,
+                    record: unknown,
+                    problem: Some(problem),
+                })
+            }
+            EffectAttempt::Accepted => {
+                for attempt in 0..self.observation_attempts {
+                    match self.client.get(&record.torrent_id).await {
+                        Ok(None) => {
+                            let finished = self.journal.finish_completion(&record.operation_id)?;
+                            return Ok(HandoffProgress::Continue(finished));
+                        }
+                        Ok(Some(_)) => {}
+                        Err(problem) => {
+                            let unknown = self.journal.mark_unknown_remove_record(
+                                &record.operation_id,
+                                "QBIT_REMOVE_UNCERTAIN",
+                            )?;
+                            return Ok(HandoffProgress::Halt {
+                                status: CompletionExecutionStatus::UnknownRemoveRecord,
+                                record: unknown,
+                                problem: Some(problem),
+                            });
+                        }
+                    }
+                    if attempt + 1 < self.observation_attempts {
+                        tokio::time::sleep(self.observation_delay).await;
+                    }
+                }
+
+                let unknown = self.journal.mark_unknown_remove_record(
+                    &record.operation_id,
+                    "QBIT_REMOVE_POSTCONDITION_UNCONFIRMED",
+                )?;
+                Ok(HandoffProgress::Halt {
+                    status: CompletionExecutionStatus::UnknownRemoveRecord,
+                    record: unknown,
+                    problem: Some(PortError::new(
+                        "QBIT_REMOVE_POSTCONDITION_UNCONFIRMED",
+                        "qBittorrent accepted record removal but fresh bounded observation did not confirm absence",
+                    )),
+                })
+            }
+        }
     }
 
     fn observe_same_volume_handoff(
