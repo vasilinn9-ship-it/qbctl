@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 qb-application = { path = "../../crates/qb-application" }
+qb-domain = { path = "../../crates/qb-domain" }
 anyhow.workspace = true
 clap.workspace = true
 prost.workspace = true
