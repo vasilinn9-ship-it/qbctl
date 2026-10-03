@@ -22,6 +22,10 @@ use qb_application::{
     registry::{
         RegisterIncoming, RegisterIncomingResult, RegistryRecord, RegistryState, TorrentRegistry,
     },
+    release::{
+        ReleaseJournal, ReleaseRecord, ReleaseRequest, ReleaseReservation, ReleaseState,
+        RELEASE_FINGERPRINT_VERSION,
+    },
     JournalHealthPort, PortError,
 };
 use qb_domain::{
@@ -32,7 +36,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, Transact
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 #[derive(Debug, Error)]
 pub enum JournalError {
@@ -1029,6 +1033,33 @@ impl AdmissionJournal for Journal {
             }
         };
 
+        let retained_capacity: Option<(String, Vec<u8>, Vec<u8>, String)> = transaction
+            .query_row(
+                "SELECT admission_operation_id, working_volume_id, retained_bytes, working_save_path
+                 FROM retained_capacity
+                 WHERE registry_id = ?1",
+                [&registry_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        if let Some((_, retained_volume, retained_bytes, retained_path)) = &retained_capacity {
+            let retained_volume = decode_u64_blob(retained_volume, "working_volume_id")
+                .map_err(map_port_error)?;
+            let retained_bytes =
+                decode_u64_blob(retained_bytes, "retained_bytes").map_err(map_port_error)?;
+            if retained_volume != request.working_volume_id
+                || retained_bytes != request.reserved_bytes
+                || !retained_path.eq_ignore_ascii_case(&request.working_save_path)
+            {
+                return Err(PortError::new(
+                    "CAPACITY_OWNERSHIP_CONFLICT",
+                    "retained Working capacity does not match the new admission reservation",
+                ));
+            }
+        }
+
         let operation_id = OperationId::new(Uuid::new_v4().to_string())
             .map_err(|error| PortError::new("JOURNAL_STATE_INVALID", error.to_string()))?;
         let now = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
@@ -1139,6 +1170,23 @@ impl AdmissionJournal for Journal {
             .map_err(JournalError::from)
             .map_err(map_port_error)?;
 
+        if retained_capacity.is_some() {
+            let changed = transaction
+                .execute(
+                    "DELETE FROM retained_capacity
+                     WHERE registry_id = ?1",
+                    [&registry_id],
+                )
+                .map_err(JournalError::from)
+                .map_err(map_port_error)?;
+            if changed != 1 {
+                return Err(PortError::new(
+                    "JOURNAL_STATE_INVALID",
+                    "retained capacity changed during admission ownership transfer",
+                ));
+            }
+        }
+
         let changed = transaction
             .execute(
                 "UPDATE torrent_registry
@@ -1222,11 +1270,20 @@ impl AdmissionJournal for Journal {
         let volume = working_volume_id.to_be_bytes();
         let mut statement = connection
             .prepare(
-                "SELECT operation_id, reserved_bytes
-                 FROM admission_reservations
-                 WHERE working_volume_id = ?1
-                   AND reservation_state = 'active'
-                 ORDER BY operation_id",
+                "SELECT responsible, bytes
+                 FROM (
+                    SELECT operation_id AS responsible,
+                           reserved_bytes AS bytes
+                    FROM admission_reservations
+                    WHERE working_volume_id = ?1
+                      AND reservation_state = 'active'
+                    UNION ALL
+                    SELECT source_relative AS responsible,
+                           retained_bytes AS bytes
+                    FROM retained_capacity
+                    WHERE working_volume_id = ?1
+                 )
+                 ORDER BY responsible",
             )
             .map_err(JournalError::from)
             .map_err(map_port_error)?;
@@ -1434,6 +1491,478 @@ impl AdmissionJournal for Journal {
             true,
         )
         .map_err(map_port_error)
+    }
+}
+
+
+impl ReleaseJournal for Journal {
+    fn reserve_release(&self, request: &ReleaseRequest) -> Result<ReleaseReservation, PortError> {
+        if request.registry_id.trim().is_empty() {
+            return Err(PortError::new(
+                "RELEASE_REQUEST_INVALID",
+                "release registry id must not be empty",
+            ));
+        }
+
+        let fingerprint = request.fingerprint();
+        let mut connection = self.connection.lock().expect("journal mutex poisoned");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+
+        let existing: Option<(String, u32, Vec<u8>)> = transaction
+            .query_row(
+                "SELECT operation_id, fingerprint_version, release_fingerprint
+                 FROM release_operations
+                 WHERE request_id = ?1",
+                [request.request_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        if let Some((operation_id, fingerprint_version, stored_fingerprint)) = existing {
+            let operation_id = OperationId::new(operation_id)
+                .map_err(|error| PortError::new("JOURNAL_STATE_INVALID", error.to_string()))?;
+            if fingerprint_version != RELEASE_FINGERPRINT_VERSION
+                || stored_fingerprint.as_slice() != fingerprint
+            {
+                return Ok(ReleaseReservation::Conflict { operation_id });
+            }
+            let record = load_release_record(&transaction, operation_id.as_str())
+                .map_err(map_port_error)?
+                .ok_or_else(|| {
+                    PortError::new(
+                        "JOURNAL_STATE_INVALID",
+                        "release request references a missing operation",
+                    )
+                })?;
+            transaction
+                .commit()
+                .map_err(JournalError::from)
+                .map_err(map_port_error)?;
+            return Ok(ReleaseReservation::Replay(record));
+        }
+
+        let registry = load_registry_record(&transaction, &request.registry_id)
+            .map_err(map_port_error)?
+            .ok_or_else(|| {
+                PortError::new(
+                    "RELEASE_TARGET_NOT_FOUND",
+                    "release registry record does not exist",
+                )
+            })?;
+        if registry.state != RegistryState::Processing {
+            return Err(PortError::new(
+                "RELEASE_TARGET_NOT_PROCESSING",
+                "only a processing registry record can be released from qBittorrent",
+            ));
+        }
+        let admission_operation_id = registry
+            .operation_id
+            .as_deref()
+            .ok_or_else(|| {
+                PortError::new(
+                    "JOURNAL_STATE_INVALID",
+                    "processing registry record has no admission operation",
+                )
+            })
+            .and_then(|value| {
+                OperationId::new(value.to_owned())
+                    .map_err(|error| PortError::new("JOURNAL_STATE_INVALID", error.to_string()))
+            })?;
+
+        let active_release: Option<String> = transaction
+            .query_row(
+                "SELECT operation_id
+                 FROM release_operations
+                 WHERE registry_id = ?1
+                   AND state IN (
+                       'prepared','stop_pending','stopped','unknown_stop',
+                       'delete_pending','unknown_delete'
+                   )
+                 LIMIT 1",
+                [&request.registry_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        if let Some(operation_id) = active_release {
+            let operation_id = OperationId::new(operation_id)
+                .map_err(|error| PortError::new("JOURNAL_STATE_INVALID", error.to_string()))?;
+            return Ok(ReleaseReservation::Conflict { operation_id });
+        }
+
+        let admission = load_admission_record(&transaction, admission_operation_id.as_str())
+            .map_err(map_port_error)?
+            .ok_or_else(|| {
+                PortError::new(
+                    "JOURNAL_STATE_INVALID",
+                    "release target admission record does not exist",
+                )
+            })?;
+        if admission.disposition != MutationDisposition::Finished {
+            return Err(PortError::new(
+                "RELEASE_ADMISSION_NOT_FINISHED",
+                "release requires a finished admission operation",
+            ));
+        }
+
+        let retained: Option<(String, Vec<u8>, Vec<u8>, String)> = transaction
+            .query_row(
+                "SELECT admission_operation_id, working_volume_id, retained_bytes, working_save_path
+                 FROM retained_capacity
+                 WHERE registry_id = ?1",
+                [&request.registry_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        if let Some((owner_admission, volume, bytes, save_path)) = &retained {
+            if owner_admission != admission_operation_id.as_str()
+                || decode_u64_blob(volume, "working_volume_id").map_err(map_port_error)?
+                    != admission.working_volume_id
+                || decode_u64_blob(bytes, "retained_bytes").map_err(map_port_error)?
+                    != admission.reserved_bytes
+                || !save_path.eq_ignore_ascii_case(&admission.working_save_path)
+            {
+                return Err(PortError::new(
+                    "CAPACITY_OWNERSHIP_CONFLICT",
+                    "existing retained capacity does not match the release target admission",
+                ));
+            }
+        } else if !admission.reservation_active {
+            return Err(PortError::new(
+                "CAPACITY_OWNERSHIP_MISSING",
+                "release target has neither active admission nor retained capacity ownership",
+            ));
+        }
+
+        let operation_id = OperationId::new(Uuid::new_v4().to_string())
+            .map_err(|error| PortError::new("JOURNAL_STATE_INVALID", error.to_string()))?;
+        let v1 = admission.identity.v1.map(|value| value.to_vec());
+        let v2 = admission.identity.v2.map(|value| value.to_vec());
+        transaction
+            .execute(
+                "INSERT INTO release_operations(
+                    operation_id,
+                    request_id,
+                    fingerprint_version,
+                    release_fingerprint,
+                    registry_id,
+                    admission_operation_id,
+                    identity_v1,
+                    identity_v2,
+                    source_relative,
+                    source_volume_id,
+                    source_file_id,
+                    source_size,
+                    source_modified_marker,
+                    source_metainfo_digest,
+                    working_volume_id,
+                    retained_bytes,
+                    working_save_path,
+                    state,
+                    problem_code,
+                    revision,
+                    created_at,
+                    updated_at,
+                    finished_at
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                    ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                    'prepared', NULL, 1,
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    NULL
+                 )",
+                params![
+                    operation_id.as_str(),
+                    request.request_id.as_str(),
+                    RELEASE_FINGERPRINT_VERSION,
+                    fingerprint.as_slice(),
+                    request.registry_id,
+                    admission_operation_id.as_str(),
+                    v1,
+                    v2,
+                    admission.source_relative,
+                    admission
+                        .source_evidence
+                        .identity
+                        .volume_id
+                        .to_be_bytes()
+                        .as_slice(),
+                    admission
+                        .source_evidence
+                        .identity
+                        .file_id
+                        .to_be_bytes()
+                        .as_slice(),
+                    admission.source_evidence.size.to_be_bytes().as_slice(),
+                    admission
+                        .source_evidence
+                        .modified_marker
+                        .to_be_bytes()
+                        .as_slice(),
+                    admission.source_metainfo_digest.as_slice(),
+                    admission.working_volume_id.to_be_bytes().as_slice(),
+                    admission.reserved_bytes.to_be_bytes().as_slice(),
+                    admission.working_save_path,
+                ],
+            )
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        insert_release_event(&transaction, operation_id.as_str(), 1, "prepared", None)
+            .map_err(map_port_error)?;
+
+        if retained.is_some() {
+            let changed = transaction
+                .execute(
+                    "UPDATE retained_capacity
+                     SET release_operation_id = ?1,
+                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     WHERE registry_id = ?2
+                       AND admission_operation_id = ?3",
+                    params![
+                        operation_id.as_str(),
+                        request.registry_id,
+                        admission_operation_id.as_str()
+                    ],
+                )
+                .map_err(JournalError::from)
+                .map_err(map_port_error)?;
+            if changed != 1 {
+                return Err(PortError::new(
+                    "JOURNAL_STATE_INVALID",
+                    "retained capacity changed during release reservation",
+                ));
+            }
+        } else {
+            let changed = transaction
+                .execute(
+                    "UPDATE admission_reservations
+                     SET reservation_state = 'released',
+                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     WHERE operation_id = ?1
+                       AND reservation_state = 'active'",
+                    [admission_operation_id.as_str()],
+                )
+                .map_err(JournalError::from)
+                .map_err(map_port_error)?;
+            if changed != 1 {
+                return Err(PortError::new(
+                    "CAPACITY_OWNERSHIP_CONFLICT",
+                    "active admission capacity could not transfer to retained ownership",
+                ));
+            }
+            transaction
+                .execute(
+                    "INSERT INTO retained_capacity(
+                        registry_id,
+                        admission_operation_id,
+                        release_operation_id,
+                        source_relative,
+                        working_volume_id,
+                        retained_bytes,
+                        working_save_path,
+                        created_at,
+                        updated_at
+                     ) VALUES (
+                        ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                        strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     )",
+                    params![
+                        request.registry_id,
+                        admission_operation_id.as_str(),
+                        operation_id.as_str(),
+                        admission.source_relative,
+                        admission.working_volume_id.to_be_bytes().as_slice(),
+                        admission.reserved_bytes.to_be_bytes().as_slice(),
+                        admission.working_save_path,
+                    ],
+                )
+                .map_err(JournalError::from)
+                .map_err(map_port_error)?;
+        }
+
+        let record = load_release_record(&transaction, operation_id.as_str())
+            .map_err(map_port_error)?
+            .ok_or_else(|| {
+                PortError::new(
+                    "JOURNAL_STATE_INVALID",
+                    "new release operation disappeared before commit",
+                )
+            })?;
+        transaction
+            .commit()
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        Ok(ReleaseReservation::New(record))
+    }
+
+    fn list_recoverable_releases(&self) -> Result<Vec<ReleaseRecord>, PortError> {
+        let connection = self.connection.lock().expect("journal mutex poisoned");
+        let mut statement = connection
+            .prepare(
+                "SELECT operation_id
+                 FROM release_operations
+                 WHERE state IN (
+                    'prepared','stop_pending','stopped','unknown_stop',
+                    'delete_pending','unknown_delete'
+                 )
+                 ORDER BY created_at, operation_id",
+            )
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        let mut records = Vec::new();
+        for row in rows {
+            let operation_id = row.map_err(JournalError::from).map_err(map_port_error)?;
+            let record = load_release_record(&connection, &operation_id)
+                .map_err(map_port_error)?
+                .ok_or_else(|| {
+                    PortError::new(
+                        "JOURNAL_STATE_INVALID",
+                        "recoverable release operation disappeared",
+                    )
+                })?;
+            records.push(record);
+        }
+        Ok(records)
+    }
+
+    fn mark_stop_pending(&self, operation_id: &OperationId) -> Result<ReleaseRecord, PortError> {
+        transition_release(
+            self,
+            operation_id,
+            &[ReleaseState::Prepared],
+            ReleaseState::StopPending,
+            None,
+        )
+    }
+
+    fn mark_stopped(&self, operation_id: &OperationId) -> Result<ReleaseRecord, PortError> {
+        transition_release(
+            self,
+            operation_id,
+            &[
+                ReleaseState::Prepared,
+                ReleaseState::StopPending,
+                ReleaseState::UnknownStop,
+            ],
+            ReleaseState::Stopped,
+            None,
+        )
+    }
+
+    fn mark_unknown_stop(
+        &self,
+        operation_id: &OperationId,
+        problem_code: &str,
+    ) -> Result<ReleaseRecord, PortError> {
+        transition_release(
+            self,
+            operation_id,
+            &[ReleaseState::StopPending],
+            ReleaseState::UnknownStop,
+            Some(problem_code),
+        )
+    }
+
+    fn retry_stop(&self, operation_id: &OperationId) -> Result<ReleaseRecord, PortError> {
+        transition_release(
+            self,
+            operation_id,
+            &[ReleaseState::UnknownStop, ReleaseState::StopPending],
+            ReleaseState::Prepared,
+            None,
+        )
+    }
+
+    fn mark_delete_pending(&self, operation_id: &OperationId) -> Result<ReleaseRecord, PortError> {
+        transition_release(
+            self,
+            operation_id,
+            &[ReleaseState::Stopped],
+            ReleaseState::DeletePending,
+            None,
+        )
+    }
+
+    fn mark_unknown_delete(
+        &self,
+        operation_id: &OperationId,
+        problem_code: &str,
+    ) -> Result<ReleaseRecord, PortError> {
+        transition_release(
+            self,
+            operation_id,
+            &[ReleaseState::DeletePending],
+            ReleaseState::UnknownDelete,
+            Some(problem_code),
+        )
+    }
+
+    fn retry_delete(&self, operation_id: &OperationId) -> Result<ReleaseRecord, PortError> {
+        transition_release(
+            self,
+            operation_id,
+            &[ReleaseState::UnknownDelete, ReleaseState::DeletePending],
+            ReleaseState::Stopped,
+            None,
+        )
+    }
+
+    fn mark_release_blocked(
+        &self,
+        operation_id: &OperationId,
+        problem_code: &str,
+    ) -> Result<ReleaseRecord, PortError> {
+        transition_release(
+            self,
+            operation_id,
+            &[
+                ReleaseState::Prepared,
+                ReleaseState::StopPending,
+                ReleaseState::Stopped,
+                ReleaseState::UnknownStop,
+                ReleaseState::DeletePending,
+                ReleaseState::UnknownDelete,
+            ],
+            ReleaseState::Blocked,
+            Some(problem_code),
+        )
+    }
+
+    fn mark_release_failed(
+        &self,
+        operation_id: &OperationId,
+        problem_code: &str,
+    ) -> Result<ReleaseRecord, PortError> {
+        transition_release(
+            self,
+            operation_id,
+            &[ReleaseState::StopPending, ReleaseState::DeletePending],
+            ReleaseState::Failed,
+            Some(problem_code),
+        )
+    }
+
+    fn finish_release(&self, operation_id: &OperationId) -> Result<ReleaseRecord, PortError> {
+        transition_release(
+            self,
+            operation_id,
+            &[ReleaseState::DeletePending, ReleaseState::UnknownDelete],
+            ReleaseState::Finished,
+            None,
+        )
     }
 }
 
@@ -1773,6 +2302,11 @@ fn migrate(connection: &mut Connection) -> Result<(), JournalError> {
         version = 5;
     }
 
+    if version == 5 {
+        migrate_v5_to_v6(connection)?;
+        version = 6;
+    }
+
     if version != SCHEMA_VERSION {
         return Err(JournalError::InvalidState(format!(
             "migration stopped at schema {version}"
@@ -2007,6 +2541,101 @@ fn migrate_v4_to_v5(connection: &mut Connection) -> Result<(), JournalError> {
         WHERE singleton = 1;
 
         PRAGMA user_version = 5;
+        "#,
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+
+fn migrate_v5_to_v6(connection: &mut Connection) -> Result<(), JournalError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE release_operations (
+            operation_id TEXT PRIMARY KEY,
+            request_id TEXT NOT NULL UNIQUE,
+            fingerprint_version INTEGER NOT NULL,
+            release_fingerprint BLOB NOT NULL CHECK(length(release_fingerprint) = 32),
+            registry_id TEXT NOT NULL REFERENCES torrent_registry(registry_id),
+            admission_operation_id TEXT NOT NULL REFERENCES admission_reservations(operation_id),
+            identity_v1 BLOB CHECK(identity_v1 IS NULL OR length(identity_v1) = 20),
+            identity_v2 BLOB CHECK(identity_v2 IS NULL OR length(identity_v2) = 32),
+            source_relative TEXT NOT NULL CHECK(length(source_relative) > 0),
+            source_volume_id BLOB NOT NULL CHECK(length(source_volume_id) = 8),
+            source_file_id BLOB NOT NULL CHECK(length(source_file_id) = 8),
+            source_size BLOB NOT NULL CHECK(length(source_size) = 8),
+            source_modified_marker BLOB NOT NULL CHECK(length(source_modified_marker) = 16),
+            source_metainfo_digest BLOB NOT NULL CHECK(length(source_metainfo_digest) = 32),
+            working_volume_id BLOB NOT NULL CHECK(length(working_volume_id) = 8),
+            retained_bytes BLOB NOT NULL CHECK(length(retained_bytes) = 8),
+            working_save_path TEXT NOT NULL CHECK(length(working_save_path) > 0),
+            state TEXT NOT NULL CHECK(state IN (
+                'prepared',
+                'stop_pending',
+                'stopped',
+                'unknown_stop',
+                'delete_pending',
+                'unknown_delete',
+                'finished',
+                'blocked',
+                'failed'
+            )),
+            problem_code TEXT,
+            revision INTEGER NOT NULL CHECK(revision > 0),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            finished_at TEXT,
+            CHECK(identity_v1 IS NOT NULL OR identity_v2 IS NOT NULL)
+        );
+
+        CREATE UNIQUE INDEX release_active_registry_idx
+        ON release_operations(registry_id)
+        WHERE state IN (
+            'prepared',
+            'stop_pending',
+            'stopped',
+            'unknown_stop',
+            'delete_pending',
+            'unknown_delete'
+        );
+
+        CREATE INDEX release_recovery_idx
+        ON release_operations(state, created_at, operation_id);
+
+        CREATE TABLE release_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operation_id TEXT NOT NULL REFERENCES release_operations(operation_id),
+            revision INTEGER NOT NULL CHECK(revision > 0),
+            event_kind TEXT NOT NULL,
+            state TEXT NOT NULL,
+            problem_code TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(operation_id, revision)
+        );
+
+        CREATE TABLE retained_capacity (
+            registry_id TEXT PRIMARY KEY REFERENCES torrent_registry(registry_id),
+            admission_operation_id TEXT NOT NULL UNIQUE REFERENCES admission_reservations(operation_id),
+            release_operation_id TEXT NOT NULL REFERENCES release_operations(operation_id),
+            source_relative TEXT NOT NULL CHECK(length(source_relative) > 0),
+            working_volume_id BLOB NOT NULL CHECK(length(working_volume_id) = 8),
+            retained_bytes BLOB NOT NULL CHECK(length(retained_bytes) = 8),
+            working_save_path TEXT NOT NULL CHECK(length(working_save_path) > 0),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX retained_capacity_volume_idx
+        ON retained_capacity(working_volume_id);
+
+        UPDATE schema_meta
+        SET schema_version = 6,
+            application_min_version = '0.1.0',
+            migrated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE singleton = 1;
+
+        PRAGMA user_version = 6;
         "#,
     )?;
     transaction.commit()?;
@@ -2474,6 +3103,325 @@ fn transition_cleanup(
             PortError::new(
                 "JOURNAL_STATE_INVALID",
                 "Incoming cleanup disappeared after transition",
+            )
+        })?;
+    transaction
+        .commit()
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    Ok(record)
+}
+
+
+struct StoredReleaseRow {
+    request_id: String,
+    operation_id: String,
+    registry_id: String,
+    admission_operation_id: String,
+    identity_v1: Option<Vec<u8>>,
+    identity_v2: Option<Vec<u8>>,
+    source_relative: String,
+    source_volume_id: Vec<u8>,
+    source_file_id: Vec<u8>,
+    source_size: Vec<u8>,
+    source_modified_marker: Vec<u8>,
+    source_metainfo_digest: Vec<u8>,
+    working_volume_id: Vec<u8>,
+    retained_bytes: Vec<u8>,
+    working_save_path: String,
+    state: String,
+    problem_code: Option<String>,
+    revision: u64,
+}
+
+fn load_release_record(
+    connection: &Connection,
+    operation_id: &str,
+) -> Result<Option<ReleaseRecord>, JournalError> {
+    let row: Option<StoredReleaseRow> = connection
+        .query_row(
+            "SELECT request_id,
+                    operation_id,
+                    registry_id,
+                    admission_operation_id,
+                    identity_v1,
+                    identity_v2,
+                    source_relative,
+                    source_volume_id,
+                    source_file_id,
+                    source_size,
+                    source_modified_marker,
+                    source_metainfo_digest,
+                    working_volume_id,
+                    retained_bytes,
+                    working_save_path,
+                    state,
+                    problem_code,
+                    revision
+             FROM release_operations
+             WHERE operation_id = ?1",
+            [operation_id],
+            |row| {
+                Ok(StoredReleaseRow {
+                    request_id: row.get(0)?,
+                    operation_id: row.get(1)?,
+                    registry_id: row.get(2)?,
+                    admission_operation_id: row.get(3)?,
+                    identity_v1: row.get(4)?,
+                    identity_v2: row.get(5)?,
+                    source_relative: row.get(6)?,
+                    source_volume_id: row.get(7)?,
+                    source_file_id: row.get(8)?,
+                    source_size: row.get(9)?,
+                    source_modified_marker: row.get(10)?,
+                    source_metainfo_digest: row.get(11)?,
+                    working_volume_id: row.get(12)?,
+                    retained_bytes: row.get(13)?,
+                    working_save_path: row.get(14)?,
+                    state: row.get(15)?,
+                    problem_code: row.get(16)?,
+                    revision: row.get(17)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let request_id = RequestId::new(row.request_id)
+        .map_err(|error| JournalError::InvalidState(error.to_string()))?;
+    let operation_id = OperationId::new(row.operation_id)
+        .map_err(|error| JournalError::InvalidState(error.to_string()))?;
+    let admission_operation_id = OperationId::new(row.admission_operation_id)
+        .map_err(|error| JournalError::InvalidState(error.to_string()))?;
+    let v1 = row
+        .identity_v1
+        .map(|value| {
+            value.try_into().map_err(|value: Vec<u8>| {
+                JournalError::InvalidState(format!(
+                    "release v1 identity has {} bytes instead of 20",
+                    value.len()
+                ))
+            })
+        })
+        .transpose()?;
+    let v2 = row
+        .identity_v2
+        .map(|value| {
+            value.try_into().map_err(|value: Vec<u8>| {
+                JournalError::InvalidState(format!(
+                    "release v2 identity has {} bytes instead of 32",
+                    value.len()
+                ))
+            })
+        })
+        .transpose()?;
+    let identity = TorrentIdentity::new(v1, v2)
+        .ok_or_else(|| JournalError::InvalidState("release has no torrent identity".into()))?;
+    let source_metainfo_digest: [u8; 32] =
+        row.source_metainfo_digest
+            .try_into()
+            .map_err(|value: Vec<u8>| {
+                JournalError::InvalidState(format!(
+                    "release source digest has {} bytes instead of 32",
+                    value.len()
+                ))
+            })?;
+    let state = parse_release_state(&row.state).ok_or_else(|| {
+        JournalError::InvalidState(format!("unknown release state '{}'", row.state))
+    })?;
+
+    Ok(Some(ReleaseRecord {
+        request_id,
+        operation_id,
+        registry_id: row.registry_id,
+        admission_operation_id,
+        identity,
+        source_relative: row.source_relative,
+        source_evidence: qb_application::storage::FileEvidence {
+            identity: qb_application::storage::FileIdentity {
+                volume_id: decode_u64_blob(&row.source_volume_id, "source_volume_id")?,
+                file_id: decode_u64_blob(&row.source_file_id, "source_file_id")?,
+            },
+            size: decode_u64_blob(&row.source_size, "source_size")?,
+            modified_marker: decode_u128_blob(
+                &row.source_modified_marker,
+                "source_modified_marker",
+            )?,
+        },
+        source_metainfo_digest,
+        working_volume_id: decode_u64_blob(&row.working_volume_id, "working_volume_id")?,
+        retained_bytes: decode_u64_blob(&row.retained_bytes, "retained_bytes")?,
+        working_save_path: row.working_save_path,
+        state,
+        problem_code: row.problem_code,
+        revision: row.revision,
+    }))
+}
+
+fn release_state_name(state: ReleaseState) -> &'static str {
+    match state {
+        ReleaseState::Prepared => "prepared",
+        ReleaseState::StopPending => "stop_pending",
+        ReleaseState::Stopped => "stopped",
+        ReleaseState::UnknownStop => "unknown_stop",
+        ReleaseState::DeletePending => "delete_pending",
+        ReleaseState::UnknownDelete => "unknown_delete",
+        ReleaseState::Finished => "finished",
+        ReleaseState::Blocked => "blocked",
+        ReleaseState::Failed => "failed",
+    }
+}
+
+fn parse_release_state(state: &str) -> Option<ReleaseState> {
+    match state {
+        "prepared" => Some(ReleaseState::Prepared),
+        "stop_pending" => Some(ReleaseState::StopPending),
+        "stopped" => Some(ReleaseState::Stopped),
+        "unknown_stop" => Some(ReleaseState::UnknownStop),
+        "delete_pending" => Some(ReleaseState::DeletePending),
+        "unknown_delete" => Some(ReleaseState::UnknownDelete),
+        "finished" => Some(ReleaseState::Finished),
+        "blocked" => Some(ReleaseState::Blocked),
+        "failed" => Some(ReleaseState::Failed),
+        _ => None,
+    }
+}
+
+fn insert_release_event(
+    transaction: &Transaction<'_>,
+    operation_id: &str,
+    revision: u64,
+    state: &str,
+    problem_code: Option<&str>,
+) -> Result<(), JournalError> {
+    transaction.execute(
+        "INSERT INTO release_events(
+            operation_id, revision, event_kind, state, problem_code, created_at
+         ) VALUES (
+            ?1, ?2, ?3, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        params![operation_id, revision, state, problem_code],
+    )?;
+    Ok(())
+}
+
+fn transition_release(
+    journal: &Journal,
+    operation_id: &OperationId,
+    expected: &[ReleaseState],
+    next: ReleaseState,
+    problem_code: Option<&str>,
+) -> Result<ReleaseRecord, PortError> {
+    let mut connection = journal.connection.lock().expect("journal mutex poisoned");
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    let current = load_release_record(&transaction, operation_id.as_str())
+        .map_err(map_port_error)?
+        .ok_or_else(|| PortError::new("RELEASE_NOT_FOUND", operation_id.to_string()))?;
+
+    if current.state == next && current.problem_code.as_deref() == problem_code {
+        transaction
+            .commit()
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        return Ok(current);
+    }
+    if !expected.contains(&current.state) {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            format!(
+                "release {} cannot move from {} to {}",
+                operation_id,
+                release_state_name(current.state),
+                release_state_name(next)
+            ),
+        ));
+    }
+
+    let revision = current.revision.checked_add(1).ok_or_else(|| {
+        PortError::new("JOURNAL_STATE_INVALID", "release revision overflow")
+    })?;
+    let finished = matches!(
+        next,
+        ReleaseState::Finished | ReleaseState::Blocked | ReleaseState::Failed
+    );
+    let finished_sql = if finished {
+        "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+    } else {
+        "NULL"
+    };
+    let changed = transaction
+        .execute(
+            &format!(
+                "UPDATE release_operations
+                 SET state = ?1,
+                     problem_code = ?2,
+                     revision = ?3,
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                     finished_at = {finished_sql}
+                 WHERE operation_id = ?4
+                   AND revision = ?5
+                   AND state = ?6"
+            ),
+            params![
+                release_state_name(next),
+                problem_code,
+                revision,
+                operation_id.as_str(),
+                current.revision,
+                release_state_name(current.state),
+            ],
+        )
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    if changed != 1 {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            "release operation changed concurrently",
+        ));
+    }
+
+    if next == ReleaseState::Finished {
+        let changed = transaction
+            .execute(
+                "UPDATE torrent_registry
+                 SET state = 'incoming',
+                     operation_id = NULL,
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE registry_id = ?1
+                   AND state = 'processing'
+                   AND operation_id = ?2",
+                params![current.registry_id, current.admission_operation_id.as_str()],
+            )
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        if changed != 1 {
+            return Err(PortError::new(
+                "JOURNAL_STATE_INVALID",
+                "finished release could not return registry ownership to Incoming",
+            ));
+        }
+    }
+
+    insert_release_event(
+        &transaction,
+        operation_id.as_str(),
+        revision,
+        release_state_name(next),
+        problem_code,
+    )
+    .map_err(map_port_error)?;
+
+    let record = load_release_record(&transaction, operation_id.as_str())
+        .map_err(map_port_error)?
+        .ok_or_else(|| {
+            PortError::new(
+                "JOURNAL_STATE_INVALID",
+                "release operation disappeared after transition",
             )
         })?;
     transaction
@@ -3067,13 +4015,16 @@ mod tests {
                     'torrent_aliases',
                     'admission_reservations',
                     'incoming_cleanup_intents',
-                    'incoming_cleanup_events'
+                    'incoming_cleanup_events',
+                    'release_operations',
+                    'release_events',
+                    'retained_capacity'
                  )",
                 [],
                 |row| row.get(0),
             )
             .expect("table count");
-        assert_eq!(table_count, 9);
+        assert_eq!(table_count, 12);
     }
 
     fn cleanup_intent() -> IncomingCleanupIntent {
@@ -3552,6 +4503,156 @@ mod tests {
             .expect("retry ready");
         assert_eq!(retry.disposition, MutationDisposition::Prepared);
         assert_eq!(retry.checkpoint, "retry_ready");
+    }
+
+
+    fn finished_admission(journal: &Journal, request_id_value: &str) -> AdmissionRecord {
+        let request = admission_request(request_id_value);
+        let operation_id = match journal.reserve_admission(&request).expect("reserve admission") {
+            AdmissionReservationResult::New(record) => record.operation_id,
+            other => panic!("unexpected admission reservation: {other:?}"),
+        };
+        journal
+            .mark_admission_effect_pending(&operation_id)
+            .expect("admission pending");
+        journal
+            .mark_admission_observed_applied(&operation_id)
+            .expect("admission observed");
+        journal.finish_admission(&operation_id).expect("admission finished")
+    }
+
+    #[test]
+    fn release_is_durable_and_transfers_capacity_without_losing_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.sqlite");
+        let admission = {
+            let journal = Journal::open(&path).expect("journal");
+            finished_admission(&journal, "release-admission")
+        };
+
+        let release_request = ReleaseRequest {
+            request_id: RequestId::new("release-request").expect("request id"),
+            registry_id: admission.registry_id.clone(),
+        };
+        let release_operation = {
+            let journal = Journal::open(&path).expect("reopen");
+            let record = match journal.reserve_release(&release_request).expect("reserve release") {
+                ReleaseReservation::New(record) => record,
+                other => panic!("unexpected release reservation: {other:?}"),
+            };
+            assert_eq!(record.state, ReleaseState::Prepared);
+            assert_eq!(record.admission_operation_id, admission.operation_id);
+            assert_eq!(record.retained_bytes, admission.reserved_bytes);
+            assert!(!journal
+                .get_admission(&admission.operation_id)
+                .expect("admission")
+                .expect("record")
+                .reservation_active);
+            let reservations = journal.capacity_reservations(42).expect("capacity");
+            assert_eq!(reservations.len(), 1);
+            assert_eq!(reservations[0].responsible, "candidate.torrent");
+            assert_eq!(reservations[0].bytes, 4096);
+            record.operation_id
+        };
+
+        let reopened = Journal::open(&path).expect("reopen again");
+        let recoverable = reopened
+            .list_recoverable_releases()
+            .expect("recoverable releases");
+        assert_eq!(recoverable.len(), 1);
+        assert_eq!(recoverable[0].operation_id, release_operation);
+
+        let stop_pending = reopened
+            .mark_stop_pending(&release_operation)
+            .expect("stop pending");
+        assert_eq!(stop_pending.state, ReleaseState::StopPending);
+        let unknown = reopened
+            .mark_unknown_stop(&release_operation, "QBIT_STOP_UNCERTAIN")
+            .expect("unknown stop");
+        assert_eq!(unknown.state, ReleaseState::UnknownStop);
+        let retry = reopened.retry_stop(&release_operation).expect("retry stop");
+        assert_eq!(retry.state, ReleaseState::Prepared);
+
+        reopened
+            .mark_stop_pending(&release_operation)
+            .expect("stop pending again");
+        let stopped = reopened.mark_stopped(&release_operation).expect("stopped");
+        assert_eq!(stopped.state, ReleaseState::Stopped);
+        reopened
+            .mark_delete_pending(&release_operation)
+            .expect("delete pending");
+        let unknown_delete = reopened
+            .mark_unknown_delete(&release_operation, "QBIT_DELETE_UNCERTAIN")
+            .expect("unknown delete");
+        assert_eq!(unknown_delete.state, ReleaseState::UnknownDelete);
+        reopened
+            .retry_delete(&release_operation)
+            .expect("retry delete");
+        reopened
+            .mark_delete_pending(&release_operation)
+            .expect("delete pending again");
+        let finished = reopened.finish_release(&release_operation).expect("finish release");
+        assert_eq!(finished.state, ReleaseState::Finished);
+        assert!(reopened
+            .list_recoverable_releases()
+            .expect("recoverable")
+            .is_empty());
+
+        let registry = reopened
+            .find_by_identity(&admission.identity)
+            .expect("registry")
+            .expect("record");
+        assert_eq!(registry.state, RegistryState::Incoming);
+        assert!(registry.operation_id.is_none());
+
+        let reservations = reopened.capacity_reservations(42).expect("retained capacity");
+        assert_eq!(reservations.len(), 1);
+        assert_eq!(reservations[0].responsible, "candidate.torrent");
+
+        let mut readmission = admission_request("readmission-after-release");
+        readmission.identity = admission.identity.clone();
+        match reopened.reserve_admission(&readmission).expect("readmission") {
+            AdmissionReservationResult::New(record) => {
+                assert!(record.reservation_active);
+                assert_eq!(record.registry_id, admission.registry_id);
+            }
+            other => panic!("unexpected readmission result: {other:?}"),
+        }
+        let reservations = reopened
+            .capacity_reservations(42)
+            .expect("capacity after readmission");
+        assert_eq!(reservations.len(), 1);
+        assert_eq!(reservations[0].bytes, 4096);
+    }
+
+    #[test]
+    fn release_request_id_replays_and_conflicts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path().join("state.sqlite")).expect("journal");
+        let admission = finished_admission(&journal, "release-conflict-admission");
+        let request = ReleaseRequest {
+            request_id: RequestId::new("release-idempotent").expect("request id"),
+            registry_id: admission.registry_id.clone(),
+        };
+        let operation_id = match journal.reserve_release(&request).expect("release") {
+            ReleaseReservation::New(record) => record.operation_id,
+            other => panic!("unexpected release: {other:?}"),
+        };
+        match journal.reserve_release(&request).expect("replay") {
+            ReleaseReservation::Replay(record) => assert_eq!(record.operation_id, operation_id),
+            other => panic!("unexpected replay: {other:?}"),
+        }
+
+        let conflict = ReleaseRequest {
+            request_id: request.request_id,
+            registry_id: "different-registry".into(),
+        };
+        match journal.reserve_release(&conflict).expect("conflict") {
+            ReleaseReservation::Conflict { operation_id: existing } => {
+                assert_eq!(existing, operation_id)
+            }
+            other => panic!("unexpected conflict: {other:?}"),
+        }
     }
 
     #[test]
