@@ -5813,8 +5813,8 @@ mod tests {
         };
 
         let journal = Journal::open(&path).expect("reopen transitions");
-        let pending = CompletionJournal::mark_stop_pending(&journal, &operation_id)
-            .expect("stop pending");
+        let pending =
+            CompletionJournal::mark_stop_pending(&journal, &operation_id).expect("stop pending");
         assert_eq!(pending.state, CompletionState::StopPending);
 
         let unknown =
@@ -5827,8 +5827,7 @@ mod tests {
         assert_eq!(retry.state, CompletionState::Prepared);
         assert!(retry.problem_code.is_none());
 
-        CompletionJournal::mark_stop_pending(&journal, &operation_id)
-            .expect("stop pending again");
+        CompletionJournal::mark_stop_pending(&journal, &operation_id).expect("stop pending again");
         let stopped = CompletionJournal::mark_stopped(&journal, &operation_id).expect("stopped");
         assert_eq!(stopped.state, CompletionState::Stopped);
 
@@ -5888,21 +5887,19 @@ mod tests {
         assert_eq!(recoverable.len(), 1);
         assert_eq!(recoverable[0].operation_id, release_operation);
 
-        let stop_pending = ReleaseJournal::mark_stop_pending(&reopened, &release_operation)
-            .expect("stop pending");
+        let stop_pending =
+            ReleaseJournal::mark_stop_pending(&reopened, &release_operation).expect("stop pending");
         assert_eq!(stop_pending.state, ReleaseState::StopPending);
         let unknown =
             ReleaseJournal::mark_unknown_stop(&reopened, &release_operation, "QBIT_STOP_UNCERTAIN")
                 .expect("unknown stop");
         assert_eq!(unknown.state, ReleaseState::UnknownStop);
-        let retry =
-            ReleaseJournal::retry_stop(&reopened, &release_operation).expect("retry stop");
+        let retry = ReleaseJournal::retry_stop(&reopened, &release_operation).expect("retry stop");
         assert_eq!(retry.state, ReleaseState::Prepared);
 
         ReleaseJournal::mark_stop_pending(&reopened, &release_operation)
             .expect("stop pending again");
-        let stopped =
-            ReleaseJournal::mark_stopped(&reopened, &release_operation).expect("stopped");
+        let stopped = ReleaseJournal::mark_stopped(&reopened, &release_operation).expect("stopped");
         assert_eq!(stopped.state, ReleaseState::Stopped);
         reopened
             .mark_delete_pending(&release_operation)
