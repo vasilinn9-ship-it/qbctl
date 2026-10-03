@@ -71,3 +71,39 @@ message QbitProbeResponse {
   string webapi_version = 2;
   bool mutation_ready = 3;
 }
+
+
+message PauseTorrentRequest {
+  string torrent_id = 1;
+}
+
+message ResumeTorrentRequest {
+  string torrent_id = 1;
+}
+
+message QueueTargetGetRequest {}
+
+message QueueTargetResponse {
+  optional uint32 target_client_count = 1;
+}
+
+message SetQueueTargetRequest {
+  uint32 target_client_count = 1;
+}
+
+message SetActiveDownloadsRequest {
+  uint32 max_active_downloads = 1;
+}
+
+message SetDownloadLimitRequest {
+  uint64 bytes_per_sec = 1;
+}
+
+message SetUploadLimitRequest {
+  uint64 bytes_per_sec = 1;
+}
+
+message MutationResultResponse {
+  bool replayed = 1;
+  string checkpoint = 2;
+}
