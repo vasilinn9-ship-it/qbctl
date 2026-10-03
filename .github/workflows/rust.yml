@@ -114,3 +114,30 @@ jobs:
       - name: Stop disposable qBittorrent
         if: always()
         run: docker rm -f qbctl-real-qbit || true
+
+
+  sync-lockfile:
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'rust/slice-2-qbit'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.head_ref }}
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - name: Refresh committed lockfile
+        run: cargo generate-lockfile
+      - name: Commit lockfile when stale
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- Cargo.lock; then
+            echo "Cargo.lock is already current"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          git commit -m "Refresh Slice 2 Cargo.lock"
+          git push origin "HEAD:${GITHUB_HEAD_REF}"
