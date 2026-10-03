@@ -455,8 +455,8 @@ fn copy_to_temp_verified(
 ) -> Result<VerifiedCopyOutcome, PortError> {
     let refreshed_source =
         validate_root(source_role, roots.path(source_role)).map_err(map_storage_port_error)?;
-    let refreshed_destination =
-        validate_root(destination_role, roots.path(destination_role)).map_err(map_storage_port_error)?;
+    let refreshed_destination = validate_root(destination_role, roots.path(destination_role))
+        .map_err(map_storage_port_error)?;
     if !paths_equal(&refreshed_source, roots.path(source_role))
         || !paths_equal(&refreshed_destination, roots.path(destination_role))
     {
@@ -819,7 +819,9 @@ fn move_same_volume_no_replace(
     let destination_managed =
         ManagedRelativePath::parse(destination_relative).map_err(map_storage_port_error)?;
     let source_path = roots.path(source_role).join(source_managed.as_path());
-    let destination_path = roots.path(destination_role).join(destination_managed.as_path());
+    let destination_path = roots
+        .path(destination_role)
+        .join(destination_managed.as_path());
 
     match observe_managed_file(roots, source_role, source_relative)? {
         None => return Ok(SameVolumeMoveOutcome::SourceMissing),
@@ -864,7 +866,9 @@ fn move_same_volume_no_replace(
             .map(|value| value as u32)
             .is_some_and(|value| value == ERROR_ALREADY_EXISTS || value == ERROR_FILE_EXISTS)
         {
-            if let Some(observed) = observe_managed_file(roots, destination_role, destination_relative)? {
+            if let Some(observed) =
+                observe_managed_file(roots, destination_role, destination_relative)?
+            {
                 return Ok(SameVolumeMoveOutcome::DestinationExists { observed });
             }
         }
@@ -877,8 +881,8 @@ fn move_same_volume_no_replace(
             "source still exists after same-volume move",
         ));
     }
-    let destination =
-        observe_managed_file(roots, destination_role, destination_relative)?.ok_or_else(|| {
+    let destination = observe_managed_file(roots, destination_role, destination_relative)?
+        .ok_or_else(|| {
             PortError::new(
                 "STORAGE_MOVE_POSTCONDITION",
                 "destination is missing after same-volume move",
