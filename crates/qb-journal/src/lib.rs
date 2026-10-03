@@ -2015,12 +2015,7 @@ impl CompletionJournal for Journal {
         destination: &qb_application::storage::FileEvidence,
         destination_sha256: [u8; 32],
     ) -> Result<CompletionRecord, PortError> {
-        receipt_completion_archive_destination(
-            self,
-            operation_id,
-            destination,
-            destination_sha256,
-        )
+        receipt_completion_archive_destination(self, operation_id, destination, destination_sha256)
     }
 
     fn mark_archive_receipted(
@@ -2185,10 +2180,7 @@ impl CompletionJournal for Journal {
         )
     }
 
-    fn finish_completion(
-        &self,
-        operation_id: &OperationId,
-    ) -> Result<CompletionRecord, PortError> {
+    fn finish_completion(&self, operation_id: &OperationId) -> Result<CompletionRecord, PortError> {
         finish_completion_operation(self, operation_id)
     }
 }
