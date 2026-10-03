@@ -11,8 +11,8 @@ use qb_domain::{torrent::TorrentId, RequestId};
 use qb_proto::{
     v1::{
         request, response, CapabilitiesResponse, MutationCertainty, MutationResultResponse,
-        NextAction, Problem, ProblemCategory, QueueTargetResponse, Request, Response, RetryGuidance,
-        Status, TorrentGetResponse,
+        NextAction, Problem, ProblemCategory, QueueTargetResponse, Request, Response,
+        RetryGuidance, Status, TorrentGetResponse,
     },
     PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
@@ -265,9 +265,11 @@ async fn dispatch_mutation(
         Ok(MutationExecutionResult::Execution(execution)) => {
             mutation_execution_response(sequence, Some(request_id.into_inner()), *execution)
         }
-        Ok(MutationExecutionResult::Conflict { operation_id }) => {
-            request_conflict(sequence, Some(request_id.into_inner()), operation_id.to_string())
-        }
+        Ok(MutationExecutionResult::Conflict { operation_id }) => request_conflict(
+            sequence,
+            Some(request_id.into_inner()),
+            operation_id.to_string(),
+        ),
         Err(error) => port_error(sequence, Some(request_id.into_inner()), error),
     }
 }
@@ -377,11 +379,7 @@ fn mutation_problem(
     }
 }
 
-fn request_conflict(
-    sequence: u64,
-    request_id: Option<String>,
-    operation_id: String,
-) -> Response {
+fn request_conflict(sequence: u64, request_id: Option<String>, operation_id: String) -> Response {
     Response {
         sequence,
         status: Status::Error as i32,
