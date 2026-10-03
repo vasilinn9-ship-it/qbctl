@@ -1,4 +1,7 @@
-use crate::{storage::IncomingScan, PortError};
+use crate::{
+    storage::{IncomingScan, ManagedRoot, Storage},
+    PortError,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapacityReservation {
@@ -42,6 +45,22 @@ pub struct CapacityDecision {
 pub struct AdmissionCapacityPlan {
     pub decisions: Vec<CapacityDecision>,
     pub final_reserved_bytes: u64,
+}
+
+pub fn plan_incoming_capacity_from_storage(
+    storage: &dyn Storage,
+    scan: &IncomingScan,
+    reserve_bytes: u64,
+    existing_reservations: Vec<CapacityReservation>,
+) -> Result<AdmissionCapacityPlan, PortError> {
+    let volume = storage.volume_status(ManagedRoot::Working)?;
+    plan_incoming_capacity(
+        scan,
+        volume.volume_id,
+        volume.free_bytes,
+        reserve_bytes,
+        existing_reservations,
+    )
 }
 
 pub fn plan_incoming_capacity(
@@ -162,9 +181,83 @@ fn capacity_key_order(left: &str, right: &str) -> std::cmp::Ordering {
 mod tests {
     use qb_domain::torrent::{ManifestFile, TorrentIdentity, TorrentManifest, TorrentMetainfo};
 
-    use crate::storage::{FileEvidence, FileIdentity, IncomingCandidate, IncomingScan};
+    use crate::storage::{
+        FileEvidence, FileIdentity, IncomingCandidate, IncomingFileSnapshot, IncomingScan,
+        StorageVolumeStatus,
+    };
 
     use super::*;
+
+    struct CapacityStorage;
+
+    impl Storage for CapacityStorage {
+        fn volume_status(&self, root: ManagedRoot) -> Result<StorageVolumeStatus, PortError> {
+            assert_eq!(root, ManagedRoot::Working);
+            Ok(StorageVolumeStatus {
+                root,
+                volume_id: 7,
+                free_bytes: 120,
+                total_bytes: 1_000,
+            })
+        }
+
+        fn list_incoming(&self) -> Result<Vec<String>, PortError> {
+            Err(PortError::new(
+                "INTERNAL_INVARIANT_VIOLATION",
+                "capacity planning must not rescan Incoming",
+            ))
+        }
+
+        fn read_incoming(
+            &self,
+            _relative_path: &str,
+            _max_bytes: usize,
+        ) -> Result<IncomingFileSnapshot, PortError> {
+            Err(PortError::new(
+                "INTERNAL_INVARIANT_VIOLATION",
+                "capacity planning must not reread Incoming",
+            ))
+        }
+    }
+
+    #[test]
+    fn incoming_capacity_reads_fresh_working_volume_status() {
+        let candidate = IncomingCandidate {
+            relative_path: "candidate.torrent".into(),
+            source_evidence: FileEvidence {
+                identity: FileIdentity {
+                    volume_id: 1,
+                    file_id: 2,
+                },
+                size: 3,
+                modified_marker: 4,
+            },
+            source_sha256: [0x55; 32],
+            metainfo: TorrentMetainfo {
+                identity: TorrentIdentity::new(Some([0x11; 20]), None).expect("identity"),
+                manifest: TorrentManifest::new(vec![ManifestFile {
+                    path: "payload.bin".into(),
+                    size: 90,
+                }])
+                .expect("manifest"),
+            },
+        };
+        let scan = IncomingScan {
+            eligible: vec![candidate],
+            already_processed: Vec::new(),
+            redundant_identical: Vec::new(),
+            rejected: Vec::new(),
+        };
+
+        let plan =
+            plan_incoming_capacity_from_storage(&CapacityStorage, &scan, 10, Vec::new())
+                .expect("capacity plan");
+
+        assert_eq!(plan.decisions[0].explanation.volume_id, 7);
+        assert_eq!(plan.decisions[0].explanation.free_bytes, 120);
+        assert_eq!(plan.decisions[0].explanation.required_bytes, 100);
+        assert_eq!(plan.decisions[0].disposition, CapacityDisposition::Accepted);
+    }
 
     #[test]
     fn defers_large_candidate_and_continues_with_later_independent_candidate() {
