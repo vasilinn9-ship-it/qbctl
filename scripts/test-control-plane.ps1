@@ -253,6 +253,27 @@ try {
     Assert-Exit 0 (Invoke-CliText @("capabilities")) "capabilities"
     Assert-Exit 0 (Invoke-CliText @("doctor")) "doctor"
 
+    $storageList = Invoke-CliText @("--output", "fields", "storage", "list")
+    Assert-Exit 0 $storageList "storage list"
+    if ($storageList.Stdout -notmatch "(?m)^storage_root_count=4\r?$" -or
+        $storageList.Stdout -notmatch "(?m)^storage_root\.0\.role=MANAGED_ROOT_VIEW_INCOMING\r?$" -or
+        $storageList.Stdout -notmatch "(?m)^storage_root\.1\.role=MANAGED_ROOT_VIEW_ARCHIVE\r?$" -or
+        $storageList.Stdout -notmatch "(?m)^storage_root\.2\.role=MANAGED_ROOT_VIEW_WORKING\r?$" -or
+        $storageList.Stdout -notmatch "(?m)^storage_root\.3\.role=MANAGED_ROOT_VIEW_COMPLETED\r?$") {
+        throw "storage list did not expose all managed roots in deterministic order"
+    }
+
+    $storageStatus = Invoke-CliText @("--output", "fields", "storage", "status")
+    Assert-Exit 0 $storageStatus "storage status"
+    if ($storageStatus.Stdout -notmatch "(?m)^incoming_eligible_count=1\r?$" -or
+        $storageStatus.Stdout -notmatch "(?m)^incoming_already_processed_count=0\r?$" -or
+        $storageStatus.Stdout -notmatch "(?m)^incoming_redundant_identical_count=0\r?$" -or
+        $storageStatus.Stdout -notmatch "(?m)^incoming_rejected_count=0\r?$" -or
+        $storageStatus.Stdout -notmatch "(?m)^incoming\.0\.relative_path=a\.torrent\r?$" -or
+        $storageStatus.Stdout -notmatch "(?m)^incoming\.0\.classification=eligible\r?$") {
+        throw "storage status did not expose the post-cleanup Incoming scan"
+    }
+
     $torrentUnavailable = Invoke-CliText @("--output", "fields", "torrent", "list")
     Assert-Exit 6 $torrentUnavailable "torrent list without qBittorrent"
     if ($torrentUnavailable.Stdout -notmatch "(?m)^problem\.0\.code=QBIT_UNAVAILABLE\r?$") {
@@ -393,6 +414,7 @@ try {
     $daemon = Start-Daemon
     Wait-DaemonReady
     Assert-Exit 0 (Invoke-CliText @("doctor")) "doctor after restart"
+    Assert-Exit 0 (Invoke-CliText @("storage", "status")) "storage status after restart"
     if (-not (Test-Path $canonicalIncoming) -or (Test-Path $redundantIncoming)) {
         throw "Incoming cleanup state was not stable across daemon restart"
     }
