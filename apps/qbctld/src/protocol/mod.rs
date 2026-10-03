@@ -6,7 +6,11 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context as _, Result};
 use prost::Message;
-use qb_application::{system::SystemService, torrent::TorrentService};
+use qb_application::{
+    mutation::MutationService,
+    system::{RuntimeHealthPort, SystemService},
+    torrent::TorrentService,
+};
 use qb_ipc::{IpcError, ServerConnection};
 use qb_proto::v1::Request;
 use tokio::time::timeout;
@@ -20,6 +24,7 @@ pub async fn serve_connection(
     runtime: Arc<RuntimeContext>,
     system: Arc<SystemService>,
     torrents: Option<Arc<TorrentService>>,
+    mutations: Arc<MutationService>,
     qbit_startup_problem: Option<Arc<str>>,
 ) -> Result<()> {
     let handshake = timeout(
@@ -42,10 +47,14 @@ pub async fn serve_connection(
         };
         let request = Request::decode(frame).context("decode protocol request")?;
 
+        let mutation_admission_enabled =
+            RuntimeHealthPort::snapshot(runtime.as_ref()).mutation_admission_enabled;
         let response = dispatch::dispatch(
             request,
             &system,
             torrents.as_deref(),
+            &mutations,
+            mutation_admission_enabled,
             qbit_startup_problem.as_deref(),
         )
         .await;
@@ -68,5 +77,10 @@ pub(crate) fn capabilities() -> Vec<String> {
         "queue.read.v1".into(),
         "transfer.limits.read.v1".into(),
         "qbit.probe.v1".into(),
+        "torrent.control.v1".into(),
+        "queue.policy.v1".into(),
+        "transfer.limits.write.v1".into(),
+        "request-idempotency.v1".into(),
+        "operation.recovery.v1".into(),
     ]
 }
