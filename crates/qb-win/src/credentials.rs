@@ -1,7 +1,16 @@
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct StoredCredential {
     pub username: String,
     pub secret: String,
+}
+
+impl std::fmt::Debug for StoredCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredCredential")
+            .field("username", &self.username)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -140,6 +149,18 @@ pub fn read_generic(_target: &str) -> Result<StoredCredential, CredentialError> 
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_debug_redacts_secret() {
+        let credential = StoredCredential {
+            username: "admin".into(),
+            secret: "super-secret".into(),
+        };
+        let debug = format!("{credential:?}");
+        assert!(debug.contains("admin"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("super-secret"));
+    }
 
     #[test]
     fn decodes_utf8_and_utf16_secret_blobs() {
