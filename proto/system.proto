@@ -28,11 +28,19 @@ message CapabilitiesResponse {
 
 message StatusRequest {}
 
+message RecoveryBlockerView {
+  string kind = 1;
+  string state = 2;
+  optional string problem_code = 3;
+  uint64 count = 4;
+}
+
 message StatusResponse {
   DaemonState daemon_state = 1;
   string instance_id = 2;
   uint32 schema_version = 3;
   bool mutation_admission_enabled = 4;
+  repeated RecoveryBlockerView recovery_blockers = 5;
 }
 
 enum ManagedRootView {
