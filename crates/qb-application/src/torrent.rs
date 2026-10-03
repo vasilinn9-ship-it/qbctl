@@ -5,6 +5,14 @@ use qb_domain::torrent::{TorrentId, TorrentMetainfo, TorrentState};
 use crate::PortError;
 
 pub type PortFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, PortError>> + Send + 'a>>;
+pub type EffectFuture<'a> = Pin<Box<dyn Future<Output = EffectAttempt> + Send + 'a>>;
+
+#[derive(Debug)]
+pub enum EffectAttempt {
+    Accepted,
+    Rejected(PortError),
+    Uncertain(PortError),
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QbitProbe {
@@ -107,6 +115,11 @@ pub trait TorrentClient: Send + Sync {
     fn queue_settings(&self) -> PortFuture<'_, QueueSettings>;
     fn network_preferences(&self) -> PortFuture<'_, NetworkPreferences>;
     fn trackers(&self, id: &TorrentId) -> PortFuture<'_, Vec<TrackerEvidence>>;
+    fn stop(&self, id: &TorrentId) -> EffectFuture<'_>;
+    fn start(&self, id: &TorrentId) -> EffectFuture<'_>;
+    fn set_active_downloads(&self, value: u32) -> EffectFuture<'_>;
+    fn set_download_limit(&self, bytes_per_sec: u64) -> EffectFuture<'_>;
+    fn set_upload_limit(&self, bytes_per_sec: u64) -> EffectFuture<'_>;
 }
 
 pub struct TorrentService {
@@ -144,5 +157,25 @@ impl TorrentService {
 
     pub async fn trackers(&self, id: &TorrentId) -> Result<Vec<TrackerEvidence>, PortError> {
         self.client.trackers(id).await
+    }
+
+    pub async fn stop(&self, id: &TorrentId) -> EffectAttempt {
+        self.client.stop(id).await
+    }
+
+    pub async fn start(&self, id: &TorrentId) -> EffectAttempt {
+        self.client.start(id).await
+    }
+
+    pub async fn set_active_downloads(&self, value: u32) -> EffectAttempt {
+        self.client.set_active_downloads(value).await
+    }
+
+    pub async fn set_download_limit(&self, bytes_per_sec: u64) -> EffectAttempt {
+        self.client.set_download_limit(bytes_per_sec).await
+    }
+
+    pub async fn set_upload_limit(&self, bytes_per_sec: u64) -> EffectAttempt {
+        self.client.set_upload_limit(bytes_per_sec).await
     }
 }
