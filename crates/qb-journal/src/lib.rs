@@ -1083,6 +1083,9 @@ impl AdmissionJournal for Journal {
             MutationDisposition::EffectPending => {
                 (MutationDisposition::EffectPending, "observed_not_applied")
             }
+            MutationDisposition::Unknown => {
+                (MutationDisposition::Unknown, "observed_not_applied")
+            }
             other => {
                 return Err(PortError::new(
                     "OPERATION_TRANSITION_INVALID",
@@ -2862,6 +2865,32 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn admission_unknown_can_become_retry_ready_only_after_external_observation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path().join("state.sqlite")).expect("journal");
+        let request = admission_request("admission-unknown-retry");
+        let operation_id = match journal.reserve_admission(&request).expect("reserve") {
+            AdmissionReservationResult::New(record) => record.operation_id,
+            other => panic!("unexpected reservation: {other:?}"),
+        };
+
+        journal
+            .mark_admission_effect_pending(&operation_id)
+            .expect("effect pending");
+        journal
+            .mark_admission_unknown(&operation_id, "QBIT_MUTATION_UNCERTAIN")
+            .expect("unknown");
+
+        let retry = journal
+            .mark_admission_retry_ready(&operation_id)
+            .expect("retry ready");
+        assert_eq!(retry.disposition, MutationDisposition::Prepared);
+        assert_eq!(retry.checkpoint, "observed_not_applied");
+        assert!(retry.pending_effect_kind.is_none());
+        assert!(retry.reservation_active);
     }
 
     #[test]
