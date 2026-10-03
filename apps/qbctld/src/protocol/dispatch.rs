@@ -1,5 +1,7 @@
 use qb_application::{
-    completion::{CompletionExecution, CompletionExecutionStatus, CompletionService},
+    completion::{
+        CompletionExecution, CompletionExecutionStatus, CompletionJournal, CompletionService,
+    },
     mutation::{
         MutationCommand, MutationExecution, MutationExecutionResult, MutationExecutionStatus,
         MutationService, TorrentControlAction,
@@ -24,6 +26,7 @@ use qb_proto::{
 pub struct OperationServices<'a> {
     pub mutations: Option<&'a MutationService>,
     pub completion: Option<&'a CompletionService>,
+    pub completion_journal: Option<&'a dyn CompletionJournal>,
 }
 
 pub async fn dispatch(
@@ -39,6 +42,7 @@ pub async fn dispatch(
     let request_id = request.request_id.clone();
     let mutations = operations.mutations;
     let completion = operations.completion;
+    let completion_journal = operations.completion_journal;
 
     match request.command {
         Some(request::Command::Capabilities(_)) => success(
@@ -96,14 +100,14 @@ pub async fn dispatch(
             }
         }
         Some(request::Command::OperationList(_)) => {
-            let Some(service) = completion else {
+            let Some(journal) = completion_journal else {
                 return internal_unavailable(
                     sequence,
                     request_id,
-                    "completion operation service unavailable",
+                    "completion operation journal unavailable",
                 );
             };
-            match service.list_operations() {
+            match journal.list_completions() {
                 Ok(records) => success(
                     sequence,
                     request_id,
@@ -118,18 +122,18 @@ pub async fn dispatch(
             }
         }
         Some(request::Command::OperationGet(command)) => {
-            let Some(service) = completion else {
+            let Some(journal) = completion_journal else {
                 return internal_unavailable(
                     sequence,
                     request_id,
-                    "completion operation service unavailable",
+                    "completion operation journal unavailable",
                 );
             };
             let operation_id = match OperationId::new(command.operation_id) {
                 Ok(value) => value,
                 Err(error) => return invalid_request(sequence, request_id, &error.to_string()),
             };
-            match service.get_operation(&operation_id) {
+            match journal.get_completion(&operation_id) {
                 Ok(Some(record)) => success(
                     sequence,
                     request_id,
