@@ -819,6 +819,8 @@ impl CompletionService {
             CompletionState::Stopped
             | CompletionState::ArchivePending
             | CompletionState::UnknownArchive
+            | CompletionState::ArchiveSourceDeletePending
+            | CompletionState::UnknownArchiveSourceDelete
             | CompletionState::PayloadPending
             | CompletionState::RemoveRecordPending
             | CompletionState::UnknownRemoveRecord
