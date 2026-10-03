@@ -1129,7 +1129,7 @@ mod tests {
         let server = FakeHttpServer::spawn(vec![
             FakeResponse::ok("Ok.").with_header("Set-Cookie", "SID=test; HttpOnly"),
             FakeResponse::ok(
-                r#"[{"hash":"abcdef0123456789abcdef0123456789abcdef01","name":"sample","save_path":"C:\\\\Working","state":"futureState","total_size":100,"amount_left":25,"dlspeed":7,"upspeed":3,"progress":0.75,"availability":1.5,"peers":2,"peers_total":4,"seeds":1,"seeds_total":3}]"#,
+                r#"[{"hash":"abcdef0123456789abcdef0123456789abcdef01","name":"sample","save_path":"C:\\\\Working","state":"futureState","total_size":100,"amount_left":25,"dlspeed":7,"upspeed":3,"progress":0.75,"availability":1.5,"num_leechs":2,"num_incomplete":4,"num_seeds":1,"num_complete":3}]"#,
             ),
         ])
         .await;
