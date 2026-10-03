@@ -100,9 +100,8 @@ async fn disposable_qbittorrent_authenticates_and_probes() {
         "added torrent did not settle on the managed save path"
     );
 
-    let downloads = PathBuf::from(
-        env::var("QBCTL_QBIT_DOWNLOADS_HOST").expect("QBCTL_QBIT_DOWNLOADS_HOST"),
-    );
+    let downloads =
+        PathBuf::from(env::var("QBCTL_QBIT_DOWNLOADS_HOST").expect("QBCTL_QBIT_DOWNLOADS_HOST"));
     let payload = downloads.join("file.bin");
     let partial_bytes = b"partial-payload-retained-by-release";
     fs::write(&payload, partial_bytes).expect("write partial payload fixture");
