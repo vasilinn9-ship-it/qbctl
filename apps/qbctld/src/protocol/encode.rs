@@ -15,7 +15,8 @@ use qb_domain::torrent::TorrentState;
 use qb_proto::v1::{
     DaemonState, DoctorCheck, DoctorResponse, IncomingStatusEntry, ManagedRootView,
     OperationFileView, OperationSummary, OperationView, QbitProbeResponse, QueueSettingsResponse,
-    StatusResponse, StorageListResponse, StorageRootView, StorageStatusResponse,
+    RecoveryBlockerView, StatusResponse, StorageListResponse, StorageRootView,
+    StorageStatusResponse,
     TorrentListResponse, TorrentStateView, TorrentSummary, TrackerEvidenceView, TrackerStatusView,
     TransferLimitsResponse,
 };
@@ -39,6 +40,16 @@ pub fn system_status(status: ApplicationSystemStatus) -> StatusResponse {
         instance_id: status.instance_id,
         schema_version: status.schema_version,
         mutation_admission_enabled: status.mutation_admission_enabled,
+        recovery_blockers: status
+            .recovery_blockers
+            .into_iter()
+            .map(|blocker| RecoveryBlockerView {
+                kind: blocker.kind,
+                state: blocker.state,
+                problem_code: blocker.problem_code,
+                count: blocker.count,
+            })
+            .collect(),
     }
 }
 
