@@ -689,7 +689,13 @@ mod tests {
             b"d4:infod6:lengthi4e4:name8:file.bin12:piece lengthi4e6:pieces20:01234567890123456789ee";
         let parsed = parse_inner(bytes).expect("v1 parse");
 
-        assert!(parsed.identity.v1.is_some());
+        assert_eq!(
+            parsed.identity.v1,
+            Some([
+                145, 220, 39, 1, 166, 54, 73, 96, 19, 94, 201, 143, 124, 177, 8, 95, 204,
+                242, 59, 23,
+            ])
+        );
         assert!(parsed.identity.v2.is_none());
         assert_eq!(parsed.manifest.total_size, 4);
         assert_eq!(parsed.manifest.files[0].path, "file.bin");
@@ -701,7 +707,13 @@ mod tests {
         let parsed = parse_inner(bytes).expect("v2 parse");
 
         assert!(parsed.identity.v1.is_none());
-        assert!(parsed.identity.v2.is_some());
+        assert_eq!(
+            parsed.identity.v2,
+            Some([
+                177, 67, 53, 221, 241, 120, 91, 54, 80, 223, 159, 163, 230, 139, 165, 211,
+                220, 178, 196, 86, 86, 161, 56, 36, 121, 241, 37, 40, 132, 80, 102, 14,
+            ])
+        );
         assert_eq!(parsed.manifest.files[0].path, "file.txt");
         assert_eq!(parsed.manifest.files[0].size, 0);
     }
@@ -712,6 +724,20 @@ mod tests {
         let parsed = parse_inner(bytes).expect("hybrid parse");
 
         assert!(parsed.identity.is_hybrid());
+        assert_eq!(
+            parsed.identity.v1,
+            Some([
+                227, 251, 105, 158, 61, 244, 46, 15, 2, 14, 108, 54, 57, 38, 202, 123, 79,
+                36, 151, 242,
+            ])
+        );
+        assert_eq!(
+            parsed.identity.v2,
+            Some([
+                187, 117, 114, 56, 246, 32, 155, 17, 121, 127, 87, 181, 139, 71, 27, 103,
+                124, 35, 182, 8, 255, 115, 213, 225, 90, 164, 86, 221, 27, 65, 148, 74,
+            ])
+        );
         assert_eq!(parsed.manifest.files[0].path, "file.txt");
     }
 
