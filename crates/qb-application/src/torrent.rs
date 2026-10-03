@@ -139,6 +139,17 @@ pub trait TorrentClient: Send + Sync {
     fn add_torrent<'a>(&'a self, request: &'a AddTorrentRequest) -> EffectFuture<'a>;
     fn stop<'a>(&'a self, id: &'a TorrentId) -> EffectFuture<'a>;
     fn start<'a>(&'a self, id: &'a TorrentId) -> EffectFuture<'a>;
+    fn remove_keep_files<'a>(&'a self, id: &'a TorrentId) -> EffectFuture<'a> {
+        Box::pin(async move {
+            EffectAttempt::NotSent(PortError::new(
+                "QBIT_MUTATION_UNSUPPORTED",
+                format!(
+                    "qBittorrent record removal is not supported for torrent {}",
+                    id.as_str()
+                ),
+            ))
+        })
+    }
     fn set_active_downloads(&self, value: u32) -> EffectFuture<'_>;
     fn set_download_limit(&self, bytes_per_sec: u64) -> EffectFuture<'_>;
     fn set_upload_limit(&self, bytes_per_sec: u64) -> EffectFuture<'_>;
@@ -195,6 +206,10 @@ impl TorrentService {
 
     pub async fn start(&self, id: &TorrentId) -> EffectAttempt {
         self.client.start(id).await
+    }
+
+    pub async fn remove_keep_files(&self, id: &TorrentId) -> EffectAttempt {
+        self.client.remove_keep_files(id).await
     }
 
     pub async fn set_active_downloads(&self, value: u32) -> EffectAttempt {

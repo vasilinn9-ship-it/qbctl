@@ -377,6 +377,14 @@ impl QbitClient {
         self.mutation_post_form("torrents/start", &form).await
     }
 
+    async fn remove_keep_files_inner(&self, id: &TorrentId) -> EffectAttempt {
+        let form = [
+            ("hashes", id.as_str().to_string()),
+            ("deleteFiles", "false".to_string()),
+        ];
+        self.mutation_post_form("torrents/delete", &form).await
+    }
+
     async fn set_active_downloads_inner(&self, value: u32) -> EffectAttempt {
         let json = serde_json::json!({ "max_active_downloads": value }).to_string();
         let form = [("json", json)];
@@ -497,6 +505,10 @@ impl TorrentClient for QbitClient {
 
     fn start<'a>(&'a self, id: &'a TorrentId) -> EffectFuture<'a> {
         Box::pin(async move { self.start_inner(id).await })
+    }
+
+    fn remove_keep_files<'a>(&'a self, id: &'a TorrentId) -> EffectFuture<'a> {
+        Box::pin(async move { self.remove_keep_files_inner(id).await })
     }
 
     fn set_active_downloads(&self, value: u32) -> EffectFuture<'_> {
@@ -1272,6 +1284,35 @@ mod tests {
         let request = requests[1].to_ascii_lowercase();
         assert!(request.starts_with("post /api/v2/torrents/stop http/1.1"));
         assert!(request.contains("hashes=abcdef0123456789abcdef0123456789abcdef01"));
+    }
+
+    #[tokio::test]
+    async fn remove_keep_files_posts_delete_files_false() {
+        let server = FakeHttpServer::spawn(vec![
+            FakeResponse::ok("Ok.").with_header("Set-Cookie", "SID=test; HttpOnly"),
+            FakeResponse::ok(""),
+        ])
+        .await;
+        let client = QbitClient::new(
+            &server.url,
+            QbitCredentials::new("admin", "secret"),
+            Duration::from_secs(2),
+        )
+        .expect("client");
+        let id = TorrentId::new("abcdef0123456789abcdef0123456789abcdef01").expect("torrent id");
+
+        assert!(matches!(
+            client.remove_keep_files_inner(&id).await,
+            EffectAttempt::Accepted
+        ));
+
+        let requests = server.finish().await;
+        assert_eq!(requests.len(), 2);
+        let request = requests[1].to_ascii_lowercase();
+        assert!(request.starts_with("post /api/v2/torrents/delete http/1.1"));
+        assert!(request.contains("hashes=abcdef0123456789abcdef0123456789abcdef01"));
+        assert!(request.contains("deletefiles=false"));
+        assert!(!request.contains("deletefiles=true"));
     }
 
     #[tokio::test]
