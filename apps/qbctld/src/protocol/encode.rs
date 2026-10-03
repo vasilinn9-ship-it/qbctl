@@ -3,9 +3,7 @@ use qb_application::{
         DaemonPhase, DoctorReport as ApplicationDoctorReport,
         SystemStatus as ApplicationSystemStatus,
     },
-    torrent::{
-        QbitProbe, QueueSettings, TorrentView, TransferInfo,
-    },
+    torrent::{QbitProbe, QueueSettings, TorrentView, TransferInfo},
 };
 use qb_domain::torrent::TorrentState;
 use qb_proto::v1::{
@@ -48,7 +46,6 @@ pub fn doctor(report: ApplicationDoctorReport) -> DoctorResponse {
             .collect(),
     }
 }
-
 
 pub fn torrent_summary(value: TorrentView) -> TorrentSummary {
     TorrentSummary {
