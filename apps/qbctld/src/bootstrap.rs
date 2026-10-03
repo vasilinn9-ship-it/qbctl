@@ -22,7 +22,7 @@ pub struct Bootstrap {
     pub runtime: Arc<RuntimeContext>,
     pub system: Arc<SystemService>,
     pub torrents: Option<Arc<TorrentService>>,
-    pub mutations: Option<Arc<MutationService>>,
+    pub mutations: Arc<MutationService>,
     pub qbit_startup_problem: Option<String>,
     _instance_guard: InstanceGuard,
 }
@@ -51,9 +51,17 @@ pub fn build(runtime_override: Option<PathBuf>) -> Result<Bootstrap> {
     let runtime_port: Arc<dyn RuntimeHealthPort> = runtime.clone();
     let system = Arc::new(SystemService::new(journal_health, runtime_port));
 
-    let (torrents, mutations, qbit_startup_problem) = match config.qbittorrent.as_ref() {
-        Some(qbit) => match build_qbit_services(qbit, mutation_journal) {
-            Ok((torrents, mutations)) => (Some(torrents), Some(mutations), None),
+    let (torrents, mutation_client, qbit_startup_problem) = match config.qbittorrent.as_ref() {
+        Some(qbit) => match build_qbit_client(qbit) {
+            Ok(client) => {
+                let torrent_port: Arc<dyn TorrentClient> = client.clone();
+                let mutation_port: Arc<dyn TorrentClient> = client;
+                (
+                    Some(Arc::new(TorrentService::new(torrent_port))),
+                    Some(mutation_port),
+                    None,
+                )
+            }
             Err(error) => (None, None, Some(error.to_string())),
         },
         None => (
@@ -62,6 +70,7 @@ pub fn build(runtime_override: Option<PathBuf>) -> Result<Bootstrap> {
             Some("qBittorrent is not configured for the Rust daemon".into()),
         ),
     };
+    let mutations = Arc::new(MutationService::new(mutation_journal, mutation_client));
 
     Ok(Bootstrap {
         config,
@@ -74,10 +83,7 @@ pub fn build(runtime_override: Option<PathBuf>) -> Result<Bootstrap> {
     })
 }
 
-fn build_qbit_services(
-    config: &QbitConfig,
-    journal: Arc<dyn MutationJournal>,
-) -> Result<(Arc<TorrentService>, Arc<MutationService>)> {
+fn build_qbit_client(config: &QbitConfig) -> Result<Arc<QbitClient>> {
     let secret = match std::env::var("QBCTL_QBIT_PASSWORD") {
         Ok(secret) => secret,
         Err(_) => {
@@ -87,19 +93,12 @@ fn build_qbit_services(
         }
     };
 
-    let client = Arc::new(
-        QbitClient::new(
-            &config.url,
-            QbitCredentials::new(&config.username, secret),
-            Duration::from_secs(config.request_timeout_seconds),
-        )
-        .context("build qBittorrent client")?,
-    );
+    let client = QbitClient::new(
+        &config.url,
+        QbitCredentials::new(&config.username, secret),
+        Duration::from_secs(config.request_timeout_seconds),
+    )
+    .context("build qBittorrent client")?;
 
-    let torrent_port: Arc<dyn TorrentClient> = client.clone();
-    let mutation_port: Arc<dyn TorrentClient> = client;
-    let torrents = Arc::new(TorrentService::new(torrent_port));
-    let mutations = Arc::new(MutationService::new(journal, mutation_port));
-
-    Ok((torrents, mutations))
+    Ok(Arc::new(client))
 }
