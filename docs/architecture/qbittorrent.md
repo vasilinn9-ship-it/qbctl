@@ -10,6 +10,7 @@ This document is the Rust v1 source of truth for the qBittorrent boundary.
 - WebAPI version/capability checks;
 - qBittorrent JSON DTOs;
 - normalization into application/domain types;
+- canonical qBittorrent torrent selectors (including full v2 info-hash -> 160-bit qBittorrent TorrentID normalization);
 - mutation transport certainty classification.
 
 It does not own:
@@ -42,6 +43,7 @@ Baseline authentication remains `auth/login` session-cookie auth. The adapter ac
 - Origin/Referer must match the configured qB endpoint where required.
 - password/session cookies are never logged or persisted in operational SQLite.
 - DTOs deserialize only fields required by a use case.
+- required observation fields fail closed when absent; incompatible responses are not silently defaulted to zero/false evidence.
 - tracker URLs are redacted before leaving qb-qbit.
 
 ## Mutation contract
@@ -60,6 +62,17 @@ These are distinct:
 - transfer speed limits.
 
 Changing one must not silently rewrite the others.
+
+
+## Torrent selectors
+
+qBittorrent's WebAPI `hash` parameter identifies its internal 160-bit `TorrentID`. For v1/hybrid torrents that is the 40-hex v1-compatible ID. For a v2-only torrent, qBittorrent derives the same 160-bit ID from the first 160 bits of the SHA-256 info-hash.
+
+The domain selector therefore accepts either:
+- a 40-hex qBittorrent TorrentID; or
+- a full 64-hex v2 info-hash, which is canonicalized to the corresponding first-40-hex qBittorrent TorrentID before WebAPI use and RequestId fingerprinting.
+
+Full v1/v2 identity aliases remain the responsibility of metainfo/identity models; mutation and read selectors use the canonical engine ID.
 
 ## Transfer limits
 
