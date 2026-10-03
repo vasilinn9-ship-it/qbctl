@@ -105,6 +105,12 @@ pub struct MutationRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueueTargetPolicy {
+    pub revision: u64,
+    pub target_client_count: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RequestReservation {
     New(MutationRecord),
     Replay(MutationRecord),
@@ -158,7 +164,7 @@ pub trait MutationJournal: Send + Sync {
 
     fn list_recoverable(&self) -> Result<Vec<MutationRecord>, PortError>;
 
-    fn queue_target(&self) -> Result<Option<u32>, PortError>;
+    fn queue_target(&self) -> Result<QueueTargetPolicy, PortError>;
 
     fn apply_queue_target(
         &self,
@@ -279,7 +285,7 @@ impl MutationService {
         Ok(results)
     }
 
-    pub fn queue_target(&self) -> Result<Option<u32>, PortError> {
+    pub fn queue_target(&self) -> Result<QueueTargetPolicy, PortError> {
         self.journal.queue_target()
     }
 
@@ -594,7 +600,9 @@ impl MutationService {
             }
             MutationCommand::SetQueueTarget {
                 target_client_count,
-            } => Ok(self.journal.queue_target()? == Some(*target_client_count)),
+            } => Ok(
+                self.journal.queue_target()?.target_client_count == Some(*target_client_count)
+            ),
         }
     }
 
