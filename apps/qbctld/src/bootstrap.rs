@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context as _, Result};
+use anyhow::{anyhow, Context as _, Result};
 use qb_application::{
     cleanup::{IncomingCleanupJournal, IncomingCleanupService},
     incoming::IncomingService,
@@ -108,12 +108,24 @@ pub fn build(runtime_override: Option<PathBuf>) -> Result<Bootstrap> {
     let mutations = Arc::new(MutationService::new(mutation_journal, mutation_client));
     let release = storage.as_ref().zip(release_client).map(|(storage, client)| {
         Arc::new(ReleaseService::new(
-            release_journal,
+            release_journal.clone(),
             storage.clone(),
             client,
             MAX_METAINFO_BYTES,
         ))
     });
+
+    if release.is_none() {
+        let recoverable = release_journal
+            .list_recoverable_releases()
+            .map_err(|error| anyhow!("inspect durable release recovery state: {error}"))?;
+        if !recoverable.is_empty() {
+            return Err(anyhow!(
+                "{} durable queue release operation(s) require both managed storage and qBittorrent configuration",
+                recoverable.len()
+            ));
+        }
+    }
 
     Ok(Bootstrap {
         config,
