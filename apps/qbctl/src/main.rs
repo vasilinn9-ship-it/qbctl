@@ -283,7 +283,10 @@ fn command_request(command: Command) -> (request::Command, Option<String>) {
         ),
         Command::Operation {
             command: OperationCommand::List,
-        } => (request::Command::OperationList(OperationListRequest {}), None),
+        } => (
+            request::Command::OperationList(OperationListRequest {}),
+            None,
+        ),
         Command::Operation {
             command: OperationCommand::Get { operation_id },
         } => (
@@ -531,7 +534,11 @@ fn render_human(response: &Response) -> Result<(), CliError> {
                     operation.registry_id,
                     operation.files_moved_and_receipted,
                     operation.files_total,
-                    if operation.archive_receipted { "yes" } else { "no" }
+                    if operation.archive_receipted {
+                        "yes"
+                    } else {
+                        "no"
+                    }
                 );
             }
         }
@@ -761,7 +768,10 @@ fn render_fields(response: &Response) -> Result<(), CliError> {
             }
         }
         Some(response::Payload::OperationRecover(value)) => {
-            println!("execution_status={}", sanitize_field(&value.execution_status));
+            println!(
+                "execution_status={}",
+                sanitize_field(&value.execution_status)
+            );
             println!("replayed={}", value.replayed);
             println!("operation_present={}", value.operation.is_some());
             if let Some(operation) = value.operation.as_ref() {
@@ -935,7 +945,11 @@ fn print_operation_human(operation: &OperationView) {
     println!(
         "  source: {} · archive receipt: {} · files moved+receipted: {}/{} · content audit: {}",
         operation.source_relative,
-        if summary.archive_receipted { "yes" } else { "no" },
+        if summary.archive_receipted {
+            "yes"
+        } else {
+            "no"
+        },
         summary.files_moved_and_receipted,
         summary.files_total,
         if summary.post_handoff_content_audited {
@@ -955,7 +969,11 @@ fn print_operation_human(operation: &OperationView) {
             file.size,
             file.strategy,
             file.state,
-            if file.destination_receipted { "yes" } else { "no" }
+            if file.destination_receipted {
+                "yes"
+            } else {
+                "no"
+            }
         );
     }
 }
@@ -970,7 +988,10 @@ fn print_operation_summary_fields(index: usize, operation: &qb_proto::v1::Operat
         sanitize_field(&operation.request_id)
     );
     println!("operation.{index}.kind={}", sanitize_field(&operation.kind));
-    println!("operation.{index}.state={}", sanitize_field(&operation.state));
+    println!(
+        "operation.{index}.state={}",
+        sanitize_field(&operation.state)
+    );
     println!(
         "operation.{index}.registry_id={}",
         sanitize_field(&operation.registry_id)
