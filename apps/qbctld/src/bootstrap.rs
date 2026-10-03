@@ -87,7 +87,7 @@ pub fn build(runtime_override: Option<PathBuf>) -> Result<Bootstrap> {
             Some(qbit) => match build_qbit_client(qbit) {
                 Ok(client) => {
                     let torrent_port: Arc<dyn TorrentClient> = client.clone();
-                    let mutation_port: Arc<dyn TorrentClient> = client;
+                    let mutation_port: Arc<dyn TorrentClient> = client.clone();
                     let release_port: Arc<dyn TorrentClient> = client;
                     (
                         Some(Arc::new(TorrentService::new(torrent_port))),
