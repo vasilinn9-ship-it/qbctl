@@ -247,10 +247,7 @@ pub trait CompletionJournal: Send + Sync {
         operation_id: &OperationId,
     ) -> Result<CompletionRecord, PortError>;
 
-    fn finish_completion(
-        &self,
-        operation_id: &OperationId,
-    ) -> Result<CompletionRecord, PortError>;
+    fn finish_completion(&self, operation_id: &OperationId) -> Result<CompletionRecord, PortError>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -947,8 +944,7 @@ impl CompletionService {
                 CompletionState::PayloadPending => {
                     self.advance_payload(record, explicit_request).await?
                 }
-                CompletionState::RemoveRecordPending
-                | CompletionState::UnknownRemoveRecord => {
+                CompletionState::RemoveRecordPending | CompletionState::UnknownRemoveRecord => {
                     self.advance_remove_record(record, explicit_request).await?
                 }
                 CompletionState::Finished => {
@@ -1453,9 +1449,10 @@ impl CompletionService {
                         ..
                     } if published_sha256 == record.source_metainfo_digest => destination,
                     _ => {
-                        let unknown = self
-                            .journal
-                            .mark_unknown_archive(&record.operation_id, "ARCHIVE_PUBLISH_UNCERTAIN")?;
+                        let unknown = self.journal.mark_unknown_archive(
+                            &record.operation_id,
+                            "ARCHIVE_PUBLISH_UNCERTAIN",
+                        )?;
                         return Ok(HandoffProgress::Halt {
                             status: CompletionExecutionStatus::UnknownArchive,
                             record: unknown,
@@ -2308,9 +2305,10 @@ impl CompletionService {
             Ok(Some(_)) => {}
             Err(problem) => {
                 if record.state == CompletionState::RemoveRecordPending {
-                    record = self
-                        .journal
-                        .mark_unknown_remove_record(&record.operation_id, "QBIT_REMOVE_UNCERTAIN")?;
+                    record = self.journal.mark_unknown_remove_record(
+                        &record.operation_id,
+                        "QBIT_REMOVE_UNCERTAIN",
+                    )?;
                 }
                 return Ok(HandoffProgress::Halt {
                     status: CompletionExecutionStatus::UnknownRemoveRecord,
@@ -3895,10 +3893,7 @@ mod tests {
                 .await
                 .expect("first completion"),
         );
-        assert_eq!(
-            first.status,
-            CompletionExecutionStatus::UnknownRemoveRecord
-        );
+        assert_eq!(first.status, CompletionExecutionStatus::UnknownRemoveRecord);
         assert_eq!(first.record.state, CompletionState::UnknownRemoveRecord);
         assert_eq!(client.remove_calls.load(Ordering::SeqCst), 1);
 
@@ -3911,7 +3906,10 @@ mod tests {
             recovered[0].status,
             CompletionExecutionStatus::UnknownRemoveRecord
         );
-        assert_eq!(recovered[0].record.state, CompletionState::UnknownRemoveRecord);
+        assert_eq!(
+            recovered[0].record.state,
+            CompletionState::UnknownRemoveRecord
+        );
         assert_eq!(client.remove_calls.load(Ordering::SeqCst), 1);
 
         let replay = execution(
