@@ -1777,7 +1777,10 @@ impl CompletionJournal for Journal {
                             .to_be_bytes()
                             .as_slice(),
                         file.source_evidence.size.to_be_bytes().as_slice(),
-                        file.source_evidence.modified_marker.to_be_bytes().as_slice(),
+                        file.source_evidence
+                            .modified_marker
+                            .to_be_bytes()
+                            .as_slice(),
                         completion_strategy_name(preflight.payload_strategy()),
                     ],
                 )
@@ -3549,9 +3552,7 @@ fn load_completion_record(
         let index = u32::try_from(file_index)
             .map_err(|_| JournalError::InvalidState("completion file index is negative".into()))?;
         let strategy = parse_completion_strategy(&strategy).ok_or_else(|| {
-            JournalError::InvalidState(format!(
-                "unknown completion handoff strategy '{strategy}'"
-            ))
+            JournalError::InvalidState(format!("unknown completion handoff strategy '{strategy}'"))
         })?;
         let state = parse_completion_file_state(&state).ok_or_else(|| {
             JournalError::InvalidState(format!("unknown completion file state '{state}'"))
@@ -5543,14 +5544,18 @@ mod tests {
             let mut conflict = preflight.clone();
             conflict.registry_id = "different-registry".into();
             assert!(matches!(
-                journal.reserve_completion(&conflict).expect("request conflict"),
+                journal
+                    .reserve_completion(&conflict)
+                    .expect("request conflict"),
                 CompletionReservation::Conflict { .. }
             ));
 
             let mut active = preflight.clone();
             active.request_id = RequestId::new("completion-active-conflict").expect("request id");
             assert!(matches!(
-                journal.reserve_completion(&active).expect("active conflict"),
+                journal
+                    .reserve_completion(&active)
+                    .expect("active conflict"),
                 CompletionReservation::ActiveConflict { .. }
             ));
 
