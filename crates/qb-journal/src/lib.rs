@@ -872,6 +872,14 @@ mod tests {
         RequestId::new(value).expect("request id")
     }
 
+    fn torrent_command(action: TorrentControlAction) -> MutationCommand {
+        MutationCommand::TorrentControl {
+            torrent_id: TorrentId::new("abcdef0123456789abcdef0123456789abcdef01")
+                .expect("torrent id"),
+            action,
+        }
+    }
+
     #[test]
     fn creates_schema_v2_and_reopens() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -915,10 +923,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let journal = Journal::open(dir.path().join("state.sqlite")).expect("journal");
         let request = request_id("pause-1");
-        let fingerprint = [7_u8; 32];
+        let command = torrent_command(TorrentControlAction::Stop);
 
         let first = journal
-            .reserve_request_inner(&request, "torrent.pause", fingerprint)
+            .reserve_request_inner(&request, &command)
             .expect("reserve");
         let first_operation = match first {
             RequestReservation::New(record) => record.operation_id,
@@ -926,7 +934,7 @@ mod tests {
         };
 
         let replay = journal
-            .reserve_request_inner(&request, "torrent.pause", fingerprint)
+            .reserve_request_inner(&request, &command)
             .expect("replay");
         match replay {
             RequestReservation::Replay(record) => {
@@ -937,7 +945,10 @@ mod tests {
         }
 
         let conflict = journal
-            .reserve_request_inner(&request, "torrent.pause", [8_u8; 32])
+            .reserve_request_inner(
+                &request,
+                &torrent_command(TorrentControlAction::Start),
+            )
             .expect("conflict");
         assert_eq!(
             conflict,
@@ -948,13 +959,46 @@ mod tests {
     }
 
     #[test]
+    fn typed_command_survives_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.sqlite");
+        let request = request_id("queue-1");
+        let command = MutationCommand::QueueSet {
+            target_client_count: Some(80),
+            max_active_downloads: Some(10),
+        };
+
+        let operation_id = {
+            let journal = Journal::open(&path).expect("journal");
+            match journal
+                .reserve_request_inner(&request, &command)
+                .expect("reserve")
+            {
+                RequestReservation::New(record) => record.operation_id,
+                other => panic!("unexpected reservation: {other:?}"),
+            }
+        };
+
+        let reopened = Journal::open(&path).expect("reopen");
+        let record = reopened
+            .get_operation(&operation_id)
+            .expect("get")
+            .expect("operation");
+        assert_eq!(record.command, command);
+        assert_eq!(record.command_fingerprint, command.fingerprint());
+    }
+
+    #[test]
     fn mutation_checkpoint_progress_is_monotonic() {
         let dir = tempfile::tempdir().expect("tempdir");
         let journal = Journal::open(dir.path().join("state.sqlite")).expect("journal");
         let request = request_id("resume-1");
 
         let reservation = journal
-            .reserve_request_inner(&request, "torrent.resume", [1_u8; 32])
+            .reserve_request_inner(
+                &request,
+                &torrent_command(TorrentControlAction::Start),
+            )
             .expect("reserve");
         let operation_id = match reservation {
             RequestReservation::New(record) => record.operation_id,
@@ -985,7 +1029,10 @@ mod tests {
         let request = request_id("pause-unknown");
 
         let reservation = journal
-            .reserve_request_inner(&request, "torrent.pause", [2_u8; 32])
+            .reserve_request_inner(
+                &request,
+                &torrent_command(TorrentControlAction::Stop),
+            )
             .expect("reserve");
         let operation_id = match reservation {
             RequestReservation::New(record) => record.operation_id,
