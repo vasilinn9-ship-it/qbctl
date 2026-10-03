@@ -445,6 +445,330 @@ fn observe_managed_file(
 }
 
 #[cfg(windows)]
+fn copy_to_temp_verified(
+    roots: &ValidatedManagedRootLayout,
+    source_role: ManagedRootRole,
+    source_relative: &str,
+    destination_role: ManagedRootRole,
+    temp_relative: &str,
+    expected_source: &FileEvidence,
+) -> Result<VerifiedCopyOutcome, PortError> {
+    let refreshed_source =
+        validate_root(source_role, roots.path(source_role)).map_err(map_storage_port_error)?;
+    let refreshed_destination =
+        validate_root(destination_role, roots.path(destination_role)).map_err(map_storage_port_error)?;
+    if !paths_equal(&refreshed_source, roots.path(source_role))
+        || !paths_equal(&refreshed_destination, roots.path(destination_role))
+    {
+        return Err(PortError::new(
+            "STORAGE_ROOT_CHANGED",
+            "managed root identity changed before verified copy",
+        ));
+    }
+
+    let source_volume = roots
+        .observe_volume(source_role)
+        .map_err(map_storage_port_error)?;
+    let destination_volume = roots
+        .observe_volume(destination_role)
+        .map_err(map_storage_port_error)?;
+    if source_volume.serial_number == destination_volume.serial_number {
+        return Err(PortError::new(
+            "STORAGE_VOLUME_MISMATCH",
+            "verified cross-volume copy requires different source and destination volumes",
+        ));
+    }
+
+    let source_managed =
+        ManagedRelativePath::parse(source_relative).map_err(map_storage_port_error)?;
+    let temp_managed = ManagedRelativePath::parse(temp_relative).map_err(map_storage_port_error)?;
+    let source_path = roots.path(source_role).join(source_managed.as_path());
+    let temp_path = roots.path(destination_role).join(temp_managed.as_path());
+
+    match observe_managed_file(roots, source_role, source_relative)? {
+        None => return Ok(VerifiedCopyOutcome::SourceMissing),
+        Some(observed) if &observed != expected_source => {
+            return Ok(VerifiedCopyOutcome::SourceChanged { observed });
+        }
+        Some(_) => {}
+    }
+
+    if observe_managed_file(roots, destination_role, temp_relative)?.is_some() {
+        return verify_existing_temp(
+            roots,
+            source_role,
+            source_relative,
+            destination_role,
+            temp_relative,
+            expected_source,
+        );
+    }
+
+    ensure_managed_parent_directories(roots, destination_role, temp_managed.as_path())?;
+
+    let mut source = match open_snapshot_file(&source_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(VerifiedCopyOutcome::SourceMissing);
+        }
+        Err(error) => return Err(PortError::new("STORAGE_IO", error.to_string())),
+    };
+    let before = file_evidence(&source, source_relative)?;
+    if &before != expected_source {
+        return Ok(VerifiedCopyOutcome::SourceChanged { observed: before });
+    }
+
+    let mut temp = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            return verify_existing_temp(
+                roots,
+                source_role,
+                source_relative,
+                destination_role,
+                temp_relative,
+                expected_source,
+            );
+        }
+        Err(error) => return Err(PortError::new("STORAGE_IO", error.to_string())),
+    };
+
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = source
+            .read(&mut buffer)
+            .map_err(|error| PortError::new("STORAGE_IO", error.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+        temp.write_all(&buffer[..read])
+            .map_err(|error| PortError::new("STORAGE_IO", error.to_string()))?;
+    }
+    temp.flush()
+        .map_err(|error| PortError::new("STORAGE_IO", error.to_string()))?;
+    temp.sync_all()
+        .map_err(|error| PortError::new("STORAGE_IO", error.to_string()))?;
+
+    let after = file_evidence(&source, source_relative)?;
+    if &after != expected_source {
+        return Err(PortError::new(
+            "HANDOFF_SOURCE_CHANGED",
+            "source evidence changed while cross-volume copy was in progress",
+        ));
+    }
+    let source_sha256: [u8; 32] = digest.finalize().into();
+    drop(temp);
+    drop(source);
+
+    let mut temp = open_snapshot_file(&temp_path)
+        .map_err(|error| PortError::new("STORAGE_IO", error.to_string()))?;
+    let temp_evidence = file_evidence(&temp, temp_relative)?;
+    let temp_sha256 = sha256_reader(&mut temp)?;
+    if temp_evidence.size != expected_source.size || temp_sha256 != source_sha256 {
+        return Err(PortError::new(
+            "STORAGE_COPY_VERIFY_FAILED",
+            "operation temp does not cryptographically match the source after copy and flush",
+        ));
+    }
+
+    Ok(VerifiedCopyOutcome::Verified {
+        temp: temp_evidence,
+        sha256: source_sha256,
+        created: true,
+    })
+}
+
+#[cfg(windows)]
+fn verify_existing_temp(
+    roots: &ValidatedManagedRootLayout,
+    source_role: ManagedRootRole,
+    source_relative: &str,
+    destination_role: ManagedRootRole,
+    temp_relative: &str,
+    expected_source: &FileEvidence,
+) -> Result<VerifiedCopyOutcome, PortError> {
+    let source_path = roots.path(source_role).join(
+        ManagedRelativePath::parse(source_relative)
+            .map_err(map_storage_port_error)?
+            .as_path(),
+    );
+    let temp_path = roots.path(destination_role).join(
+        ManagedRelativePath::parse(temp_relative)
+            .map_err(map_storage_port_error)?
+            .as_path(),
+    );
+
+    let mut source = match open_snapshot_file(&source_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(VerifiedCopyOutcome::SourceMissing);
+        }
+        Err(error) => return Err(PortError::new("STORAGE_IO", error.to_string())),
+    };
+    let before = file_evidence(&source, source_relative)?;
+    if &before != expected_source {
+        return Ok(VerifiedCopyOutcome::SourceChanged { observed: before });
+    }
+    let source_sha256 = sha256_reader(&mut source)?;
+    let after = file_evidence(&source, source_relative)?;
+    if &after != expected_source {
+        return Ok(VerifiedCopyOutcome::SourceChanged { observed: after });
+    }
+
+    let mut temp = open_snapshot_file(&temp_path)
+        .map_err(|error| PortError::new("STORAGE_IO", error.to_string()))?;
+    let temp_evidence = file_evidence(&temp, temp_relative)?;
+    let temp_sha256 = sha256_reader(&mut temp)?;
+    if temp_evidence.size == expected_source.size && temp_sha256 == source_sha256 {
+        Ok(VerifiedCopyOutcome::Verified {
+            temp: temp_evidence,
+            sha256: source_sha256,
+            created: false,
+        })
+    } else {
+        Ok(VerifiedCopyOutcome::TempConflict {
+            observed: temp_evidence,
+            sha256: temp_sha256,
+        })
+    }
+}
+
+#[cfg(not(windows))]
+fn copy_to_temp_verified(
+    _roots: &ValidatedManagedRootLayout,
+    _source_role: ManagedRootRole,
+    _source_relative: &str,
+    _destination_role: ManagedRootRole,
+    _temp_relative: &str,
+    _expected_source: &FileEvidence,
+) -> Result<VerifiedCopyOutcome, PortError> {
+    Err(PortError::new(
+        "STORAGE_COPY_UNSUPPORTED",
+        "verified cross-volume copy requires the Windows storage adapter",
+    ))
+}
+
+#[cfg(windows)]
+fn delete_managed_exact(
+    roots: &ValidatedManagedRootLayout,
+    role: ManagedRootRole,
+    relative_path: &str,
+    expected_evidence: &FileEvidence,
+    expected_sha256: &[u8; 32],
+) -> Result<ManagedDeleteOutcome, PortError> {
+    use std::{mem::size_of, os::windows::fs::OpenOptionsExt, os::windows::io::AsRawHandle};
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+    };
+
+    let refreshed = validate_root(role, roots.path(role)).map_err(map_storage_port_error)?;
+    if !paths_equal(&refreshed, roots.path(role)) {
+        return Err(PortError::new(
+            "STORAGE_ROOT_CHANGED",
+            format!("{role:?} root identity changed before exact delete"),
+        ));
+    }
+
+    let managed = ManagedRelativePath::parse(relative_path).map_err(map_storage_port_error)?;
+    let path = roots.path(role).join(managed.as_path());
+
+    match observe_managed_file(roots, role, relative_path)? {
+        None => return Ok(ManagedDeleteOutcome::Missing),
+        Some(observed) if &observed != expected_evidence => {
+            return Ok(ManagedDeleteOutcome::Changed);
+        }
+        Some(_) => {}
+    }
+
+    const GENERIC_READ_ACCESS: u32 = 0x8000_0000;
+    const DELETE_ACCESS: u32 = 0x0001_0000;
+    let mut file = match OpenOptions::new()
+        .access_mode(GENERIC_READ_ACCESS | DELETE_ACCESS)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(ManagedDeleteOutcome::Missing);
+        }
+        Err(error) => return Err(PortError::new("STORAGE_IO", error.to_string())),
+    };
+
+    let before = file_evidence(&file, relative_path)?;
+    if &before != expected_evidence {
+        return Ok(ManagedDeleteOutcome::Changed);
+    }
+    let digest = sha256_reader(&mut file)?;
+    let after = file_evidence(&file, relative_path)?;
+    if &after != expected_evidence || &digest != expected_sha256 {
+        return Ok(ManagedDeleteOutcome::Changed);
+    }
+
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+    let success = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle() as _,
+            FileDispositionInfo,
+            std::ptr::from_ref(&disposition).cast(),
+            size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    };
+    if success == 0 {
+        return Err(PortError::new(
+            "STORAGE_DELETE_UNCERTAIN",
+            io::Error::last_os_error().to_string(),
+        ));
+    }
+    drop(file);
+
+    if observe_managed_file(roots, role, relative_path)?.is_some() {
+        return Err(PortError::new(
+            "STORAGE_DELETE_POSTCONDITION",
+            "managed source still exists after exact delete",
+        ));
+    }
+    Ok(ManagedDeleteOutcome::Deleted)
+}
+
+#[cfg(not(windows))]
+fn delete_managed_exact(
+    _roots: &ValidatedManagedRootLayout,
+    _role: ManagedRootRole,
+    _relative_path: &str,
+    _expected_evidence: &FileEvidence,
+    _expected_sha256: &[u8; 32],
+) -> Result<ManagedDeleteOutcome, PortError> {
+    Err(PortError::new(
+        "STORAGE_DELETE_UNSUPPORTED",
+        "exact managed deletion requires the Windows storage adapter",
+    ))
+}
+
+fn sha256_reader(reader: &mut File) -> Result<[u8; 32], PortError> {
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| PortError::new("STORAGE_IO", error.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(digest.finalize().into())
+}
+
+#[cfg(windows)]
 fn move_same_volume_no_replace(
     roots: &ValidatedManagedRootLayout,
     source_role: ManagedRootRole,
