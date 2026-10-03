@@ -493,10 +493,11 @@ fn move_same_volume_no_replace(
     let moved = unsafe { MoveFileW(source_wide.as_ptr(), destination_wide.as_ptr()) };
     if moved == 0 {
         let error = io::Error::last_os_error();
-        if matches!(
-            error.raw_os_error().map(|value| value as u32),
-            Some(ERROR_ALREADY_EXISTS | ERROR_FILE_EXISTS)
-        ) {
+        if error
+            .raw_os_error()
+            .map(|value| value as u32)
+            .is_some_and(|value| value == ERROR_ALREADY_EXISTS || value == ERROR_FILE_EXISTS)
+        {
             if let Some(observed) =
                 observe_managed_file(roots, destination_role, relative_path)?
             {
@@ -1352,6 +1353,82 @@ mod tests {
         assert_eq!(snapshot.bytes, b"metainfo");
         assert_eq!(snapshot.evidence.size, 8);
         assert_ne!(snapshot.evidence.identity.file_id, 0);
+
+        fs::remove_dir_all(temp).expect("cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn managed_storage_moves_same_volume_without_replace_and_preserves_identity() {
+        let temp = temp_root("move-same-volume");
+        let roots = valid_roots(&temp);
+        let source = roots.working.join("dir").join("payload.bin");
+        fs::create_dir_all(source.parent().expect("source parent")).expect("source parent");
+        fs::write(&source, b"payload").expect("fixture");
+
+        let storage = ManagedStorage::new(roots.clone());
+        let evidence = storage
+            .observe_file(ManagedRoot::Working, "dir/payload.bin")
+            .expect("observe source")
+            .expect("source evidence");
+
+        let outcome = storage
+            .move_same_volume_no_replace(
+                ManagedRoot::Working,
+                ManagedRoot::Completed,
+                "dir/payload.bin",
+                &evidence,
+            )
+            .expect("move");
+        assert_eq!(
+            outcome,
+            SameVolumeMoveOutcome::Moved {
+                destination: evidence.clone()
+            }
+        );
+        assert!(!source.exists());
+        let destination = roots.completed.join("dir").join("payload.bin");
+        assert_eq!(fs::read(destination).expect("destination bytes"), b"payload");
+
+        fs::remove_dir_all(temp).expect("cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn managed_storage_same_volume_move_refuses_existing_destination() {
+        let temp = temp_root("move-destination-conflict");
+        let roots = valid_roots(&temp);
+        let source = roots.working.join("dir").join("payload.bin");
+        let destination = roots.completed.join("dir").join("payload.bin");
+        fs::create_dir_all(source.parent().expect("source parent")).expect("source parent");
+        fs::create_dir_all(destination.parent().expect("destination parent"))
+            .expect("destination parent");
+        fs::write(&source, b"source").expect("source fixture");
+        fs::write(&destination, b"destination").expect("destination fixture");
+
+        let storage = ManagedStorage::new(roots.clone());
+        let evidence = storage
+            .observe_file(ManagedRoot::Working, "dir/payload.bin")
+            .expect("observe source")
+            .expect("source evidence");
+
+        let outcome = storage
+            .move_same_volume_no_replace(
+                ManagedRoot::Working,
+                ManagedRoot::Completed,
+                "dir/payload.bin",
+                &evidence,
+            )
+            .expect("conflict outcome");
+        assert!(matches!(
+            outcome,
+            SameVolumeMoveOutcome::DestinationExists { .. }
+        ));
+        assert_eq!(fs::read(source).expect("source retained"), b"source");
+        assert_eq!(
+            fs::read(destination).expect("destination retained"),
+            b"destination"
+        );
 
         fs::remove_dir_all(temp).expect("cleanup");
     }
