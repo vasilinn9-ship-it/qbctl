@@ -6,10 +6,7 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context as _, Result};
 use prost::Message;
-use qb_application::{
-    system::SystemService,
-    torrent::TorrentService,
-};
+use qb_application::{system::SystemService, torrent::TorrentService};
 use qb_ipc::{IpcError, ServerConnection};
 use qb_proto::v1::Request;
 use tokio::time::timeout;
