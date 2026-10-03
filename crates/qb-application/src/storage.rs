@@ -60,6 +60,17 @@ pub trait Storage: Send + Sync {
 
     fn matches_root_path(&self, root: ManagedRoot, observed: &str) -> Result<bool, PortError>;
 
+    fn observe_file(
+        &self,
+        _root: ManagedRoot,
+        _relative_path: &str,
+    ) -> Result<Option<FileEvidence>, PortError> {
+        Err(PortError::new(
+            "STORAGE_OBSERVE_UNSUPPORTED",
+            "managed file observation is not supported by this storage adapter",
+        ))
+    }
+
     fn list_incoming(&self) -> Result<Vec<String>, PortError>;
 
     fn read_incoming(

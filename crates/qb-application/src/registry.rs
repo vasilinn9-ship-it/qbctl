@@ -41,6 +41,13 @@ pub trait TorrentRegistry: Send + Sync {
         identity: &TorrentIdentity,
     ) -> Result<Option<RegistryRecord>, PortError>;
 
+    fn get_by_id(&self, _registry_id: &str) -> Result<Option<RegistryRecord>, PortError> {
+        Err(PortError::new(
+            "REGISTRY_LOOKUP_UNSUPPORTED",
+            "registry lookup by id is not supported by this adapter",
+        ))
+    }
+
     fn register_incoming(
         &self,
         candidate: &RegisterIncoming,

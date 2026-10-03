@@ -207,6 +207,14 @@ impl Storage for ManagedStorage {
         Ok(paths_equal(self.roots.path(role), observed))
     }
 
+    fn observe_file(
+        &self,
+        root: ManagedRoot,
+        relative_path: &str,
+    ) -> Result<Option<FileEvidence>, PortError> {
+        observe_managed_file(&self.roots, managed_root_role(root), relative_path)
+    }
+
     fn list_incoming(&self) -> Result<Vec<String>, PortError> {
         self.revalidate_root(ManagedRootRole::Incoming)?;
 
@@ -334,6 +342,52 @@ impl Storage for ManagedStorage {
             max_bytes,
         )
     }
+}
+
+fn observe_managed_file(
+    roots: &ValidatedManagedRootLayout,
+    role: ManagedRootRole,
+    relative_path: &str,
+) -> Result<Option<FileEvidence>, PortError> {
+    let refreshed = validate_root(role, roots.path(role)).map_err(map_storage_port_error)?;
+    if !paths_equal(&refreshed, roots.path(role)) {
+        return Err(PortError::new(
+            "STORAGE_ROOT_CHANGED",
+            format!("{role:?} root identity changed before file observation"),
+        ));
+    }
+
+    let managed = ManagedRelativePath::parse(relative_path).map_err(map_storage_port_error)?;
+    let mut current = roots.path(role).to_path_buf();
+    let components = managed.as_path().components().collect::<Vec<_>>();
+
+    for (index, component) in components.iter().enumerate() {
+        current.push(component.as_os_str());
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(PortError::new("STORAGE_IO", error.to_string())),
+        };
+        if is_reparse_metadata(&metadata) {
+            return Err(PortError::new(
+                "STORAGE_REPARSE_POINT",
+                format!("managed {role:?} path traverses a reparse point: {relative_path}"),
+            ));
+        }
+        if index + 1 < components.len() && !metadata.is_dir() {
+            return Err(PortError::new(
+                "STORAGE_PATH_INVALID",
+                format!("managed {role:?} path has a non-directory parent: {relative_path}"),
+            ));
+        }
+    }
+
+    let file = match open_snapshot_file(&current) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(PortError::new("STORAGE_IO", error.to_string())),
+    };
+    file_evidence(&file, relative_path).map(Some)
 }
 
 fn validate_incoming_delete_path(
