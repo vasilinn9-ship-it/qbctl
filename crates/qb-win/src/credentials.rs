@@ -90,10 +90,24 @@ unsafe fn read_wide_z(pointer: *mut u16) -> Option<String> {
 
 #[cfg(windows)]
 fn decode_secret(blob: &[u8]) -> Option<String> {
+    let looks_utf16_le = blob.len().is_multiple_of(2)
+        && (blob.starts_with(&[0xff, 0xfe]) || blob.iter().any(|byte| *byte == 0));
+
+    if looks_utf16_le {
+        if let Some(value) = decode_utf16_le(blob) {
+            return Some(value);
+        }
+    }
+
     if let Ok(value) = std::str::from_utf8(blob) {
         return Some(value.to_string());
     }
 
+    decode_utf16_le(blob)
+}
+
+#[cfg(windows)]
+fn decode_utf16_le(blob: &[u8]) -> Option<String> {
     if !blob.len().is_multiple_of(2) {
         return None;
     }
@@ -103,10 +117,19 @@ fn decode_secret(blob: &[u8]) -> Option<String> {
         return None;
     }
 
-    let utf16: Vec<u16> = pairs.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
-    String::from_utf16(&utf16)
-        .ok()
-        .map(|value| value.trim_end_matches('\0').to_string())
+    let mut units: Vec<u16> = pairs.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
+    if units.first() == Some(&0xfeff) {
+        units.remove(0);
+    }
+    while units.last() == Some(&0) {
+        units.pop();
+    }
+
+    let value = String::from_utf16(&units).ok()?;
+    if value.contains('\0') {
+        return None;
+    }
+    Some(value)
 }
 
 #[cfg(not(windows))]
@@ -127,5 +150,15 @@ mod tests {
             .flat_map(u16::to_le_bytes)
             .collect::<Vec<_>>();
         assert_eq!(decode_secret(&utf16).as_deref(), Some("secret"));
+
+        let utf16_with_terminator = "пароль"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            decode_secret(&utf16_with_terminator).as_deref(),
+            Some("пароль")
+        );
     }
 }
