@@ -836,23 +836,17 @@ mod tests {
         let requests = server.finish().await;
         assert_eq!(requests.len(), 3);
         assert!(requests[0].starts_with("POST /api/v2/auth/login HTTP/1.1"));
-        assert!(
-            requests[0]
-                .to_ascii_lowercase()
-                .contains("origin: http://127.0.0.1:")
-        );
+        assert!(requests[0]
+            .to_ascii_lowercase()
+            .contains("origin: http://127.0.0.1:"));
         assert!(requests[0].contains("username=admin"));
         assert!(requests[0].contains("password=secret"));
-        assert!(
-            requests[1]
-                .to_ascii_lowercase()
-                .contains("cookie: sid=test-session")
-        );
-        assert!(
-            requests[2]
-                .to_ascii_lowercase()
-                .contains("cookie: sid=test-session")
-        );
+        assert!(requests[1]
+            .to_ascii_lowercase()
+            .contains("cookie: sid=test-session"));
+        assert!(requests[2]
+            .to_ascii_lowercase()
+            .contains("cookie: sid=test-session"));
     }
 
     #[tokio::test]
@@ -881,16 +875,12 @@ mod tests {
 
         let requests = server.finish().await;
         assert_eq!(requests.len(), 4);
-        assert!(
-            requests[1]
-                .to_ascii_lowercase()
-                .contains("cookie: sid=first")
-        );
-        assert!(
-            requests[3]
-                .to_ascii_lowercase()
-                .contains("cookie: sid=second")
-        );
+        assert!(requests[1]
+            .to_ascii_lowercase()
+            .contains("cookie: sid=first"));
+        assert!(requests[3]
+            .to_ascii_lowercase()
+            .contains("cookie: sid=second"));
     }
 
     #[tokio::test]
@@ -1001,16 +991,12 @@ mod tests {
 
         let requests = server.finish().await;
         assert_eq!(requests.len(), 4);
-        assert!(
-            requests[1]
-                .to_ascii_lowercase()
-                .contains("cookie: sid=first")
-        );
-        assert!(
-            requests[3]
-                .to_ascii_lowercase()
-                .contains("cookie: sid=second")
-        );
+        assert!(requests[1]
+            .to_ascii_lowercase()
+            .contains("cookie: sid=first"));
+        assert!(requests[3]
+            .to_ascii_lowercase()
+            .contains("cookie: sid=second"));
     }
 
     #[tokio::test]
