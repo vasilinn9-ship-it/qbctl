@@ -396,7 +396,10 @@ fn render_fields(response: &Response) -> Result<(), CliError> {
 fn print_torrent_fields(index: usize, torrent: &qb_proto::v1::TorrentSummary) {
     println!("torrent.{index}.id={}", torrent.id);
     println!("torrent.{index}.name={}", sanitize_field(&torrent.name));
-    println!("torrent.{index}.state={}", torrent_state_name(torrent.state));
+    println!(
+        "torrent.{index}.state={}",
+        torrent_state_name(torrent.state)
+    );
     println!("torrent.{index}.total_bytes={}", torrent.total_bytes);
     println!(
         "torrent.{index}.remaining_bytes={}",
