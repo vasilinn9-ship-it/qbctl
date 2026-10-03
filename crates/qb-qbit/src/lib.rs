@@ -180,14 +180,7 @@ impl QbitClient {
             .into_iter()
             .map(|row| TrackerEvidence {
                 identity: redact_tracker_identity(&row.url),
-                status: match row.status {
-                    0 => TrackerStatus::Disabled,
-                    1 => TrackerStatus::NotContacted,
-                    2 => TrackerStatus::Working,
-                    3 => TrackerStatus::Updating,
-                    4 => TrackerStatus::Error,
-                    _ => TrackerStatus::Unknown,
-                },
+                status: map_tracker_status(row.status),
                 peers: row.num_peers,
                 seeds: row.num_seeds,
                 leeches: row.num_leeches,
@@ -614,6 +607,17 @@ fn map_state(value: &str) -> TorrentState {
     }
 }
 
+fn map_tracker_status(value: i64) -> TrackerStatus {
+    match value {
+        0 => TrackerStatus::Disabled,
+        1 => TrackerStatus::NotContacted,
+        2 => TrackerStatus::Working,
+        3 => TrackerStatus::Updating,
+        4..=6 => TrackerStatus::Error,
+        _ => TrackerStatus::Unknown,
+    }
+}
+
 fn redact_tracker_identity(value: &str) -> String {
     match Url::parse(value) {
         Ok(url) => {
@@ -856,6 +860,18 @@ mod tests {
         assert_eq!(map_state("pausedDL"), TorrentState::Stopped);
         assert_eq!(map_state("stalledDL"), TorrentState::StalledDownloading);
         assert_eq!(map_state("future-state"), TorrentState::Unknown);
+    }
+
+    #[test]
+    fn tracker_status_mapping_covers_supported_webapi_values() {
+        assert_eq!(map_tracker_status(0), TrackerStatus::Disabled);
+        assert_eq!(map_tracker_status(1), TrackerStatus::NotContacted);
+        assert_eq!(map_tracker_status(2), TrackerStatus::Working);
+        assert_eq!(map_tracker_status(3), TrackerStatus::Updating);
+        assert_eq!(map_tracker_status(4), TrackerStatus::Error);
+        assert_eq!(map_tracker_status(5), TrackerStatus::Error);
+        assert_eq!(map_tracker_status(6), TrackerStatus::Error);
+        assert_eq!(map_tracker_status(7), TrackerStatus::Unknown);
     }
 
     #[tokio::test]
