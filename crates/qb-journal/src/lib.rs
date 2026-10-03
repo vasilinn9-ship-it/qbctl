@@ -11,6 +11,10 @@ use qb_application::{
         AdmissionJournal, AdmissionRecord, AdmissionReservationRequest, AdmissionReservationResult,
         CapacityReservation, ADMISSION_FINGERPRINT_VERSION,
     },
+    cleanup::{
+        IncomingCleanupIntent, IncomingCleanupJournal, IncomingCleanupRecord,
+        IncomingCleanupReservation, IncomingCleanupState, INCOMING_CLEANUP_FINGERPRINT_VERSION,
+    },
     mutation::{
         MutationCommand, MutationDisposition, MutationJournal, MutationRecord, QueueTargetPolicy,
         RequestReservation, TorrentControlAction, FINGERPRINT_VERSION,
@@ -28,7 +32,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, Transact
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Error)]
 pub enum JournalError {
@@ -674,6 +678,209 @@ impl TorrentRegistry for Journal {
             .map_err(JournalError::from)
             .map_err(map_port_error)?;
         Ok(result)
+    }
+}
+
+impl IncomingCleanupJournal for Journal {
+    fn reserve_cleanup(
+        &self,
+        intent: &IncomingCleanupIntent,
+    ) -> Result<IncomingCleanupReservation, PortError> {
+        if intent.canonical_path.is_empty()
+            || intent.redundant_path.is_empty()
+            || intent.canonical_path == intent.redundant_path
+        {
+            return Err(PortError::new(
+                "CLEANUP_REQUEST_INVALID",
+                "cleanup paths must be non-empty and distinct",
+            ));
+        }
+
+        let fingerprint = intent.fingerprint();
+        let mut connection = self.connection.lock().expect("journal mutex poisoned");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+
+        let existing_id: Option<String> = transaction
+            .query_row(
+                "SELECT cleanup_id
+                 FROM incoming_cleanup_intents
+                 WHERE fingerprint_version = ?1
+                   AND cleanup_fingerprint = ?2",
+                params![
+                    INCOMING_CLEANUP_FINGERPRINT_VERSION,
+                    fingerprint.as_slice()
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        if let Some(cleanup_id) = existing_id {
+            let record = load_cleanup_record(&transaction, &cleanup_id)
+                .map_err(map_port_error)?
+                .ok_or_else(|| {
+                    PortError::new(
+                        "JOURNAL_STATE_INVALID",
+                        "cleanup fingerprint references a missing intent",
+                    )
+                })?;
+            transaction
+                .commit()
+                .map_err(JournalError::from)
+                .map_err(map_port_error)?;
+            return Ok(IncomingCleanupReservation::Replay(record));
+        }
+
+        let conflicting: Option<String> = transaction
+            .query_row(
+                "SELECT cleanup_id
+                 FROM incoming_cleanup_intents
+                 WHERE redundant_path = ?1
+                   AND state = 'prepared'
+                 LIMIT 1",
+                [&intent.redundant_path],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        if conflicting.is_some() {
+            return Err(PortError::new(
+                "SOURCE_AMBIGUOUS",
+                "redundant Incoming path already has a different active cleanup intent",
+            ));
+        }
+
+        let cleanup_id = Uuid::new_v4().to_string();
+        transaction
+            .execute(
+                "INSERT INTO incoming_cleanup_intents(
+                    cleanup_id,
+                    fingerprint_version,
+                    cleanup_fingerprint,
+                    canonical_path,
+                    canonical_volume_id,
+                    canonical_file_id,
+                    canonical_size,
+                    canonical_modified_marker,
+                    redundant_path,
+                    redundant_volume_id,
+                    redundant_file_id,
+                    redundant_size,
+                    redundant_modified_marker,
+                    source_sha256,
+                    state,
+                    problem_code,
+                    revision,
+                    created_at,
+                    updated_at,
+                    finished_at
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                    ?11, ?12, ?13, ?14, 'prepared', NULL, 1,
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    NULL
+                 )",
+                params![
+                    cleanup_id,
+                    INCOMING_CLEANUP_FINGERPRINT_VERSION,
+                    fingerprint.as_slice(),
+                    intent.canonical_path,
+                    intent.canonical_evidence.identity.volume_id.to_be_bytes().as_slice(),
+                    intent.canonical_evidence.identity.file_id.to_be_bytes().as_slice(),
+                    intent.canonical_evidence.size.to_be_bytes().as_slice(),
+                    intent
+                        .canonical_evidence
+                        .modified_marker
+                        .to_be_bytes()
+                        .as_slice(),
+                    intent.redundant_path,
+                    intent.redundant_evidence.identity.volume_id.to_be_bytes().as_slice(),
+                    intent.redundant_evidence.identity.file_id.to_be_bytes().as_slice(),
+                    intent.redundant_evidence.size.to_be_bytes().as_slice(),
+                    intent
+                        .redundant_evidence
+                        .modified_marker
+                        .to_be_bytes()
+                        .as_slice(),
+                    intent.source_sha256.as_slice(),
+                ],
+            )
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+
+        insert_cleanup_event(&transaction, &cleanup_id, 1, "prepared", None)
+            .map_err(map_port_error)?;
+
+        let record = load_cleanup_record(&transaction, &cleanup_id)
+            .map_err(map_port_error)?
+            .ok_or_else(|| {
+                PortError::new(
+                    "JOURNAL_STATE_INVALID",
+                    "new cleanup intent disappeared before commit",
+                )
+            })?;
+        transaction
+            .commit()
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        Ok(IncomingCleanupReservation::New(record))
+    }
+
+    fn list_recoverable_cleanups(&self) -> Result<Vec<IncomingCleanupRecord>, PortError> {
+        let connection = self.connection.lock().expect("journal mutex poisoned");
+        let mut statement = connection
+            .prepare(
+                "SELECT cleanup_id
+                 FROM incoming_cleanup_intents
+                 WHERE state = 'prepared'
+                 ORDER BY created_at, cleanup_id",
+            )
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            let cleanup_id = row.map_err(JournalError::from).map_err(map_port_error)?;
+            let record = load_cleanup_record(&connection, &cleanup_id)
+                .map_err(map_port_error)?
+                .ok_or_else(|| {
+                    PortError::new(
+                        "JOURNAL_STATE_INVALID",
+                        "recoverable cleanup intent disappeared",
+                    )
+                })?;
+            records.push(record);
+        }
+        Ok(records)
+    }
+
+    fn mark_cleanup_deleted(
+        &self,
+        cleanup_id: &str,
+    ) -> Result<IncomingCleanupRecord, PortError> {
+        transition_cleanup(self, cleanup_id, IncomingCleanupState::Deleted, None)
+    }
+
+    fn mark_cleanup_blocked(
+        &self,
+        cleanup_id: &str,
+        problem_code: &str,
+    ) -> Result<IncomingCleanupRecord, PortError> {
+        transition_cleanup(
+            self,
+            cleanup_id,
+            IncomingCleanupState::Blocked,
+            Some(problem_code),
+        )
     }
 }
 
@@ -1547,6 +1754,11 @@ fn migrate(connection: &mut Connection) -> Result<(), JournalError> {
         version = 4;
     }
 
+    if version == 4 {
+        migrate_v4_to_v5(connection)?;
+        version = 5;
+    }
+
     if version != SCHEMA_VERSION {
         return Err(JournalError::InvalidState(format!(
             "migration stopped at schema {version}"
@@ -1726,6 +1938,61 @@ fn migrate_v3_to_v4(connection: &mut Connection) -> Result<(), JournalError> {
         WHERE singleton = 1;
 
         PRAGMA user_version = 4;
+        "#,
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v4_to_v5(connection: &mut Connection) -> Result<(), JournalError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE incoming_cleanup_intents (
+            cleanup_id TEXT PRIMARY KEY,
+            fingerprint_version INTEGER NOT NULL,
+            cleanup_fingerprint BLOB NOT NULL CHECK(length(cleanup_fingerprint) = 32),
+            canonical_path TEXT NOT NULL CHECK(length(canonical_path) > 0),
+            canonical_volume_id BLOB NOT NULL CHECK(length(canonical_volume_id) = 8),
+            canonical_file_id BLOB NOT NULL CHECK(length(canonical_file_id) = 8),
+            canonical_size BLOB NOT NULL CHECK(length(canonical_size) = 8),
+            canonical_modified_marker BLOB NOT NULL CHECK(length(canonical_modified_marker) = 16),
+            redundant_path TEXT NOT NULL CHECK(length(redundant_path) > 0),
+            redundant_volume_id BLOB NOT NULL CHECK(length(redundant_volume_id) = 8),
+            redundant_file_id BLOB NOT NULL CHECK(length(redundant_file_id) = 8),
+            redundant_size BLOB NOT NULL CHECK(length(redundant_size) = 8),
+            redundant_modified_marker BLOB NOT NULL CHECK(length(redundant_modified_marker) = 16),
+            source_sha256 BLOB NOT NULL CHECK(length(source_sha256) = 32),
+            state TEXT NOT NULL CHECK(state IN ('prepared','deleted','blocked')),
+            problem_code TEXT,
+            revision INTEGER NOT NULL CHECK(revision > 0),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            finished_at TEXT,
+            UNIQUE(fingerprint_version, cleanup_fingerprint)
+        );
+
+        CREATE UNIQUE INDEX incoming_cleanup_active_path_idx
+        ON incoming_cleanup_intents(redundant_path)
+        WHERE state = 'prepared';
+
+        CREATE TABLE incoming_cleanup_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cleanup_id TEXT NOT NULL REFERENCES incoming_cleanup_intents(cleanup_id),
+            revision INTEGER NOT NULL CHECK(revision > 0),
+            event_kind TEXT NOT NULL CHECK(event_kind IN ('prepared','deleted','blocked')),
+            problem_code TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(cleanup_id, revision)
+        );
+
+        UPDATE schema_meta
+        SET schema_version = 5,
+            application_min_version = '0.1.0',
+            migrated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE singleton = 1;
+
+        PRAGMA user_version = 5;
         "#,
     )?;
     transaction.commit()?;
@@ -1976,6 +2243,236 @@ fn load_registry_record(
         handoff_file_count,
         handoff_receipt_count,
     }))
+}
+
+struct StoredCleanupRow {
+    cleanup_id: String,
+    canonical_path: String,
+    canonical_volume_id: Vec<u8>,
+    canonical_file_id: Vec<u8>,
+    canonical_size: Vec<u8>,
+    canonical_modified_marker: Vec<u8>,
+    redundant_path: String,
+    redundant_volume_id: Vec<u8>,
+    redundant_file_id: Vec<u8>,
+    redundant_size: Vec<u8>,
+    redundant_modified_marker: Vec<u8>,
+    source_sha256: Vec<u8>,
+    state: String,
+    problem_code: Option<String>,
+    revision: u64,
+}
+
+fn load_cleanup_record(
+    connection: &Connection,
+    cleanup_id: &str,
+) -> Result<Option<IncomingCleanupRecord>, JournalError> {
+    let row = connection
+        .query_row(
+            "SELECT cleanup_id,
+                    canonical_path,
+                    canonical_volume_id,
+                    canonical_file_id,
+                    canonical_size,
+                    canonical_modified_marker,
+                    redundant_path,
+                    redundant_volume_id,
+                    redundant_file_id,
+                    redundant_size,
+                    redundant_modified_marker,
+                    source_sha256,
+                    state,
+                    problem_code,
+                    revision
+             FROM incoming_cleanup_intents
+             WHERE cleanup_id = ?1",
+            [cleanup_id],
+            |row| {
+                Ok(StoredCleanupRow {
+                    cleanup_id: row.get(0)?,
+                    canonical_path: row.get(1)?,
+                    canonical_volume_id: row.get(2)?,
+                    canonical_file_id: row.get(3)?,
+                    canonical_size: row.get(4)?,
+                    canonical_modified_marker: row.get(5)?,
+                    redundant_path: row.get(6)?,
+                    redundant_volume_id: row.get(7)?,
+                    redundant_file_id: row.get(8)?,
+                    redundant_size: row.get(9)?,
+                    redundant_modified_marker: row.get(10)?,
+                    source_sha256: row.get(11)?,
+                    state: row.get(12)?,
+                    problem_code: row.get(13)?,
+                    revision: row.get(14)?,
+                })
+            },
+        )
+        .optional()?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let state = match row.state.as_str() {
+        "prepared" => IncomingCleanupState::Prepared,
+        "deleted" => IncomingCleanupState::Deleted,
+        "blocked" => IncomingCleanupState::Blocked,
+        other => {
+            return Err(JournalError::InvalidState(format!(
+                "unknown Incoming cleanup state '{other}'"
+            )));
+        }
+    };
+    let source_sha256: [u8; 32] = row.source_sha256.try_into().map_err(|value: Vec<u8>| {
+        JournalError::InvalidState(format!(
+            "cleanup source digest has {} bytes instead of 32",
+            value.len()
+        ))
+    })?;
+
+    Ok(Some(IncomingCleanupRecord {
+        cleanup_id: row.cleanup_id,
+        intent: IncomingCleanupIntent {
+            canonical_path: row.canonical_path,
+            canonical_evidence: qb_application::storage::FileEvidence {
+                identity: qb_application::storage::FileIdentity {
+                    volume_id: decode_u64_blob(&row.canonical_volume_id, "canonical_volume_id")?,
+                    file_id: decode_u64_blob(&row.canonical_file_id, "canonical_file_id")?,
+                },
+                size: decode_u64_blob(&row.canonical_size, "canonical_size")?,
+                modified_marker: decode_u128_blob(
+                    &row.canonical_modified_marker,
+                    "canonical_modified_marker",
+                )?,
+            },
+            redundant_path: row.redundant_path,
+            redundant_evidence: qb_application::storage::FileEvidence {
+                identity: qb_application::storage::FileIdentity {
+                    volume_id: decode_u64_blob(&row.redundant_volume_id, "redundant_volume_id")?,
+                    file_id: decode_u64_blob(&row.redundant_file_id, "redundant_file_id")?,
+                },
+                size: decode_u64_blob(&row.redundant_size, "redundant_size")?,
+                modified_marker: decode_u128_blob(
+                    &row.redundant_modified_marker,
+                    "redundant_modified_marker",
+                )?,
+            },
+            source_sha256,
+        },
+        state,
+        problem_code: row.problem_code,
+        revision: row.revision,
+    }))
+}
+
+fn insert_cleanup_event(
+    transaction: &Transaction<'_>,
+    cleanup_id: &str,
+    revision: u64,
+    event_kind: &str,
+    problem_code: Option<&str>,
+) -> Result<(), JournalError> {
+    transaction.execute(
+        "INSERT INTO incoming_cleanup_events(
+            cleanup_id, revision, event_kind, problem_code, created_at
+         ) VALUES (
+            ?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        params![cleanup_id, revision, event_kind, problem_code],
+    )?;
+    Ok(())
+}
+
+fn transition_cleanup(
+    journal: &Journal,
+    cleanup_id: &str,
+    next: IncomingCleanupState,
+    problem_code: Option<&str>,
+) -> Result<IncomingCleanupRecord, PortError> {
+    let mut connection = journal.connection.lock().expect("journal mutex poisoned");
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+
+    let current = load_cleanup_record(&transaction, cleanup_id)
+        .map_err(map_port_error)?
+        .ok_or_else(|| PortError::new("CLEANUP_NOT_FOUND", cleanup_id.to_string()))?;
+    if current.state == next {
+        transaction
+            .commit()
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        return Ok(current);
+    }
+    if current.state != IncomingCleanupState::Prepared {
+        return Err(PortError::new(
+            "CLEANUP_TRANSITION_INVALID",
+            format!("cleanup {cleanup_id} is not prepared"),
+        ));
+    }
+
+    let (state, event_kind) = match next {
+        IncomingCleanupState::Deleted => ("deleted", "deleted"),
+        IncomingCleanupState::Blocked => ("blocked", "blocked"),
+        IncomingCleanupState::Prepared => {
+            return Err(PortError::new(
+                "CLEANUP_TRANSITION_INVALID",
+                "cleanup cannot transition back to prepared",
+            ));
+        }
+    };
+    let revision = current.revision.checked_add(1).ok_or_else(|| {
+        PortError::new(
+            "JOURNAL_STATE_INVALID",
+            "Incoming cleanup revision overflow",
+        )
+    })?;
+
+    let changed = transaction
+        .execute(
+            "UPDATE incoming_cleanup_intents
+             SET state = ?1,
+                 problem_code = ?2,
+                 revision = ?3,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE cleanup_id = ?4
+               AND state = 'prepared'
+               AND revision = ?5",
+            params![state, problem_code, revision, cleanup_id, current.revision],
+        )
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    if changed != 1 {
+        return Err(PortError::new(
+            "CLEANUP_TRANSITION_INVALID",
+            "Incoming cleanup changed concurrently",
+        ));
+    }
+
+    insert_cleanup_event(
+        &transaction,
+        cleanup_id,
+        revision,
+        event_kind,
+        problem_code,
+    )
+    .map_err(map_port_error)?;
+
+    let record = load_cleanup_record(&transaction, cleanup_id)
+        .map_err(map_port_error)?
+        .ok_or_else(|| {
+            PortError::new(
+                "JOURNAL_STATE_INVALID",
+                "Incoming cleanup disappeared after transition",
+            )
+        })?;
+    transaction
+        .commit()
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    Ok(record)
 }
 
 struct StoredAdmissionRow {
@@ -2560,13 +3057,111 @@ mod tests {
                     'controller_policy',
                     'torrent_registry',
                     'torrent_aliases',
-                    'admission_reservations'
+                    'admission_reservations',
+                    'incoming_cleanup_intents',
+                    'incoming_cleanup_events'
                  )",
                 [],
                 |row| row.get(0),
             )
             .expect("table count");
-        assert_eq!(table_count, 7);
+        assert_eq!(table_count, 9);
+    }
+
+    fn cleanup_intent() -> IncomingCleanupIntent {
+        IncomingCleanupIntent {
+            canonical_path: "a.torrent".into(),
+            canonical_evidence: qb_application::storage::FileEvidence {
+                identity: qb_application::storage::FileIdentity {
+                    volume_id: 7,
+                    file_id: 11,
+                },
+                size: 12,
+                modified_marker: 13,
+            },
+            redundant_path: "b.torrent".into(),
+            redundant_evidence: qb_application::storage::FileEvidence {
+                identity: qb_application::storage::FileIdentity {
+                    volume_id: 7,
+                    file_id: 21,
+                },
+                size: 12,
+                modified_marker: 23,
+            },
+            source_sha256: [0x55; 32],
+        }
+    }
+
+    #[test]
+    fn incoming_cleanup_intent_replays_persists_and_receipts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.sqlite");
+        let intent = cleanup_intent();
+
+        let cleanup_id = {
+            let journal = Journal::open(&path).expect("journal");
+            let first = match journal.reserve_cleanup(&intent).expect("reserve") {
+                IncomingCleanupReservation::New(record) => record,
+                other => panic!("unexpected cleanup reservation: {other:?}"),
+            };
+            assert_eq!(first.state, IncomingCleanupState::Prepared);
+            assert_eq!(first.revision, 1);
+
+            match journal.reserve_cleanup(&intent).expect("replay") {
+                IncomingCleanupReservation::Replay(record) => {
+                    assert_eq!(record.cleanup_id, first.cleanup_id);
+                }
+                other => panic!("unexpected cleanup replay: {other:?}"),
+            }
+            assert_eq!(
+                journal
+                    .list_recoverable_cleanups()
+                    .expect("recoverable")
+                    .len(),
+                1
+            );
+            first.cleanup_id
+        };
+
+        let reopened = Journal::open(&path).expect("reopen");
+        let deleted = reopened
+            .mark_cleanup_deleted(&cleanup_id)
+            .expect("receipt");
+        assert_eq!(deleted.state, IncomingCleanupState::Deleted);
+        assert_eq!(deleted.revision, 2);
+        assert!(reopened
+            .list_recoverable_cleanups()
+            .expect("recoverable")
+            .is_empty());
+
+        match reopened.reserve_cleanup(&intent).expect("replay deleted") {
+            IncomingCleanupReservation::Replay(record) => {
+                assert_eq!(record.cleanup_id, cleanup_id);
+                assert_eq!(record.state, IncomingCleanupState::Deleted);
+            }
+            other => panic!("unexpected deleted replay: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn incoming_cleanup_blocked_receipt_is_terminal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path().join("state.sqlite")).expect("journal");
+        let intent = cleanup_intent();
+        let cleanup_id = match journal.reserve_cleanup(&intent).expect("reserve") {
+            IncomingCleanupReservation::New(record) => record.cleanup_id,
+            other => panic!("unexpected cleanup reservation: {other:?}"),
+        };
+
+        let blocked = journal
+            .mark_cleanup_blocked(&cleanup_id, "SOURCE_AMBIGUOUS")
+            .expect("block");
+        assert_eq!(blocked.state, IncomingCleanupState::Blocked);
+        assert_eq!(blocked.problem_code.as_deref(), Some("SOURCE_AMBIGUOUS"));
+        assert!(journal
+            .list_recoverable_cleanups()
+            .expect("recoverable")
+            .is_empty());
     }
 
     #[test]
