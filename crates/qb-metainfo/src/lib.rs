@@ -683,6 +683,28 @@ fn invalid(message: impl Into<String>) -> MetainfoError {
 mod tests {
     use super::*;
 
+    const V2_PIECES_ROOT: [u8; 32] = [
+        81, 137, 199, 125, 41, 254, 93, 84, 106, 4, 94, 196, 105, 134, 133, 39, 133, 254,
+        165, 193, 58, 199, 218, 156, 17, 95, 245, 251, 110, 223, 129, 124,
+    ];
+
+    fn v2_piece_layer_fixture(second_piece_byte: u8) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(
+            b"d4:infod9:file treed8:file.bind0:d6:lengthi20000e11:pieces root32:",
+        );
+        bytes.extend_from_slice(&V2_PIECES_ROOT);
+        bytes.extend_from_slice(
+            b"eee12:meta versioni2e4:name4:test12:piece lengthi16384ee12:piece layersd32:",
+        );
+        bytes.extend_from_slice(&V2_PIECES_ROOT);
+        bytes.extend_from_slice(b"64:");
+        bytes.extend_from_slice(&[0x11; 32]);
+        bytes.extend_from_slice(&[second_piece_byte; 32]);
+        bytes.extend_from_slice(b"ee");
+        bytes
+    }
+
     #[test]
     fn parses_v1_single_file_and_hashes_raw_info() {
         let bytes =
@@ -716,6 +738,30 @@ mod tests {
         );
         assert_eq!(parsed.manifest.files[0].path, "file.txt");
         assert_eq!(parsed.manifest.files[0].size, 0);
+    }
+
+    #[test]
+    fn parses_v2_piece_layer_with_pinned_info_hash() {
+        let bytes = v2_piece_layer_fixture(0x22);
+        let parsed = parse_inner(&bytes).expect("v2 piece-layer parse");
+
+        assert_eq!(
+            parsed.identity.v2,
+            Some([
+                8, 248, 145, 26, 216, 233, 43, 98, 66, 203, 217, 94, 86, 185, 210, 84, 122,
+                39, 10, 40, 233, 119, 89, 14, 124, 59, 103, 34, 117, 142, 62, 204,
+            ])
+        );
+        assert_eq!(parsed.manifest.total_size, 20_000);
+        assert_eq!(parsed.manifest.files[0].path, "file.bin");
+        assert_eq!(parsed.manifest.files[0].size, 20_000);
+    }
+
+    #[test]
+    fn rejects_v2_piece_layer_that_does_not_match_pieces_root() {
+        let bytes = v2_piece_layer_fixture(0x23);
+        let error = parse_inner(&bytes).expect_err("piece-layer mismatch");
+        assert!(error.to_string().contains("does not match pieces root"));
     }
 
     #[test]
