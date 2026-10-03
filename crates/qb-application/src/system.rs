@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::{JournalHealthPort, PortError};
+use crate::{JournalHealthPort, PortError, RecoveryBlocker};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DaemonPhase {
@@ -32,6 +32,7 @@ pub struct SystemStatus {
     pub instance_id: String,
     pub schema_version: u32,
     pub mutation_admission_enabled: bool,
+    pub recovery_blockers: Vec<RecoveryBlocker>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,12 +60,14 @@ impl SystemService {
     pub fn status(&self) -> Result<SystemStatus, PortError> {
         let runtime = self.runtime.snapshot();
         let schema_version = self.journal.schema_version()?;
+        let recovery_blockers = self.journal.recovery_blockers()?;
 
         Ok(SystemStatus {
             phase: runtime.phase,
             instance_id: runtime.instance_id,
             schema_version,
             mutation_admission_enabled: runtime.mutation_admission_enabled,
+            recovery_blockers,
         })
     }
 
@@ -95,8 +98,38 @@ impl SystemService {
             },
         };
 
+        let recovery = match self.journal.recovery_blockers() {
+            Ok(blockers) if blockers.is_empty() => DoctorCheck {
+                name: "recovery".into(),
+                ok: true,
+                message: "no durable Unknown/Blocked recovery blockers".into(),
+            },
+            Ok(blockers) => DoctorCheck {
+                name: "recovery".into(),
+                ok: false,
+                message: blockers
+                    .iter()
+                    .map(|blocker| {
+                        format!(
+                            "{}:{}:{}={}",
+                            blocker.kind,
+                            blocker.state,
+                            blocker.problem_code.as_deref().unwrap_or("none"),
+                            blocker.count
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(","),
+            },
+            Err(error) => DoctorCheck {
+                name: "recovery".into(),
+                ok: false,
+                message: error.to_string(),
+            },
+        };
+
         DoctorReport {
-            checks: vec![journal, runtime_root],
+            checks: vec![journal, runtime_root, recovery],
         }
     }
 }
@@ -114,6 +147,10 @@ mod tests {
 
         fn quick_check(&self) -> Result<(), PortError> {
             Ok(())
+        }
+
+        fn recovery_blockers(&self) -> Result<Vec<RecoveryBlocker>, PortError> {
+            Ok(Vec::new())
         }
     }
 
@@ -142,6 +179,7 @@ mod tests {
         assert_eq!(status.schema_version, 7);
         assert_eq!(status.instance_id, "test-instance");
         assert!(!status.mutation_admission_enabled);
+        assert!(status.recovery_blockers.is_empty());
     }
 
     #[test]
@@ -149,7 +187,7 @@ mod tests {
         let service = SystemService::new(Arc::new(FakeJournal), Arc::new(FakeRuntime));
         let report = service.doctor();
 
-        assert_eq!(report.checks.len(), 2);
+        assert_eq!(report.checks.len(), 3);
         assert!(report.checks.iter().all(|check| check.ok));
     }
 }
