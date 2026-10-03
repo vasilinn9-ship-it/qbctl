@@ -16,9 +16,8 @@ use qb_proto::v1::{
     DaemonState, DoctorCheck, DoctorResponse, IncomingStatusEntry, ManagedRootView,
     OperationFileView, OperationSummary, OperationView, QbitProbeResponse, QueueSettingsResponse,
     RecoveryBlockerView, StatusResponse, StorageListResponse, StorageRootView,
-    StorageStatusResponse,
-    TorrentListResponse, TorrentStateView, TorrentSummary, TrackerEvidenceView, TrackerStatusView,
-    TransferLimitsResponse,
+    StorageStatusResponse, TorrentListResponse, TorrentStateView, TorrentSummary,
+    TrackerEvidenceView, TrackerStatusView, TransferLimitsResponse,
 };
 
 pub fn daemon_state(phase: DaemonPhase) -> DaemonState {
