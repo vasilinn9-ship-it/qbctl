@@ -2179,10 +2179,21 @@ mod tests {
 
     struct FakeStorage {
         files: Mutex<Vec<(ManagedRoot, String, FileEvidence)>>,
+        cross_volume_payload: bool,
+        delete_failures: Mutex<usize>,
+        delete_calls: AtomicUsize,
     }
 
     impl FakeStorage {
         fn populated() -> Arc<Self> {
+            Self::with_cross_volume(false, 0)
+        }
+
+        fn cross_volume(delete_failures: usize) -> Arc<Self> {
+            Self::with_cross_volume(true, delete_failures)
+        }
+
+        fn with_cross_volume(cross_volume_payload: bool, delete_failures: usize) -> Arc<Self> {
             Arc::new(Self {
                 files: Mutex::new(vec![
                     (
@@ -2193,6 +2204,9 @@ mod tests {
                     (ManagedRoot::Working, "dir/a.bin".into(), evidence(2, 2, 10)),
                     (ManagedRoot::Working, "dir/b.bin".into(), evidence(2, 3, 20)),
                 ]),
+                cross_volume_payload,
+                delete_failures: Mutex::new(delete_failures),
+                delete_calls: AtomicUsize::new(0),
             })
         }
     }
@@ -2201,7 +2215,9 @@ mod tests {
         fn volume_status(&self, root: ManagedRoot) -> Result<StorageVolumeStatus, PortError> {
             let (volume_id, free_bytes) = match root {
                 ManagedRoot::Incoming | ManagedRoot::Archive => (1, 1_000),
-                ManagedRoot::Working | ManagedRoot::Completed => (2, 1_000),
+                ManagedRoot::Working => (2, 1_000),
+                ManagedRoot::Completed if self.cross_volume_payload => (3, 1_000),
+                ManagedRoot::Completed => (2, 1_000),
                 ManagedRoot::Runtime => return Err(unused()),
             };
             Ok(StorageVolumeStatus {
@@ -2274,6 +2290,98 @@ mod tests {
             Ok(SameVolumeMoveOutcome::Moved {
                 destination: source_evidence,
             })
+        }
+
+        fn copy_to_temp_verified(
+            &self,
+            source_root: ManagedRoot,
+            source_relative: &str,
+            destination_root: ManagedRoot,
+            temp_relative: &str,
+            expected_source: &FileEvidence,
+        ) -> Result<VerifiedCopyOutcome, PortError> {
+            if !self.cross_volume_payload {
+                return Err(unused());
+            }
+            let mut files = self.files.lock().expect("files mutex");
+            let Some((_, _, source)) = files
+                .iter()
+                .find(|(root, path, _)| *root == source_root && path == source_relative)
+                .cloned()
+            else {
+                return Ok(VerifiedCopyOutcome::SourceMissing);
+            };
+            if &source != expected_source {
+                return Ok(VerifiedCopyOutcome::SourceChanged { observed: source });
+            }
+
+            let sha256: [u8; 32] = Sha256::digest(source_relative.as_bytes()).into();
+            if let Some((_, _, existing)) = files
+                .iter()
+                .find(|(root, path, _)| *root == destination_root && path == temp_relative)
+                .cloned()
+            {
+                if existing.size == source.size {
+                    return Ok(VerifiedCopyOutcome::Verified {
+                        temp: existing,
+                        sha256,
+                        created: false,
+                    });
+                }
+                return Ok(VerifiedCopyOutcome::TempConflict {
+                    observed: existing,
+                    sha256,
+                });
+            }
+
+            let temp = FileEvidence {
+                identity: FileIdentity {
+                    volume_id: 3,
+                    file_id: source.identity.file_id + 100,
+                },
+                size: source.size,
+                modified_marker: source.modified_marker + 1,
+            };
+            files.push((destination_root, temp_relative.to_owned(), temp.clone()));
+            Ok(VerifiedCopyOutcome::Verified {
+                temp,
+                sha256,
+                created: true,
+            })
+        }
+
+        fn delete_managed_exact(
+            &self,
+            root: ManagedRoot,
+            relative_path: &str,
+            expected_evidence: &FileEvidence,
+            _expected_sha256: &[u8; 32],
+        ) -> Result<ManagedDeleteOutcome, PortError> {
+            self.delete_calls.fetch_add(1, Ordering::SeqCst);
+            let mut failures = self.delete_failures.lock().expect("delete failures mutex");
+            if *failures > 0 {
+                *failures -= 1;
+                return Err(PortError::new(
+                    "STORAGE_DELETE_UNCERTAIN",
+                    "simulated exact-delete uncertainty",
+                ));
+            }
+            drop(failures);
+
+            let mut files = self.files.lock().expect("files mutex");
+            let Some(index) = files
+                .iter()
+                .position(|(candidate_root, path, _)| {
+                    *candidate_root == root && path == relative_path
+                })
+            else {
+                return Ok(ManagedDeleteOutcome::Missing);
+            };
+            if &files[index].2 != expected_evidence {
+                return Ok(ManagedDeleteOutcome::Changed);
+            }
+            files.remove(index);
+            Ok(ManagedDeleteOutcome::Deleted)
         }
 
         fn list_incoming(&self) -> Result<Vec<String>, PortError> {
@@ -3107,6 +3215,94 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn cross_volume_payload_is_verified_receipted_then_source_deleted() {
+        let journal = Arc::new(FakeCompletionJournal::default());
+        let storage = FakeStorage::cross_volume(0);
+        let client = FakeClient::complete();
+        client.with_stop_effects(vec![FakeStopEffect::AcceptedAndStop]);
+
+        let completed = execution(
+            completion_service(journal, storage.clone(), client)
+                .execute(&request())
+                .await
+                .expect("cross-volume completion"),
+        );
+
+        assert_eq!(
+            completed.status,
+            CompletionExecutionStatus::RemoveRecordPending
+        );
+        assert_eq!(completed.record.state, CompletionState::RemoveRecordPending);
+        assert!(completed.record.files.iter().all(|file| {
+            file.state == CompletionFileState::HandedOff
+                && file.destination_evidence.is_some()
+                && file.destination_sha256.is_some()
+        }));
+        assert_eq!(storage.delete_calls.load(Ordering::SeqCst), 2);
+
+        let files = storage.files.lock().expect("files mutex");
+        assert!(!files
+            .iter()
+            .any(|(root, _, _)| *root == ManagedRoot::Working));
+        assert_eq!(
+            files
+                .iter()
+                .filter(|(root, path, _)| {
+                    *root == ManagedRoot::Completed && !path.starts_with("_qbctl_tmp/")
+                })
+                .count(),
+            2
+        );
+        assert!(!files.iter().any(|(_, path, _)| path.starts_with("_qbctl_tmp/")));
+    }
+
+    #[tokio::test]
+    async fn cross_volume_source_delete_uncertainty_requires_explicit_replay() {
+        let journal = Arc::new(FakeCompletionJournal::default());
+        let storage = FakeStorage::cross_volume(1);
+        let client = FakeClient::complete();
+        client.with_stop_effects(vec![FakeStopEffect::AcceptedAndStop]);
+
+        let first = execution(
+            completion_service(journal.clone(), storage.clone(), client.clone())
+                .execute(&request())
+                .await
+                .expect("first cross-volume completion"),
+        );
+        assert_eq!(
+            first.status,
+            CompletionExecutionStatus::UnknownSourceDelete
+        );
+        assert_eq!(
+            first.record.files[0].state,
+            CompletionFileState::UnknownSourceDelete
+        );
+        assert_eq!(storage.delete_calls.load(Ordering::SeqCst), 1);
+
+        let recovered = completion_service(journal.clone(), storage.clone(), client.clone())
+            .recover_all()
+            .await
+            .expect("restart recovery");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].status,
+            CompletionExecutionStatus::UnknownSourceDelete
+        );
+        assert_eq!(storage.delete_calls.load(Ordering::SeqCst), 1);
+
+        let replay = execution(
+            completion_service(journal, storage.clone(), client)
+                .execute(&request())
+                .await
+                .expect("explicit replay"),
+        );
+        assert!(replay.replayed);
+        assert_eq!(replay.status, CompletionExecutionStatus::RemoveRecordPending);
+        assert_eq!(replay.record.state, CompletionState::RemoveRecordPending);
+        assert_eq!(storage.delete_calls.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
