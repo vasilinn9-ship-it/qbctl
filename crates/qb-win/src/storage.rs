@@ -713,7 +713,7 @@ fn delete_managed_exact(
         return Ok(ManagedDeleteOutcome::Changed);
     }
 
-    let disposition = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
     let success = unsafe {
         SetFileInformationByHandle(
             file.as_raw_handle() as _,
