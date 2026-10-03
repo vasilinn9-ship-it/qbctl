@@ -7166,6 +7166,44 @@ mod tests {
     }
 
     #[test]
+    fn recovery_blockers_report_durable_unknown_completion_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.sqlite");
+        let admission = {
+            let journal = Journal::open(&path).expect("journal");
+            finished_admission(&journal, "recovery-blocker-admission")
+        };
+        let preflight = completion_preflight(&admission, "recovery-blocker-request");
+
+        let journal = Journal::open(&path).expect("reopen");
+        let record = match CompletionJournal::reserve_completion(&journal, &preflight)
+            .expect("reserve completion")
+        {
+            CompletionReservation::New(record) => record,
+            other => panic!("unexpected completion reservation: {other:?}"),
+        };
+        CompletionJournal::mark_stop_pending(&journal, &record.operation_id)
+            .expect("stop pending");
+        CompletionJournal::mark_unknown_stop(
+            &journal,
+            &record.operation_id,
+            "QBIT_STOP_UNCERTAIN",
+        )
+        .expect("unknown stop");
+
+        let blockers = JournalHealthPort::recovery_blockers(&journal)
+            .expect("recovery blockers");
+        assert_eq!(blockers.len(), 1);
+        assert_eq!(blockers[0].kind, "completion");
+        assert_eq!(blockers[0].state, "unknown_stop");
+        assert_eq!(
+            blockers[0].problem_code.as_deref(),
+            Some("QBIT_STOP_UNCERTAIN")
+        );
+        assert_eq!(blockers[0].count, 1);
+    }
+
+    #[test]
     fn release_is_durable_and_transfers_capacity_without_losing_it() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("state.sqlite");
