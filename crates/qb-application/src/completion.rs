@@ -47,6 +47,8 @@ pub enum CompletionState {
     Stopped,
     ArchivePending,
     UnknownArchive,
+    ArchiveSourceDeletePending,
+    UnknownArchiveSourceDelete,
     PayloadPending,
     RemoveRecordPending,
     UnknownRemoveRecord,
@@ -175,6 +177,22 @@ pub trait CompletionJournal: Send + Sync {
         operation_id: &OperationId,
         destination: &FileEvidence,
         destination_sha256: [u8; 32],
+    ) -> Result<CompletionRecord, PortError>;
+
+    fn mark_archive_source_delete_pending(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<CompletionRecord, PortError>;
+
+    fn mark_unknown_archive_source_delete(
+        &self,
+        operation_id: &OperationId,
+        problem_code: &str,
+    ) -> Result<CompletionRecord, PortError>;
+
+    fn retry_archive_source_delete(
+        &self,
+        operation_id: &OperationId,
     ) -> Result<CompletionRecord, PortError>;
 
     fn mark_archive_receipted(
@@ -312,6 +330,7 @@ pub enum CompletionExecutionStatus {
     Blocked,
     UnknownStop,
     UnknownArchive,
+    UnknownArchiveSourceDelete,
     UnknownMove,
     UnknownSourceDelete,
     UnknownRemoveRecord,
@@ -967,7 +986,9 @@ impl CompletionService {
             let progress = match record.state {
                 CompletionState::Stopped
                 | CompletionState::ArchivePending
-                | CompletionState::UnknownArchive => {
+                | CompletionState::UnknownArchive
+                | CompletionState::ArchiveSourceDeletePending
+                | CompletionState::UnknownArchiveSourceDelete => {
                     self.advance_archive(record, explicit_request).await?
                 }
                 CompletionState::PayloadPending => {
@@ -1211,13 +1232,18 @@ impl CompletionService {
 
         if !matches!(
             record.state,
-            CompletionState::ArchivePending | CompletionState::UnknownArchive
+            CompletionState::ArchivePending
+                | CompletionState::UnknownArchive
+                | CompletionState::ArchiveSourceDeletePending
+                | CompletionState::UnknownArchiveSourceDelete
         ) {
             return Err(PortError::new(
                 "OPERATION_TRANSITION_INVALID",
-                "cross-volume Archive requires ArchivePending or UnknownArchive",
+                "cross-volume Archive requires an Archive handoff/delete state",
             ));
         }
+
+        let mut delete_intent_created_now = false;
 
         if let (Some(destination), Some(sha256)) = (
             record.archive_destination_evidence.clone(),
@@ -1271,7 +1297,143 @@ impl CompletionService {
                 }
             }
 
-            if record.state == CompletionState::UnknownArchive && !explicit_request {
+            if matches!(
+                record.state,
+                CompletionState::ArchivePending | CompletionState::UnknownArchive
+            ) {
+                if record.state == CompletionState::UnknownArchive && !explicit_request {
+                    return Ok(HandoffProgress::Halt {
+                        status: CompletionExecutionStatus::UnknownArchive,
+                        record,
+                        problem: Some(PortError::new(
+                            "ARCHIVE_HANDOFF_UNCERTAIN",
+                            "Archive publish remains uncertain; explicit replay is required before progressing to source deletion",
+                        )),
+                    });
+                }
+                if record.state == CompletionState::UnknownArchive {
+                    record = self.journal.retry_archive(&record.operation_id)?;
+                    record = self.journal.mark_archive_pending(&record.operation_id)?;
+                }
+                record = self
+                    .journal
+                    .mark_archive_source_delete_pending(&record.operation_id)?;
+                delete_intent_created_now = true;
+            }
+
+            match self
+                .storage
+                .observe_file(ManagedRoot::Incoming, &record.source_relative)?
+            {
+                None => {
+                    let receipted = self.journal.mark_archive_receipted(
+                        &record.operation_id,
+                        &destination,
+                        sha256,
+                    )?;
+                    return Ok(HandoffProgress::Continue(receipted));
+                }
+                Some(source) if source == record.source_evidence => {}
+                Some(_) => {
+                    return self.block_handoff(
+                        record,
+                        PortError::new(
+                            "HANDOFF_SOURCE_CHANGED",
+                            "Incoming metainfo changed after Archive source-delete intent",
+                        ),
+                    );
+                }
+            }
+
+            if record.state == CompletionState::UnknownArchiveSourceDelete && !explicit_request {
+                return Ok(HandoffProgress::Halt {
+                    status: CompletionExecutionStatus::UnknownArchiveSourceDelete,
+                    record,
+                    problem: Some(PortError::new(
+                        "ARCHIVE_DELETE_UNCERTAIN",
+                        "Archive source delete remains uncertain; explicit replay is required before another delete",
+                    )),
+                });
+            }
+            if record.state == CompletionState::ArchiveSourceDeletePending
+                && !delete_intent_created_now
+                && !explicit_request
+            {
+                record = self.journal.mark_unknown_archive_source_delete(
+                    &record.operation_id,
+                    "ARCHIVE_DELETE_UNCERTAIN",
+                )?;
+                return Ok(HandoffProgress::Halt {
+                    status: CompletionExecutionStatus::UnknownArchiveSourceDelete,
+                    record,
+                    problem: Some(PortError::new(
+                        "ARCHIVE_DELETE_UNCERTAIN",
+                        "restart observed Incoming metainfo still present after durable Archive source-delete intent",
+                    )),
+                });
+            }
+            if record.state == CompletionState::UnknownArchiveSourceDelete {
+                record = self
+                    .journal
+                    .retry_archive_source_delete(&record.operation_id)?;
+            }
+
+            match self.storage.delete_managed_exact(
+                ManagedRoot::Incoming,
+                &record.source_relative,
+                &record.source_evidence,
+                &sha256,
+            ) {
+                Ok(ManagedDeleteOutcome::Deleted | ManagedDeleteOutcome::Missing) => {
+                    if self
+                        .storage
+                        .observe_file(ManagedRoot::Incoming, &record.source_relative)?
+                        .is_none()
+                    {
+                        let receipted = self.journal.mark_archive_receipted(
+                            &record.operation_id,
+                            &destination,
+                            sha256,
+                        )?;
+                        return Ok(HandoffProgress::Continue(receipted));
+                    }
+                    let unknown = self.journal.mark_unknown_archive_source_delete(
+                        &record.operation_id,
+                        "ARCHIVE_DELETE_UNCERTAIN",
+                    )?;
+                    return Ok(HandoffProgress::Halt {
+                        status: CompletionExecutionStatus::UnknownArchiveSourceDelete,
+                        record: unknown,
+                        problem: Some(PortError::new(
+                            "ARCHIVE_DELETE_UNCERTAIN",
+                            "Archive source delete did not produce an absent source observation",
+                        )),
+                    });
+                }
+                Ok(ManagedDeleteOutcome::Changed) => {
+                    return self.block_handoff(
+                        record,
+                        PortError::new(
+                            "HANDOFF_SOURCE_CHANGED",
+                            "Incoming metainfo changed at exact-delete boundary",
+                        ),
+                    );
+                }
+                Err(problem) => {
+                    let unknown = self.journal.mark_unknown_archive_source_delete(
+                        &record.operation_id,
+                        problem.code,
+                    )?;
+                    return Ok(HandoffProgress::Halt {
+                        status: CompletionExecutionStatus::UnknownArchiveSourceDelete,
+                        record: unknown,
+                        problem: Some(problem),
+                    });
+                }
+            }
+        }
+
+        if record.state == CompletionState::UnknownArchive && !explicit_request {
                 return Ok(HandoffProgress::Halt {
                     status: CompletionExecutionStatus::UnknownArchive,
                     record,
@@ -3517,7 +3679,10 @@ mod tests {
             if &record.operation_id != operation_id
                 || !matches!(
                     record.state,
-                    CompletionState::ArchivePending | CompletionState::UnknownArchive
+                    CompletionState::ArchivePending
+                        | CompletionState::UnknownArchive
+                        | CompletionState::ArchiveSourceDeletePending
+                        | CompletionState::UnknownArchiveSourceDelete
                 )
             {
                 return Err(PortError::new(
@@ -3530,6 +3695,43 @@ mod tests {
             record.problem_code = None;
             record.revision += 1;
             Ok(record.clone())
+        }
+
+        fn mark_archive_source_delete_pending(
+            &self,
+            operation_id: &OperationId,
+        ) -> Result<CompletionRecord, PortError> {
+            self.transition(
+                operation_id,
+                &[CompletionState::ArchivePending],
+                CompletionState::ArchiveSourceDeletePending,
+                None,
+            )
+        }
+
+        fn mark_unknown_archive_source_delete(
+            &self,
+            operation_id: &OperationId,
+            problem_code: &str,
+        ) -> Result<CompletionRecord, PortError> {
+            self.transition(
+                operation_id,
+                &[CompletionState::ArchiveSourceDeletePending],
+                CompletionState::UnknownArchiveSourceDelete,
+                Some(problem_code),
+            )
+        }
+
+        fn retry_archive_source_delete(
+            &self,
+            operation_id: &OperationId,
+        ) -> Result<CompletionRecord, PortError> {
+            self.transition(
+                operation_id,
+                &[CompletionState::UnknownArchiveSourceDelete],
+                CompletionState::ArchiveSourceDeletePending,
+                None,
+            )
         }
 
         fn mark_archive_receipted(
