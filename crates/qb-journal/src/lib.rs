@@ -1960,6 +1960,128 @@ impl CompletionJournal for Journal {
             Some(problem_code),
         )
     }
+
+    fn mark_archive_pending(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<CompletionRecord, PortError> {
+        transition_completion(
+            self,
+            operation_id,
+            &[CompletionState::Stopped],
+            CompletionState::ArchivePending,
+            None,
+        )
+    }
+
+    fn mark_unknown_archive(
+        &self,
+        operation_id: &OperationId,
+        problem_code: &str,
+    ) -> Result<CompletionRecord, PortError> {
+        transition_completion(
+            self,
+            operation_id,
+            &[CompletionState::ArchivePending],
+            CompletionState::UnknownArchive,
+            Some(problem_code),
+        )
+    }
+
+    fn retry_archive(&self, operation_id: &OperationId) -> Result<CompletionRecord, PortError> {
+        transition_completion(
+            self,
+            operation_id,
+            &[CompletionState::ArchivePending, CompletionState::UnknownArchive],
+            CompletionState::Stopped,
+            None,
+        )
+    }
+
+    fn mark_archive_receipted(
+        &self,
+        operation_id: &OperationId,
+        destination: &qb_application::storage::FileEvidence,
+        destination_sha256: [u8; 32],
+    ) -> Result<CompletionRecord, PortError> {
+        receipt_completion_archive(self, operation_id, destination, destination_sha256)
+    }
+
+    fn mark_file_move_pending(
+        &self,
+        operation_id: &OperationId,
+        file_index: u32,
+    ) -> Result<CompletionRecord, PortError> {
+        transition_completion_file(
+            self,
+            operation_id,
+            file_index,
+            &[CompletionFileState::Prepared, CompletionFileState::UnknownMove],
+            CompletionFileState::MovePending,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn mark_file_unknown_move(
+        &self,
+        operation_id: &OperationId,
+        file_index: u32,
+        problem_code: &str,
+    ) -> Result<CompletionRecord, PortError> {
+        transition_completion_file(
+            self,
+            operation_id,
+            file_index,
+            &[CompletionFileState::MovePending],
+            CompletionFileState::UnknownMove,
+            None,
+            None,
+            Some(problem_code),
+        )
+    }
+
+    fn mark_file_handed_off(
+        &self,
+        operation_id: &OperationId,
+        file_index: u32,
+        destination: &qb_application::storage::FileEvidence,
+        destination_sha256: Option<[u8; 32]>,
+    ) -> Result<CompletionRecord, PortError> {
+        transition_completion_file(
+            self,
+            operation_id,
+            file_index,
+            &[CompletionFileState::MovePending, CompletionFileState::UnknownMove],
+            CompletionFileState::HandedOff,
+            Some(destination),
+            destination_sha256,
+            None,
+        )
+    }
+
+    fn mark_file_blocked(
+        &self,
+        operation_id: &OperationId,
+        file_index: u32,
+        problem_code: &str,
+    ) -> Result<CompletionRecord, PortError> {
+        transition_completion_file(
+            self,
+            operation_id,
+            file_index,
+            &[
+                CompletionFileState::Prepared,
+                CompletionFileState::MovePending,
+                CompletionFileState::UnknownMove,
+            ],
+            CompletionFileState::Blocked,
+            None,
+            None,
+            Some(problem_code),
+        )
+    }
 }
 
 impl ReleaseJournal for Journal {
@@ -3978,6 +4100,241 @@ fn transition_completion(
         .map_err(JournalError::from)
         .map_err(map_port_error)?;
     Ok(record)
+}
+
+fn receipt_completion_archive(
+    journal: &Journal,
+    operation_id: &OperationId,
+    destination: &qb_application::storage::FileEvidence,
+    destination_sha256: [u8; 32],
+) -> Result<CompletionRecord, PortError> {
+    let mut connection = journal.connection.lock().expect("journal mutex poisoned");
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    let current = load_completion_record(&transaction, operation_id.as_str())
+        .map_err(map_port_error)?
+        .ok_or_else(|| PortError::new("COMPLETION_NOT_FOUND", operation_id.to_string()))?;
+    if !matches!(
+        current.state,
+        CompletionState::ArchivePending | CompletionState::UnknownArchive
+    ) {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            "archive receipt requires ArchivePending or UnknownArchive",
+        ));
+    }
+    if destination.identity.volume_id != current.archive_volume_id
+        || destination.size != current.source_evidence.size
+    {
+        return Err(PortError::new(
+            "ARCHIVE_RECEIPT_INVALID",
+            "archive destination evidence does not match the completion source",
+        ));
+    }
+
+    let revision = current
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| PortError::new("JOURNAL_STATE_INVALID", "completion revision overflow"))?;
+    let changed = transaction
+        .execute(
+            "UPDATE completion_operations
+             SET archive_destination_volume_id = ?1,
+                 archive_destination_file_id = ?2,
+                 archive_destination_size = ?3,
+                 archive_destination_modified_marker = ?4,
+                 archive_destination_sha256 = ?5,
+                 state = 'payload_pending',
+                 problem_code = NULL,
+                 revision = ?6,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE operation_id = ?7
+               AND revision = ?8
+               AND state IN ('archive_pending','unknown_archive')",
+            params![
+                destination.identity.volume_id.to_be_bytes().as_slice(),
+                destination.identity.file_id.to_be_bytes().as_slice(),
+                destination.size.to_be_bytes().as_slice(),
+                destination.modified_marker.to_be_bytes().as_slice(),
+                destination_sha256.as_slice(),
+                revision,
+                operation_id.as_str(),
+                current.revision,
+            ],
+        )
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    if changed != 1 {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            "completion archive receipt changed concurrently",
+        ));
+    }
+    insert_completion_event(
+        &transaction,
+        operation_id.as_str(),
+        revision,
+        "payload_pending",
+        None,
+    )
+    .map_err(map_port_error)?;
+    let record = load_completion_record(&transaction, operation_id.as_str())
+        .map_err(map_port_error)?
+        .ok_or_else(|| {
+            PortError::new(
+                "JOURNAL_STATE_INVALID",
+                "completion disappeared after archive receipt",
+            )
+        })?;
+    transaction
+        .commit()
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    Ok(record)
+}
+
+fn transition_completion_file(
+    journal: &Journal,
+    operation_id: &OperationId,
+    file_index: u32,
+    expected: &[CompletionFileState],
+    next: CompletionFileState,
+    destination: Option<&qb_application::storage::FileEvidence>,
+    destination_sha256: Option<[u8; 32]>,
+    problem_code: Option<&str>,
+) -> Result<CompletionRecord, PortError> {
+    let mut connection = journal.connection.lock().expect("journal mutex poisoned");
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    let current = load_completion_record(&transaction, operation_id.as_str())
+        .map_err(map_port_error)?
+        .ok_or_else(|| PortError::new("COMPLETION_NOT_FOUND", operation_id.to_string()))?;
+    if current.state != CompletionState::PayloadPending {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            "file handoff requires completion PayloadPending state",
+        ));
+    }
+    let file = current
+        .files
+        .iter()
+        .find(|file| file.index == file_index)
+        .ok_or_else(|| PortError::new("COMPLETION_FILE_NOT_FOUND", file_index.to_string()))?;
+
+    if file.state == next
+        && file.problem_code.as_deref() == problem_code
+        && file.destination_evidence.as_ref() == destination
+        && file.destination_sha256 == destination_sha256
+    {
+        transaction
+            .commit()
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        return Ok(current);
+    }
+    if !expected.contains(&file.state) {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            format!(
+                "completion file {} cannot move from {} to {}",
+                file.relative_path,
+                completion_file_state_name(file.state),
+                completion_file_state_name(next)
+            ),
+        ));
+    }
+
+    let revision = file
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| PortError::new("JOURNAL_STATE_INVALID", "completion file revision overflow"))?;
+    let (
+        destination_volume_id,
+        destination_file_id,
+        destination_size,
+        destination_modified_marker,
+    ) = match destination {
+        Some(destination) => (
+            Some(destination.identity.volume_id.to_be_bytes().to_vec()),
+            Some(destination.identity.file_id.to_be_bytes().to_vec()),
+            Some(destination.size.to_be_bytes().to_vec()),
+            Some(destination.modified_marker.to_be_bytes().to_vec()),
+        ),
+        None => (None, None, None, None),
+    };
+    let destination_sha256 = destination_sha256.map(|value| value.to_vec());
+
+    let changed = transaction
+        .execute(
+            "UPDATE operation_files
+             SET state = ?1,
+                 destination_volume_id = ?2,
+                 destination_file_id = ?3,
+                 destination_size = ?4,
+                 destination_modified_marker = ?5,
+                 destination_sha256 = ?6,
+                 problem_code = ?7,
+                 revision = ?8,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE operation_id = ?9
+               AND file_index = ?10
+               AND revision = ?11
+               AND state = ?12",
+            params![
+                completion_file_state_name(next),
+                destination_volume_id,
+                destination_file_id,
+                destination_size,
+                destination_modified_marker,
+                destination_sha256,
+                problem_code,
+                revision,
+                operation_id.as_str(),
+                i64::from(file_index),
+                file.revision,
+                completion_file_state_name(file.state),
+            ],
+        )
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    if changed != 1 {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            "completion file changed concurrently",
+        ));
+    }
+
+    let record = load_completion_record(&transaction, operation_id.as_str())
+        .map_err(map_port_error)?
+        .ok_or_else(|| {
+            PortError::new(
+                "JOURNAL_STATE_INVALID",
+                "completion disappeared after file transition",
+            )
+        })?;
+    transaction
+        .commit()
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    Ok(record)
+}
+
+fn completion_file_state_name(state: CompletionFileState) -> &'static str {
+    match state {
+        CompletionFileState::Prepared => "prepared",
+        CompletionFileState::MovePending => "move_pending",
+        CompletionFileState::UnknownMove => "unknown_move",
+        CompletionFileState::DestinationReceipted => "destination_receipted",
+        CompletionFileState::SourceDeletePending => "source_delete_pending",
+        CompletionFileState::UnknownSourceDelete => "unknown_source_delete",
+        CompletionFileState::HandedOff => "handed_off",
+        CompletionFileState::Blocked => "blocked",
+        CompletionFileState::Failed => "failed",
+    }
 }
 
 struct StoredCleanupRow {
