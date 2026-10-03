@@ -1268,11 +1268,7 @@ mod tests {
         )
     }
 
-    fn admission_fixture() -> (
-        AdmissionReservationRequest,
-        IncomingFileSnapshot,
-        TorrentId,
-    ) {
+    fn admission_fixture() -> (AdmissionReservationRequest, IncomingFileSnapshot, TorrentId) {
         let bytes = b"d4:infod4:name4:testee".to_vec();
         let source_evidence = FileEvidence {
             identity: FileIdentity {
@@ -1340,7 +1336,6 @@ mod tests {
             .with_observation_policy(3, Duration::ZERO)
     }
 
-
     #[tokio::test]
     async fn admission_source_change_blocks_before_qbit_effect() {
         let (request, mut snapshot, _) = admission_fixture();
@@ -1352,10 +1347,7 @@ mod tests {
             free_bytes: 10_000,
             root: request.working_save_path.clone(),
         });
-        let client = Arc::new(FakeTorrentClient::new(
-            Vec::new(),
-            FakeAddEffect::Accepted,
-        ));
+        let client = Arc::new(FakeTorrentClient::new(Vec::new(), FakeAddEffect::Accepted));
         let service = admission_service(journal, storage, client.clone(), 10);
 
         let execution =
@@ -1380,10 +1372,7 @@ mod tests {
             free_bytes: request.reserved_bytes + 9,
             root: request.working_save_path.clone(),
         });
-        let client = Arc::new(FakeTorrentClient::new(
-            Vec::new(),
-            FakeAddEffect::Accepted,
-        ));
+        let client = Arc::new(FakeTorrentClient::new(Vec::new(), FakeAddEffect::Accepted));
         let service = admission_service(journal, storage, client.clone(), 10);
 
         let execution =
