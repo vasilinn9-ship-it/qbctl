@@ -3453,6 +3453,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completion_removes_qbit_record_after_receipts_and_finishes() {
+        let journal = Arc::new(FakeCompletionJournal::default());
+        let storage = FakeStorage::populated();
+        let client = FakeClient::complete();
+        client.with_stop_effects(vec![FakeStopEffect::AcceptedAndStop]);
+        client.with_remove_effects(vec![FakeRemoveEffect::AcceptedAndRemove]);
+
+        let completed = execution(
+            completion_service(journal, storage.clone(), client.clone())
+                .execute(&request())
+                .await
+                .expect("execute completion"),
+        );
+
+        assert_eq!(completed.status, CompletionExecutionStatus::Finished);
+        assert_eq!(completed.record.state, CompletionState::Finished);
+        assert_eq!(client.remove_calls.load(Ordering::SeqCst), 1);
+        assert!(client.removed.load(Ordering::SeqCst));
+
+        let files = storage.files.lock().expect("files mutex");
+        assert!(files
+            .iter()
+            .any(|(root, path, _)| *root == ManagedRoot::Archive && path == "sample.torrent"));
+        assert_eq!(
+            files
+                .iter()
+                .filter(|(root, _, _)| *root == ManagedRoot::Completed)
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_uncertainty_restart_does_not_duplicate_remove_request() {
+        let journal = Arc::new(FakeCompletionJournal::default());
+        let storage = FakeStorage::populated();
+        let client = FakeClient::complete();
+        client.with_stop_effects(vec![FakeStopEffect::AcceptedAndStop]);
+        client.with_remove_effects(vec![
+            FakeRemoveEffect::Uncertain,
+            FakeRemoveEffect::AcceptedAndRemove,
+        ]);
+
+        let first = execution(
+            completion_service(journal.clone(), storage.clone(), client.clone())
+                .execute(&request())
+                .await
+                .expect("first completion"),
+        );
+        assert_eq!(
+            first.status,
+            CompletionExecutionStatus::UnknownRemoveRecord
+        );
+        assert_eq!(first.record.state, CompletionState::UnknownRemoveRecord);
+        assert_eq!(client.remove_calls.load(Ordering::SeqCst), 1);
+
+        let recovered = completion_service(journal.clone(), storage.clone(), client.clone())
+            .recover_all()
+            .await
+            .expect("restart recovery");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].status,
+            CompletionExecutionStatus::UnknownRemoveRecord
+        );
+        assert_eq!(recovered[0].record.state, CompletionState::UnknownRemoveRecord);
+        assert_eq!(client.remove_calls.load(Ordering::SeqCst), 1);
+
+        let replay = execution(
+            completion_service(journal, storage, client.clone())
+                .execute(&request())
+                .await
+                .expect("explicit replay"),
+        );
+        assert!(replay.replayed);
+        assert_eq!(replay.status, CompletionExecutionStatus::Finished);
+        assert_eq!(replay.record.state, CompletionState::Finished);
+        assert_eq!(client.remove_calls.load(Ordering::SeqCst), 2);
+        assert!(client.removed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
     async fn cross_volume_payload_is_verified_receipted_then_source_deleted() {
         let journal = Arc::new(FakeCompletionJournal::default());
         let storage = FakeStorage::cross_volume(0);
