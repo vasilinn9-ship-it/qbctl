@@ -3377,6 +3377,320 @@ fn load_registry_record(
     }))
 }
 
+struct StoredCompletionRow {
+    request_id: String,
+    operation_id: String,
+    registry_id: String,
+    torrent_id: String,
+    identity_v1: Option<Vec<u8>>,
+    identity_v2: Option<Vec<u8>>,
+    source_relative: String,
+    source_volume_id: Vec<u8>,
+    source_file_id: Vec<u8>,
+    source_size: Vec<u8>,
+    source_modified_marker: Vec<u8>,
+    source_metainfo_digest: Vec<u8>,
+    working_volume_id: Vec<u8>,
+    completed_volume_id: Vec<u8>,
+    archive_volume_id: Vec<u8>,
+    working_save_path: String,
+    total_bytes: Vec<u8>,
+    state: String,
+    problem_code: Option<String>,
+    revision: u64,
+}
+
+fn load_completion_record(
+    connection: &Connection,
+    operation_id: &str,
+) -> Result<Option<CompletionRecord>, JournalError> {
+    let row: Option<StoredCompletionRow> = connection
+        .query_row(
+            "SELECT request_id,
+                    operation_id,
+                    registry_id,
+                    torrent_id,
+                    identity_v1,
+                    identity_v2,
+                    source_relative,
+                    source_volume_id,
+                    source_file_id,
+                    source_size,
+                    source_modified_marker,
+                    source_metainfo_digest,
+                    working_volume_id,
+                    completed_volume_id,
+                    archive_volume_id,
+                    working_save_path,
+                    total_bytes,
+                    state,
+                    problem_code,
+                    revision
+             FROM completion_operations
+             WHERE operation_id = ?1",
+            [operation_id],
+            |row| {
+                Ok(StoredCompletionRow {
+                    request_id: row.get(0)?,
+                    operation_id: row.get(1)?,
+                    registry_id: row.get(2)?,
+                    torrent_id: row.get(3)?,
+                    identity_v1: row.get(4)?,
+                    identity_v2: row.get(5)?,
+                    source_relative: row.get(6)?,
+                    source_volume_id: row.get(7)?,
+                    source_file_id: row.get(8)?,
+                    source_size: row.get(9)?,
+                    source_modified_marker: row.get(10)?,
+                    source_metainfo_digest: row.get(11)?,
+                    working_volume_id: row.get(12)?,
+                    completed_volume_id: row.get(13)?,
+                    archive_volume_id: row.get(14)?,
+                    working_save_path: row.get(15)?,
+                    total_bytes: row.get(16)?,
+                    state: row.get(17)?,
+                    problem_code: row.get(18)?,
+                    revision: row.get(19)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let request_id = RequestId::new(row.request_id)
+        .map_err(|error| JournalError::InvalidState(error.to_string()))?;
+    let operation_id = OperationId::new(row.operation_id)
+        .map_err(|error| JournalError::InvalidState(error.to_string()))?;
+    let torrent_id = TorrentId::new(row.torrent_id)
+        .map_err(|error| JournalError::InvalidState(error.to_string()))?;
+    let identity_v1 = row
+        .identity_v1
+        .map(|value| {
+            value.try_into().map_err(|value: Vec<u8>| {
+                JournalError::InvalidState(format!(
+                    "completion v1 identity has {} bytes instead of 20",
+                    value.len()
+                ))
+            })
+        })
+        .transpose()?;
+    let identity_v2 = row
+        .identity_v2
+        .map(|value| {
+            value.try_into().map_err(|value: Vec<u8>| {
+                JournalError::InvalidState(format!(
+                    "completion v2 identity has {} bytes instead of 32",
+                    value.len()
+                ))
+            })
+        })
+        .transpose()?;
+    let identity = TorrentIdentity::new(identity_v1, identity_v2)
+        .ok_or_else(|| JournalError::InvalidState("completion has no torrent identity".into()))?;
+    let source_metainfo_digest: [u8; 32] =
+        row.source_metainfo_digest
+            .try_into()
+            .map_err(|value: Vec<u8>| {
+                JournalError::InvalidState(format!(
+                    "completion source digest has {} bytes instead of 32",
+                    value.len()
+                ))
+            })?;
+    let state = parse_completion_state(&row.state).ok_or_else(|| {
+        JournalError::InvalidState(format!("unknown completion state '{}'", row.state))
+    })?;
+
+    let mut statement = connection.prepare(
+        "SELECT file_index,
+                relative_path,
+                expected_size,
+                source_volume_id,
+                source_file_id,
+                source_size,
+                source_modified_marker,
+                handoff_strategy,
+                state,
+                revision
+         FROM operation_files
+         WHERE operation_id = ?1
+         ORDER BY file_index",
+    )?;
+    let rows = statement.query_map([operation_id.as_str()], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+            row.get::<_, Vec<u8>>(3)?,
+            row.get::<_, Vec<u8>>(4)?,
+            row.get::<_, Vec<u8>>(5)?,
+            row.get::<_, Vec<u8>>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, String>(8)?,
+            row.get::<_, u64>(9)?,
+        ))
+    })?;
+
+    let mut files = Vec::new();
+    for row in rows {
+        let (
+            file_index,
+            relative_path,
+            expected_size,
+            source_volume_id,
+            source_file_id,
+            source_size,
+            source_modified_marker,
+            strategy,
+            state,
+            revision,
+        ) = row?;
+        let index = u32::try_from(file_index)
+            .map_err(|_| JournalError::InvalidState("completion file index is negative".into()))?;
+        let strategy = parse_completion_strategy(&strategy).ok_or_else(|| {
+            JournalError::InvalidState(format!(
+                "unknown completion handoff strategy '{strategy}'"
+            ))
+        })?;
+        let state = parse_completion_file_state(&state).ok_or_else(|| {
+            JournalError::InvalidState(format!("unknown completion file state '{state}'"))
+        })?;
+        files.push(CompletionFileRecord {
+            index,
+            relative_path,
+            size: decode_u64_blob(&expected_size, "expected_size")?,
+            source_evidence: qb_application::storage::FileEvidence {
+                identity: qb_application::storage::FileIdentity {
+                    volume_id: decode_u64_blob(&source_volume_id, "source_volume_id")?,
+                    file_id: decode_u64_blob(&source_file_id, "source_file_id")?,
+                },
+                size: decode_u64_blob(&source_size, "source_size")?,
+                modified_marker: decode_u128_blob(
+                    &source_modified_marker,
+                    "source_modified_marker",
+                )?,
+            },
+            strategy,
+            state,
+            revision,
+        });
+    }
+
+    Ok(Some(CompletionRecord {
+        request_id,
+        operation_id,
+        registry_id: row.registry_id,
+        torrent_id,
+        identity,
+        source_relative: row.source_relative,
+        source_evidence: qb_application::storage::FileEvidence {
+            identity: qb_application::storage::FileIdentity {
+                volume_id: decode_u64_blob(&row.source_volume_id, "source_volume_id")?,
+                file_id: decode_u64_blob(&row.source_file_id, "source_file_id")?,
+            },
+            size: decode_u64_blob(&row.source_size, "source_size")?,
+            modified_marker: decode_u128_blob(
+                &row.source_modified_marker,
+                "source_modified_marker",
+            )?,
+        },
+        source_metainfo_digest,
+        working_volume_id: decode_u64_blob(&row.working_volume_id, "working_volume_id")?,
+        completed_volume_id: decode_u64_blob(&row.completed_volume_id, "completed_volume_id")?,
+        archive_volume_id: decode_u64_blob(&row.archive_volume_id, "archive_volume_id")?,
+        working_save_path: row.working_save_path,
+        total_bytes: decode_u64_blob(&row.total_bytes, "total_bytes")?,
+        state,
+        problem_code: row.problem_code,
+        revision: row.revision,
+        files,
+    }))
+}
+
+fn completion_strategy_name(strategy: CompletionHandoffStrategy) -> &'static str {
+    match strategy {
+        CompletionHandoffStrategy::SameVolume => "same_volume",
+        CompletionHandoffStrategy::CrossVolume => "cross_volume",
+    }
+}
+
+fn parse_completion_strategy(value: &str) -> Option<CompletionHandoffStrategy> {
+    match value {
+        "same_volume" => Some(CompletionHandoffStrategy::SameVolume),
+        "cross_volume" => Some(CompletionHandoffStrategy::CrossVolume),
+        _ => None,
+    }
+}
+
+fn completion_state_name(state: CompletionState) -> &'static str {
+    match state {
+        CompletionState::Prepared => "prepared",
+        CompletionState::StopPending => "stop_pending",
+        CompletionState::UnknownStop => "unknown_stop",
+        CompletionState::Stopped => "stopped",
+        CompletionState::ArchivePending => "archive_pending",
+        CompletionState::UnknownArchive => "unknown_archive",
+        CompletionState::PayloadPending => "payload_pending",
+        CompletionState::RemoveRecordPending => "remove_record_pending",
+        CompletionState::UnknownRemoveRecord => "unknown_remove_record",
+        CompletionState::Finished => "finished",
+        CompletionState::Blocked => "blocked",
+        CompletionState::Failed => "failed",
+    }
+}
+
+fn parse_completion_state(value: &str) -> Option<CompletionState> {
+    match value {
+        "prepared" => Some(CompletionState::Prepared),
+        "stop_pending" => Some(CompletionState::StopPending),
+        "unknown_stop" => Some(CompletionState::UnknownStop),
+        "stopped" => Some(CompletionState::Stopped),
+        "archive_pending" => Some(CompletionState::ArchivePending),
+        "unknown_archive" => Some(CompletionState::UnknownArchive),
+        "payload_pending" => Some(CompletionState::PayloadPending),
+        "remove_record_pending" => Some(CompletionState::RemoveRecordPending),
+        "unknown_remove_record" => Some(CompletionState::UnknownRemoveRecord),
+        "finished" => Some(CompletionState::Finished),
+        "blocked" => Some(CompletionState::Blocked),
+        "failed" => Some(CompletionState::Failed),
+        _ => None,
+    }
+}
+
+fn parse_completion_file_state(value: &str) -> Option<CompletionFileState> {
+    match value {
+        "prepared" => Some(CompletionFileState::Prepared),
+        "move_pending" => Some(CompletionFileState::MovePending),
+        "unknown_move" => Some(CompletionFileState::UnknownMove),
+        "destination_receipted" => Some(CompletionFileState::DestinationReceipted),
+        "source_delete_pending" => Some(CompletionFileState::SourceDeletePending),
+        "unknown_source_delete" => Some(CompletionFileState::UnknownSourceDelete),
+        "handed_off" => Some(CompletionFileState::HandedOff),
+        "blocked" => Some(CompletionFileState::Blocked),
+        "failed" => Some(CompletionFileState::Failed),
+        _ => None,
+    }
+}
+
+fn insert_completion_event(
+    transaction: &Transaction<'_>,
+    operation_id: &str,
+    revision: u64,
+    state: &str,
+    problem_code: Option<&str>,
+) -> Result<(), JournalError> {
+    transaction.execute(
+        "INSERT INTO completion_events(
+            operation_id, revision, event_kind, state, problem_code, created_at
+         ) VALUES (
+            ?1, ?2, ?3, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        params![operation_id, revision, state, problem_code],
+    )?;
+    Ok(())
+}
+
 struct StoredCleanupRow {
     cleanup_id: String,
     canonical_path: String,
