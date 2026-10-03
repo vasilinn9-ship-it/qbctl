@@ -1997,7 +1997,10 @@ impl CompletionJournal for Journal {
         transition_completion(
             self,
             operation_id,
-            &[CompletionState::ArchivePending, CompletionState::UnknownArchive],
+            &[
+                CompletionState::ArchivePending,
+                CompletionState::UnknownArchive,
+            ],
             CompletionState::Stopped,
             None,
         )
@@ -2021,7 +2024,10 @@ impl CompletionJournal for Journal {
             self,
             operation_id,
             file_index,
-            &[CompletionFileState::Prepared, CompletionFileState::UnknownMove],
+            &[
+                CompletionFileState::Prepared,
+                CompletionFileState::UnknownMove,
+            ],
             CompletionFileState::MovePending,
             None,
             None,
@@ -2058,7 +2064,10 @@ impl CompletionJournal for Journal {
             self,
             operation_id,
             file_index,
-            &[CompletionFileState::MovePending, CompletionFileState::UnknownMove],
+            &[
+                CompletionFileState::MovePending,
+                CompletionFileState::UnknownMove,
+            ],
             CompletionFileState::HandedOff,
             Some(destination),
             destination_sha256,
@@ -4337,24 +4346,19 @@ fn transition_completion_file(
         ));
     }
 
-    let revision = file
-        .revision
-        .checked_add(1)
-        .ok_or_else(|| PortError::new("JOURNAL_STATE_INVALID", "completion file revision overflow"))?;
-    let (
-        destination_volume_id,
-        destination_file_id,
-        destination_size,
-        destination_modified_marker,
-    ) = match destination {
-        Some(destination) => (
-            Some(destination.identity.volume_id.to_be_bytes().to_vec()),
-            Some(destination.identity.file_id.to_be_bytes().to_vec()),
-            Some(destination.size.to_be_bytes().to_vec()),
-            Some(destination.modified_marker.to_be_bytes().to_vec()),
-        ),
-        None => (None, None, None, None),
-    };
+    let revision = file.revision.checked_add(1).ok_or_else(|| {
+        PortError::new("JOURNAL_STATE_INVALID", "completion file revision overflow")
+    })?;
+    let (destination_volume_id, destination_file_id, destination_size, destination_modified_marker) =
+        match destination {
+            Some(destination) => (
+                Some(destination.identity.volume_id.to_be_bytes().to_vec()),
+                Some(destination.identity.file_id.to_be_bytes().to_vec()),
+                Some(destination.size.to_be_bytes().to_vec()),
+                Some(destination.modified_marker.to_be_bytes().to_vec()),
+            ),
+            None => (None, None, None, None),
+        };
     let destination_sha256 = destination_sha256.map(|value| value.to_vec());
 
     let changed = transaction
