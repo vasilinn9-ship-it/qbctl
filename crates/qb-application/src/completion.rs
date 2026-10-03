@@ -168,6 +168,13 @@ pub trait CompletionJournal: Send + Sync {
 
     fn retry_archive(&self, operation_id: &OperationId) -> Result<CompletionRecord, PortError>;
 
+    fn mark_archive_destination_receipted(
+        &self,
+        operation_id: &OperationId,
+        destination: &FileEvidence,
+        destination_sha256: [u8; 32],
+    ) -> Result<CompletionRecord, PortError>;
+
     fn mark_archive_receipted(
         &self,
         operation_id: &OperationId,
