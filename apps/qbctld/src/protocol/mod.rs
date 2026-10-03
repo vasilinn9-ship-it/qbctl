@@ -7,7 +7,7 @@ use std::{sync::Arc, time::Duration};
 use anyhow::{Context as _, Result};
 use prost::Message;
 use qb_application::{
-    completion::CompletionService,
+    completion::{CompletionJournal, CompletionService},
     mutation::MutationService,
     storage::StorageStatusService,
     system::{RuntimeHealthPort, SystemService},
@@ -24,6 +24,7 @@ const IPC_IO_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct OperationServices {
     pub mutations: Arc<MutationService>,
     pub completion: Option<Arc<CompletionService>>,
+    pub completion_journal: Arc<dyn CompletionJournal>,
 }
 
 pub async fn serve_connection(
@@ -65,6 +66,7 @@ pub async fn serve_connection(
             dispatch::OperationServices {
                 mutations: Some(operations.mutations.as_ref()),
                 completion: operations.completion.as_deref(),
+                completion_journal: Some(operations.completion_journal.as_ref()),
             },
             mutation_admission_enabled,
             qbit_startup_problem.as_deref(),
