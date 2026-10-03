@@ -762,11 +762,18 @@ impl CompletionService {
     pub async fn recover_operation(
         &self,
         operation_id: &OperationId,
+        request_id: &RequestId,
     ) -> Result<Option<CompletionExecution>, PortError> {
         let _guard = self.lane.lock().await;
         let Some(record) = self.journal.get_completion(operation_id)? else {
             return Ok(None);
         };
+        if &record.request_id != request_id {
+            return Err(PortError::new(
+                "REQUEST_ID_CONFLICT",
+                "operation recover must reuse the completion operation RequestId",
+            ));
+        }
         self.advance(record, true, true).await.map(Some)
     }
 
