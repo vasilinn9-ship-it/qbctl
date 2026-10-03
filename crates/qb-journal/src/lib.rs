@@ -235,7 +235,7 @@ impl Journal {
                 problem_code,
                 next_revision,
                 operation_id.as_str(),
-                current.revision(),
+                current.revision,
                 disposition_name(expected),
             ],
         )?;
@@ -702,7 +702,7 @@ fn parse_disposition(value: &str) -> Option<MutationDisposition> {
 }
 
 fn map_port_error(error: JournalError) -> PortError {
-    let code = match error {
+    let code = match &error {
         JournalError::InvalidTransition(_) => "OPERATION_TRANSITION_INVALID",
         JournalError::InvalidState(_) => "JOURNAL_STATE_INVALID",
         _ => "JOURNAL_UNAVAILABLE",
