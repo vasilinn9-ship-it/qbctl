@@ -529,6 +529,348 @@ impl TorrentRegistry for Journal {
     }
 }
 
+impl AdmissionJournal for Journal {
+    fn reserve_admission(
+        &self,
+        request: &AdmissionReservationRequest,
+    ) -> Result<AdmissionReservationResult, PortError> {
+        if request.source_relative.is_empty() || request.working_save_path.is_empty() {
+            return Err(PortError::new(
+                "ADMISSION_REQUEST_INVALID",
+                "admission source and Working save path must not be empty",
+            ));
+        }
+
+        let fingerprint = request.fingerprint();
+        let mut connection = self.connection.lock().expect("journal mutex poisoned");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+
+        if let Some(existing) =
+            load_request(&transaction, request.request_id.as_str()).map_err(map_port_error)?
+        {
+            let operation_id = OperationId::new(existing.operation_id.clone())
+                .map_err(|error| PortError::new("JOURNAL_STATE_INVALID", error.to_string()))?;
+            if existing.fingerprint_version != ADMISSION_FINGERPRINT_VERSION
+                || existing.command_kind != "admission.add"
+                || existing.command_fingerprint.as_slice() != fingerprint
+            {
+                return Ok(AdmissionReservationResult::Conflict { operation_id });
+            }
+
+            let record = load_admission_record(&transaction, operation_id.as_str())
+                .map_err(map_port_error)?
+                .ok_or_else(|| {
+                    PortError::new(
+                        "JOURNAL_STATE_INVALID",
+                        "admission request references a missing reservation",
+                    )
+                })?;
+            transaction
+                .commit()
+                .map_err(JournalError::from)
+                .map_err(map_port_error)?;
+            return Ok(AdmissionReservationResult::Replay(record));
+        }
+
+        let registry_ids =
+            matching_registry_ids(&transaction, &request.identity).map_err(map_port_error)?;
+        let registry_id = match registry_ids.as_slice() {
+            [] => {
+                let registry_id = Uuid::new_v4().to_string();
+                transaction
+                    .execute(
+                        "INSERT INTO torrent_registry(
+                            registry_id,
+                            canonical_identity,
+                            state,
+                            source_relative,
+                            source_metainfo_digest,
+                            operation_id,
+                            archive_ref,
+                            handoff_file_count,
+                            handoff_receipt_count,
+                            updated_at
+                         ) VALUES (
+                            ?1, ?2, 'incoming', ?3, ?4, NULL, NULL, 0, 0,
+                            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                         )",
+                        params![
+                            registry_id,
+                            canonical_identity(&request.identity),
+                            request.source_relative,
+                            request.source_metainfo_digest.as_slice(),
+                        ],
+                    )
+                    .map_err(JournalError::from)
+                    .map_err(map_port_error)?;
+                insert_identity_aliases(&transaction, &registry_id, &request.identity)
+                    .map_err(map_port_error)?;
+                registry_id
+            }
+            [registry_id] => {
+                let record = load_registry_record(&transaction, registry_id)
+                    .map_err(map_port_error)?
+                    .ok_or_else(|| {
+                        PortError::new(
+                            "JOURNAL_STATE_INVALID",
+                            "registry alias references a missing record",
+                        )
+                    })?;
+                if record.source_metainfo_digest != request.source_metainfo_digest {
+                    return Err(PortError::new(
+                        "IDENTITY_CONFLICT",
+                        "same torrent identity is represented by different metainfo bytes",
+                    ));
+                }
+                if record.state != RegistryState::Incoming {
+                    return Err(PortError::new(
+                        "ALREADY_PROCESSED",
+                        "torrent identity is already processing or finished",
+                    ));
+                }
+                if record.operation_id.is_some() {
+                    return Err(PortError::new(
+                        "IDENTITY_CONFLICT",
+                        "torrent identity is already linked to another admission operation",
+                    ));
+                }
+
+                insert_identity_aliases(&transaction, registry_id, &request.identity)
+                    .map_err(map_port_error)?;
+                transaction
+                    .execute(
+                        "UPDATE torrent_registry
+                         SET canonical_identity = ?1,
+                             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                         WHERE registry_id = ?2",
+                        params![canonical_identity(&request.identity), registry_id],
+                    )
+                    .map_err(JournalError::from)
+                    .map_err(map_port_error)?;
+                registry_id.clone()
+            }
+            _ => {
+                return Err(PortError::new(
+                    "IDENTITY_CONFLICT",
+                    "torrent identity aliases resolve to multiple registry records",
+                ));
+            }
+        };
+
+        let operation_id = OperationId::new(Uuid::new_v4().to_string())
+            .map_err(|error| PortError::new("JOURNAL_STATE_INVALID", error.to_string()))?;
+        let now = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
+
+        transaction
+            .execute(
+                &format!(
+                    "INSERT INTO requests(
+                        request_id, fingerprint_version, command_kind, command_fingerprint,
+                        operation_id, created_at
+                     ) VALUES (?1, ?2, 'admission.add', ?3, ?4, {now})"
+                ),
+                params![
+                    request.request_id.as_str(),
+                    ADMISSION_FINGERPRINT_VERSION,
+                    fingerprint.as_slice(),
+                    operation_id.as_str(),
+                ],
+            )
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+
+        transaction
+            .execute(
+                &format!(
+                    "INSERT INTO operations(
+                        operation_id, request_id, command_kind,
+                        torrent_id, control_action, target_client_count, max_active_downloads,
+                        download_limit_bps, upload_limit_bps,
+                        checkpoint, disposition, pending_effect_kind, problem_code,
+                        revision, created_at, updated_at
+                     ) VALUES (
+                        ?1, ?2, 'admission.add',
+                        NULL, NULL, NULL, NULL, NULL, NULL,
+                        'prepared', 'prepared', NULL, NULL, 1, {now}, {now}
+                     )"
+                ),
+                params![operation_id.as_str(), request.request_id.as_str()],
+            )
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+
+        insert_event(
+            &transaction,
+            operation_id.as_str(),
+            EventSpec {
+                revision: 1,
+                event_kind: "prepared",
+                checkpoint: "prepared",
+                disposition: MutationDisposition::Prepared,
+                pending_effect_kind: None,
+                problem_code: None,
+            },
+        )
+        .map_err(map_port_error)?;
+
+        transaction
+            .execute(
+                &format!(
+                    "INSERT INTO admission_reservations(
+                        operation_id,
+                        registry_id,
+                        source_relative,
+                        source_volume_id,
+                        source_file_id,
+                        source_size,
+                        source_modified_marker,
+                        source_metainfo_digest,
+                        working_volume_id,
+                        reserved_bytes,
+                        working_save_path,
+                        reservation_state,
+                        created_at,
+                        updated_at
+                     ) VALUES (
+                        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                        'active', {now}, {now}
+                     )"
+                ),
+                params![
+                    operation_id.as_str(),
+                    registry_id,
+                    request.source_relative,
+                    request.source_evidence.identity.volume_id.to_be_bytes().as_slice(),
+                    request.source_evidence.identity.file_id.to_be_bytes().as_slice(),
+                    request.source_evidence.size.to_be_bytes().as_slice(),
+                    request
+                        .source_evidence
+                        .modified_marker
+                        .to_be_bytes()
+                        .as_slice(),
+                    request.source_metainfo_digest.as_slice(),
+                    request.working_volume_id.to_be_bytes().as_slice(),
+                    request.reserved_bytes.to_be_bytes().as_slice(),
+                    request.working_save_path,
+                ],
+            )
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+
+        let changed = transaction
+            .execute(
+                "UPDATE torrent_registry
+                 SET operation_id = ?1,
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE registry_id = ?2
+                   AND state = 'incoming'
+                   AND operation_id IS NULL",
+                params![operation_id.as_str(), registry_id],
+            )
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        if changed != 1 {
+            return Err(PortError::new(
+                "JOURNAL_STATE_INVALID",
+                "registry could not be atomically attached to admission operation",
+            ));
+        }
+
+        let record = load_admission_record(&transaction, operation_id.as_str())
+            .map_err(map_port_error)?
+            .ok_or_else(|| {
+                PortError::new(
+                    "JOURNAL_STATE_INVALID",
+                    "new admission reservation disappeared before commit",
+                )
+            })?;
+        transaction
+            .commit()
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        Ok(AdmissionReservationResult::New(record))
+    }
+
+    fn get_admission(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<AdmissionRecord>, PortError> {
+        let connection = self.connection.lock().expect("journal mutex poisoned");
+        load_admission_record(&connection, operation_id.as_str()).map_err(map_port_error)
+    }
+
+    fn list_recoverable_admissions(&self) -> Result<Vec<AdmissionRecord>, PortError> {
+        let connection = self.connection.lock().expect("journal mutex poisoned");
+        let mut statement = connection
+            .prepare(
+                "SELECT operation_id
+                 FROM operations
+                 WHERE command_kind = 'admission.add'
+                   AND disposition IN ('prepared','effect_pending','observed_applied','unknown')
+                 ORDER BY created_at, operation_id",
+            )
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            let operation_id = row.map_err(JournalError::from).map_err(map_port_error)?;
+            let record = load_admission_record(&connection, &operation_id)
+                .map_err(map_port_error)?
+                .ok_or_else(|| {
+                    PortError::new(
+                        "JOURNAL_STATE_INVALID",
+                        "recoverable admission operation has no reservation detail",
+                    )
+                })?;
+            records.push(record);
+        }
+        Ok(records)
+    }
+
+    fn capacity_reservations(
+        &self,
+        working_volume_id: u64,
+    ) -> Result<Vec<CapacityReservation>, PortError> {
+        let connection = self.connection.lock().expect("journal mutex poisoned");
+        let volume = working_volume_id.to_be_bytes();
+        let mut statement = connection
+            .prepare(
+                "SELECT operation_id, reserved_bytes
+                 FROM admission_reservations
+                 WHERE working_volume_id = ?1
+                   AND reservation_state = 'active'
+                 ORDER BY operation_id",
+            )
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        let rows = statement
+            .query_map([volume.as_slice()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+
+        let mut reservations = Vec::new();
+        for row in rows {
+            let (responsible, bytes) = row.map_err(JournalError::from).map_err(map_port_error)?;
+            reservations.push(CapacityReservation {
+                responsible,
+                volume_id: working_volume_id,
+                bytes: decode_u64_blob(&bytes, "reserved_bytes").map_err(map_port_error)?,
+            });
+        }
+        Ok(reservations)
+    }
+}
+
 impl MutationJournal for Journal {
     fn reserve_request(
         &self,
@@ -762,6 +1104,7 @@ impl MutationJournal for Journal {
                  FROM operations
                  JOIN requests ON requests.request_id = operations.request_id
                  WHERE operations.disposition IN ('prepared','effect_pending','observed_applied','unknown')
+                   AND operations.command_kind != 'admission.add'
                  ORDER BY operations.created_at, operations.operation_id",
             )
             .map_err(JournalError::from)
@@ -1284,6 +1627,175 @@ fn load_registry_record(
         handoff_file_count,
         handoff_receipt_count,
     }))
+}
+
+fn load_admission_record(
+    connection: &Connection,
+    operation_id: &str,
+) -> Result<Option<AdmissionRecord>, JournalError> {
+    let row: Option<(
+        String,
+        String,
+        String,
+        String,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        u64,
+    )> = connection
+        .query_row(
+            "SELECT requests.request_id,
+                    operations.operation_id,
+                    admission_reservations.registry_id,
+                    admission_reservations.source_relative,
+                    admission_reservations.source_volume_id,
+                    admission_reservations.source_file_id,
+                    admission_reservations.source_size,
+                    admission_reservations.source_modified_marker,
+                    admission_reservations.source_metainfo_digest,
+                    admission_reservations.working_volume_id,
+                    admission_reservations.working_save_path,
+                    admission_reservations.reserved_bytes,
+                    operations.checkpoint,
+                    operations.pending_effect_kind,
+                    operations.problem_code,
+                    operations.revision
+             FROM admission_reservations
+             JOIN operations
+               ON operations.operation_id = admission_reservations.operation_id
+             JOIN requests
+               ON requests.request_id = operations.request_id
+             WHERE admission_reservations.operation_id = ?1
+               AND operations.command_kind = 'admission.add'",
+            [operation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                    row.get(14)?,
+                    row.get(15)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    let Some((
+        request_id,
+        operation_id,
+        registry_id,
+        source_relative,
+        source_volume_id,
+        source_file_id,
+        source_size,
+        source_modified_marker,
+        source_metainfo_digest,
+        working_volume_id,
+        working_save_path,
+        reserved_bytes,
+        checkpoint,
+        pending_effect_kind,
+        problem_code,
+        revision,
+    )) = row
+    else {
+        return Ok(None);
+    };
+
+    let request_id = RequestId::new(request_id)
+        .map_err(|error| JournalError::InvalidState(error.to_string()))?;
+    let operation_id = OperationId::new(operation_id)
+        .map_err(|error| JournalError::InvalidState(error.to_string()))?;
+    let registry = load_registry_record(connection, &registry_id)?.ok_or_else(|| {
+        JournalError::InvalidState("admission reservation references missing registry".into())
+    })?;
+    if registry.operation_id.as_deref() != Some(operation_id.as_str()) {
+        return Err(JournalError::InvalidState(
+            "admission registry operation link does not match reservation".into(),
+        ));
+    }
+
+    let disposition_text: String = connection.query_row(
+        "SELECT disposition FROM operations WHERE operation_id = ?1",
+        [operation_id.as_str()],
+        |row| row.get(0),
+    )?;
+    let disposition = parse_disposition(&disposition_text).ok_or_else(|| {
+        JournalError::InvalidState(format!(
+            "unknown admission disposition '{disposition_text}'"
+        ))
+    })?;
+
+    let source_metainfo_digest: [u8; 32] =
+        source_metainfo_digest
+            .try_into()
+            .map_err(|value: Vec<u8>| {
+                JournalError::InvalidState(format!(
+                    "admission metainfo digest has {} bytes instead of 32",
+                    value.len()
+                ))
+            })?;
+
+    Ok(Some(AdmissionRecord {
+        request_id,
+        operation_id,
+        registry_id,
+        identity: registry.identity,
+        source_relative,
+        source_evidence: qb_application::storage::FileEvidence {
+            identity: qb_application::storage::FileIdentity {
+                volume_id: decode_u64_blob(&source_volume_id, "source_volume_id")?,
+                file_id: decode_u64_blob(&source_file_id, "source_file_id")?,
+            },
+            size: decode_u64_blob(&source_size, "source_size")?,
+            modified_marker: decode_u128_blob(
+                &source_modified_marker,
+                "source_modified_marker",
+            )?,
+        },
+        source_metainfo_digest,
+        working_volume_id: decode_u64_blob(&working_volume_id, "working_volume_id")?,
+        reserved_bytes: decode_u64_blob(&reserved_bytes, "reserved_bytes")?,
+        working_save_path,
+        checkpoint,
+        disposition,
+        pending_effect_kind,
+        problem_code,
+        revision,
+    }))
+}
+
+fn decode_u64_blob(bytes: &[u8], field: &str) -> Result<u64, JournalError> {
+    let value: [u8; 8] = bytes.try_into().map_err(|_| {
+        JournalError::InvalidState(format!("{field} must contain exactly 8 bytes"))
+    })?;
+    Ok(u64::from_be_bytes(value))
+}
+
+fn decode_u128_blob(bytes: &[u8], field: &str) -> Result<u128, JournalError> {
+    let value: [u8; 16] = bytes.try_into().map_err(|_| {
+        JournalError::InvalidState(format!("{field} must contain exactly 16 bytes"))
+    })?;
+    Ok(u128::from_be_bytes(value))
 }
 
 struct StoredRequest {
@@ -1812,6 +2324,102 @@ mod tests {
             .find_by_identity(&TorrentIdentity::new(None, Some(v2)).expect("v2"))
             .expect("find v2")
             .is_some());
+    }
+
+    fn admission_request(id: &str) -> AdmissionReservationRequest {
+        AdmissionReservationRequest {
+            request_id: RequestId::new(id).expect("request id"),
+            identity: TorrentIdentity::new(Some([0x91; 20]), Some([0xa2; 32]))
+                .expect("identity"),
+            source_relative: "candidate.torrent".into(),
+            source_evidence: qb_application::storage::FileEvidence {
+                identity: qb_application::storage::FileIdentity {
+                    volume_id: 7,
+                    file_id: 11,
+                },
+                size: 512,
+                modified_marker: 99,
+            },
+            source_metainfo_digest: [0xb3; 32],
+            working_volume_id: 42,
+            reserved_bytes: 4096,
+            working_save_path: r"C:\Managed\Working".into(),
+        }
+    }
+
+    #[test]
+    fn admission_reservation_is_atomic_replayable_and_persists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.sqlite");
+        let request = admission_request("admission-1");
+
+        let operation_id = {
+            let journal = Journal::open(&path).expect("journal");
+            let record = match journal.reserve_admission(&request).expect("reserve") {
+                AdmissionReservationResult::New(record) => record,
+                other => panic!("unexpected reservation: {other:?}"),
+            };
+            assert_eq!(record.disposition, MutationDisposition::Prepared);
+            assert_eq!(record.checkpoint, "prepared");
+            assert_eq!(record.source_evidence, request.source_evidence);
+            assert_eq!(record.source_metainfo_digest, request.source_metainfo_digest);
+            assert_eq!(record.working_volume_id, 42);
+            assert_eq!(record.reserved_bytes, 4096);
+
+            let replay = journal.reserve_admission(&request).expect("replay");
+            match replay {
+                AdmissionReservationResult::Replay(existing) => {
+                    assert_eq!(existing.operation_id, record.operation_id);
+                    assert_eq!(existing.registry_id, record.registry_id);
+                }
+                other => panic!("unexpected replay: {other:?}"),
+            }
+
+            let reservations = journal.capacity_reservations(42).expect("capacity reservations");
+            assert_eq!(reservations.len(), 1);
+            assert_eq!(reservations[0].responsible, record.operation_id.as_str());
+            assert_eq!(reservations[0].bytes, 4096);
+            record.operation_id
+        };
+
+        let reopened = Journal::open(&path).expect("reopen");
+        let record = reopened
+            .get_admission(&operation_id)
+            .expect("get admission")
+            .expect("admission");
+        assert_eq!(record.request_id, request.request_id);
+        assert_eq!(record.identity, request.identity);
+        assert_eq!(record.source_evidence, request.source_evidence);
+        assert_eq!(reopened.list_recoverable_admissions().expect("recoverable").len(), 1);
+        assert!(reopened.list_recoverable().expect("mutation recovery").is_empty());
+    }
+
+    #[test]
+    fn admission_request_id_conflict_does_not_create_second_operation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path().join("state.sqlite")).expect("journal");
+        let first = admission_request("admission-conflict");
+        let first_operation = match journal.reserve_admission(&first).expect("reserve") {
+            AdmissionReservationResult::New(record) => record.operation_id,
+            other => panic!("unexpected reservation: {other:?}"),
+        };
+
+        let mut changed = first.clone();
+        changed.reserved_bytes += 1;
+        match journal.reserve_admission(&changed).expect("conflict") {
+            AdmissionReservationResult::Conflict { operation_id } => {
+                assert_eq!(operation_id, first_operation);
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+
+        assert_eq!(
+            journal
+                .capacity_reservations(42)
+                .expect("reservations")
+                .len(),
+            1
+        );
     }
 
     #[test]
