@@ -2006,6 +2006,20 @@ impl CompletionJournal for Journal {
         )
     }
 
+    fn mark_archive_destination_receipted(
+        &self,
+        operation_id: &OperationId,
+        destination: &qb_application::storage::FileEvidence,
+        destination_sha256: [u8; 32],
+    ) -> Result<CompletionRecord, PortError> {
+        receipt_completion_archive_destination(
+            self,
+            operation_id,
+            destination,
+            destination_sha256,
+        )
+    }
+
     fn mark_archive_receipted(
         &self,
         operation_id: &OperationId,
@@ -4228,6 +4242,113 @@ fn finish_completion_payload(
             PortError::new(
                 "JOURNAL_STATE_INVALID",
                 "completion disappeared after payload receipt gate",
+            )
+        })?;
+    transaction
+        .commit()
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    Ok(record)
+}
+
+fn receipt_completion_archive_destination(
+    journal: &Journal,
+    operation_id: &OperationId,
+    destination: &qb_application::storage::FileEvidence,
+    destination_sha256: [u8; 32],
+) -> Result<CompletionRecord, PortError> {
+    let mut connection = journal.connection.lock().expect("journal mutex poisoned");
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    let current = load_completion_record(&transaction, operation_id.as_str())
+        .map_err(map_port_error)?
+        .ok_or_else(|| PortError::new("COMPLETION_NOT_FOUND", operation_id.to_string()))?;
+    if !matches!(
+        current.state,
+        CompletionState::ArchivePending | CompletionState::UnknownArchive
+    ) {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            "Archive destination receipt requires ArchivePending or UnknownArchive",
+        ));
+    }
+    if destination.identity.volume_id != current.archive_volume_id
+        || destination.size != current.source_evidence.size
+    {
+        return Err(PortError::new(
+            "ARCHIVE_RECEIPT_INVALID",
+            "Archive destination evidence does not match the completion source",
+        ));
+    }
+    if current.archive_destination_evidence.as_ref() == Some(destination)
+        && current.archive_sha256 == Some(destination_sha256)
+    {
+        transaction
+            .commit()
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        return Ok(current);
+    }
+    if current.archive_destination_evidence.is_some() || current.archive_sha256.is_some() {
+        return Err(PortError::new(
+            "ARCHIVE_RECEIPT_CONFLICT",
+            "Archive destination receipt already exists with different evidence",
+        ));
+    }
+
+    let revision = current
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| PortError::new("JOURNAL_STATE_INVALID", "completion revision overflow"))?;
+    let changed = transaction
+        .execute(
+            "UPDATE completion_operations
+             SET archive_destination_volume_id = ?1,
+                 archive_destination_file_id = ?2,
+                 archive_destination_size = ?3,
+                 archive_destination_modified_marker = ?4,
+                 archive_destination_sha256 = ?5,
+                 problem_code = NULL,
+                 revision = ?6,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE operation_id = ?7
+               AND revision = ?8
+               AND state IN ('archive_pending','unknown_archive')",
+            params![
+                destination.identity.volume_id.to_be_bytes().as_slice(),
+                destination.identity.file_id.to_be_bytes().as_slice(),
+                destination.size.to_be_bytes().as_slice(),
+                destination.modified_marker.to_be_bytes().as_slice(),
+                destination_sha256.as_slice(),
+                revision,
+                operation_id.as_str(),
+                current.revision,
+            ],
+        )
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    if changed != 1 {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            "Archive destination receipt changed concurrently",
+        ));
+    }
+    insert_completion_event(
+        &transaction,
+        operation_id.as_str(),
+        revision,
+        completion_state_name(current.state),
+        None,
+    )
+    .map_err(map_port_error)?;
+    let record = load_completion_record(&transaction, operation_id.as_str())
+        .map_err(map_port_error)?
+        .ok_or_else(|| {
+            PortError::new(
+                "JOURNAL_STATE_INVALID",
+                "completion disappeared after Archive destination receipt",
             )
         })?;
     transaction
