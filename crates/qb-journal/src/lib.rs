@@ -3453,7 +3453,6 @@ fn transition_release(
     Ok(record)
 }
 
-
 fn finish_release_with_resolution(
     journal: &Journal,
     operation_id: &OperationId,
