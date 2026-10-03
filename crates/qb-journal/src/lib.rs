@@ -3159,6 +3159,11 @@ fn migrate_v6_to_v7(connection: &mut Connection) -> Result<(), JournalError> {
             total_bytes BLOB NOT NULL CHECK(length(total_bytes) = 8),
             payload_strategy TEXT NOT NULL CHECK(payload_strategy IN ('same_volume','cross_volume')),
             archive_strategy TEXT NOT NULL CHECK(archive_strategy IN ('same_volume','cross_volume')),
+            archive_destination_volume_id BLOB CHECK(archive_destination_volume_id IS NULL OR length(archive_destination_volume_id) = 8),
+            archive_destination_file_id BLOB CHECK(archive_destination_file_id IS NULL OR length(archive_destination_file_id) = 8),
+            archive_destination_size BLOB CHECK(archive_destination_size IS NULL OR length(archive_destination_size) = 8),
+            archive_destination_modified_marker BLOB CHECK(archive_destination_modified_marker IS NULL OR length(archive_destination_modified_marker) = 16),
+            archive_destination_sha256 BLOB CHECK(archive_destination_sha256 IS NULL OR length(archive_destination_sha256) = 32),
             state TEXT NOT NULL CHECK(state IN (
                 'prepared',
                 'stop_pending',
@@ -3513,6 +3518,11 @@ struct StoredCompletionRow {
     archive_volume_id: Vec<u8>,
     working_save_path: String,
     total_bytes: Vec<u8>,
+    archive_destination_volume_id: Option<Vec<u8>>,
+    archive_destination_file_id: Option<Vec<u8>>,
+    archive_destination_size: Option<Vec<u8>>,
+    archive_destination_modified_marker: Option<Vec<u8>>,
+    archive_destination_sha256: Option<Vec<u8>>,
     state: String,
     problem_code: Option<String>,
     revision: u64,
@@ -3541,6 +3551,11 @@ fn load_completion_record(
                     archive_volume_id,
                     working_save_path,
                     total_bytes,
+                    archive_destination_volume_id,
+                    archive_destination_file_id,
+                    archive_destination_size,
+                    archive_destination_modified_marker,
+                    archive_destination_sha256,
                     state,
                     problem_code,
                     revision
@@ -3566,9 +3581,14 @@ fn load_completion_record(
                     archive_volume_id: row.get(14)?,
                     working_save_path: row.get(15)?,
                     total_bytes: row.get(16)?,
-                    state: row.get(17)?,
-                    problem_code: row.get(18)?,
-                    revision: row.get(19)?,
+                    archive_destination_volume_id: row.get(17)?,
+                    archive_destination_file_id: row.get(18)?,
+                    archive_destination_size: row.get(19)?,
+                    archive_destination_modified_marker: row.get(20)?,
+                    archive_destination_sha256: row.get(21)?,
+                    state: row.get(22)?,
+                    problem_code: row.get(23)?,
+                    revision: row.get(24)?,
                 })
             },
         )
@@ -3753,6 +3773,24 @@ fn load_completion_record(
         archive_volume_id: decode_u64_blob(&row.archive_volume_id, "archive_volume_id")?,
         working_save_path: row.working_save_path,
         total_bytes: decode_u64_blob(&row.total_bytes, "total_bytes")?,
+        archive_destination_evidence: decode_optional_file_evidence(
+            row.archive_destination_volume_id.as_deref(),
+            row.archive_destination_file_id.as_deref(),
+            row.archive_destination_size.as_deref(),
+            row.archive_destination_modified_marker.as_deref(),
+            "archive_destination",
+        )?,
+        archive_sha256: row
+            .archive_destination_sha256
+            .map(|value| {
+                value.try_into().map_err(|value: Vec<u8>| {
+                    JournalError::InvalidState(format!(
+                        "archive destination sha256 has {} bytes instead of 32",
+                        value.len()
+                    ))
+                })
+            })
+            .transpose()?,
         state,
         problem_code: row.problem_code,
         revision: row.revision,
