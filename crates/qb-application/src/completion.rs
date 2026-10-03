@@ -2665,20 +2665,29 @@ mod tests {
     struct FakeStorage {
         files: Mutex<Vec<(ManagedRoot, String, FileEvidence)>>,
         cross_volume_payload: bool,
+        cross_volume_archive: bool,
         delete_failures: Mutex<usize>,
         delete_calls: AtomicUsize,
     }
 
     impl FakeStorage {
         fn populated() -> Arc<Self> {
-            Self::with_cross_volume(false, 0)
+            Self::with_cross_volumes(false, false, 0)
         }
 
         fn cross_volume(delete_failures: usize) -> Arc<Self> {
-            Self::with_cross_volume(true, delete_failures)
+            Self::with_cross_volumes(true, false, delete_failures)
         }
 
-        fn with_cross_volume(cross_volume_payload: bool, delete_failures: usize) -> Arc<Self> {
+        fn cross_volume_archive(delete_failures: usize) -> Arc<Self> {
+            Self::with_cross_volumes(false, true, delete_failures)
+        }
+
+        fn with_cross_volumes(
+            cross_volume_payload: bool,
+            cross_volume_archive: bool,
+            delete_failures: usize,
+        ) -> Arc<Self> {
             Arc::new(Self {
                 files: Mutex::new(vec![
                     (
@@ -2690,6 +2699,7 @@ mod tests {
                     (ManagedRoot::Working, "dir/b.bin".into(), evidence(2, 3, 20)),
                 ]),
                 cross_volume_payload,
+                cross_volume_archive,
                 delete_failures: Mutex::new(delete_failures),
                 delete_calls: AtomicUsize::new(0),
             })
@@ -2699,7 +2709,9 @@ mod tests {
     impl Storage for FakeStorage {
         fn volume_status(&self, root: ManagedRoot) -> Result<StorageVolumeStatus, PortError> {
             let (volume_id, free_bytes) = match root {
-                ManagedRoot::Incoming | ManagedRoot::Archive => (1, 1_000),
+                ManagedRoot::Incoming => (1, 1_000),
+                ManagedRoot::Archive if self.cross_volume_archive => (4, 1_000),
+                ManagedRoot::Archive => (1, 1_000),
                 ManagedRoot::Working => (2, 1_000),
                 ManagedRoot::Completed if self.cross_volume_payload => (3, 1_000),
                 ManagedRoot::Completed => (2, 1_000),
@@ -2785,7 +2797,13 @@ mod tests {
             temp_relative: &str,
             expected_source: &FileEvidence,
         ) -> Result<VerifiedCopyOutcome, PortError> {
-            if !self.cross_volume_payload {
+            let allowed = (source_root == ManagedRoot::Working
+                && destination_root == ManagedRoot::Completed
+                && self.cross_volume_payload)
+                || (source_root == ManagedRoot::Incoming
+                    && destination_root == ManagedRoot::Archive
+                    && self.cross_volume_archive);
+            if !allowed {
                 return Err(unused());
             }
             let mut files = self.files.lock().expect("files mutex");
@@ -2800,7 +2818,11 @@ mod tests {
                 return Ok(VerifiedCopyOutcome::SourceChanged { observed: source });
             }
 
-            let sha256: [u8; 32] = Sha256::digest(source_relative.as_bytes()).into();
+            let sha256: [u8; 32] = if source_root == ManagedRoot::Incoming {
+                Sha256::digest(b"metainfo").into()
+            } else {
+                Sha256::digest(source_relative.as_bytes()).into()
+            };
             if let Some((_, _, existing)) = files
                 .iter()
                 .find(|(root, path, _)| *root == destination_root && path == temp_relative)
@@ -2821,7 +2843,11 @@ mod tests {
 
             let temp = FileEvidence {
                 identity: FileIdentity {
-                    volume_id: 3,
+                    volume_id: match destination_root {
+                        ManagedRoot::Archive => 4,
+                        ManagedRoot::Completed => 3,
+                        _ => expected_source.identity.volume_id,
+                    },
                     file_id: source.identity.file_id + 100,
                 },
                 size: source.size,
@@ -3429,34 +3455,6 @@ mod tests {
                 CompletionState::Stopped,
                 None,
             )
-        }
-
-        fn mark_archive_destination_receipted(
-            &self,
-            operation_id: &OperationId,
-            destination: &FileEvidence,
-            destination_sha256: [u8; 32],
-        ) -> Result<CompletionRecord, PortError> {
-            let mut state = self.record.lock().expect("completion journal mutex");
-            let record = state
-                .as_mut()
-                .ok_or_else(|| PortError::new("COMPLETION_NOT_FOUND", operation_id.to_string()))?;
-            if &record.operation_id != operation_id
-                || !matches!(
-                    record.state,
-                    CompletionState::ArchivePending | CompletionState::UnknownArchive
-                )
-            {
-                return Err(PortError::new(
-                    "OPERATION_TRANSITION_INVALID",
-                    "invalid fake Archive destination receipt transition",
-                ));
-            }
-            record.archive_destination_evidence = Some(destination.clone());
-            record.archive_sha256 = Some(destination_sha256);
-            record.problem_code = None;
-            record.revision += 1;
-            Ok(record.clone())
         }
 
         fn mark_archive_destination_receipted(
