@@ -358,7 +358,8 @@ impl QbitClient {
             .send()
             .await?;
 
-        if !response.status().is_success() {
+        let status = response.status();
+        if !status.is_success() {
             return Err(QbitError::Authentication);
         }
 
@@ -371,7 +372,9 @@ impl QbitClient {
             .ok_or(QbitError::Authentication)?;
 
         let body = read_bounded_body(response).await?;
-        if body != b"Ok." {
+        let legacy_success = status == StatusCode::OK && body == b"Ok.";
+        let modern_success = status == StatusCode::NO_CONTENT && body.is_empty();
+        if !legacy_success && !modern_success {
             return Err(QbitError::Authentication);
         }
 
@@ -516,7 +519,10 @@ async fn read_bounded_body(mut response: Response) -> Result<Vec<u8>, QbitError>
 fn extract_session_cookie(header: &str) -> Option<String> {
     let cookie = header.split(';').next()?.trim();
     let (name, value) = cookie.split_once('=')?;
-    if !matches!(name, "SID" | "QBT_SID") || value.is_empty() {
+    let modern_name = name
+        .strip_prefix("QBT_SID_")
+        .is_some_and(|port| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()));
+    if (name != "SID" && !modern_name) || value.is_empty() {
         return None;
     }
     Some(format!("{name}={value}"))
@@ -799,6 +805,21 @@ mod tests {
     }
 
     #[test]
+    fn session_cookie_names_are_fail_closed() {
+        assert_eq!(
+            extract_session_cookie("SID=legacy; HttpOnly").as_deref(),
+            Some("SID=legacy")
+        );
+        assert_eq!(
+            extract_session_cookie("QBT_SID_8080=modern; HttpOnly").as_deref(),
+            Some("QBT_SID_8080=modern")
+        );
+        assert!(extract_session_cookie("QBT_SID=missing-port").is_none());
+        assert!(extract_session_cookie("QBT_SID_http=bad-port").is_none());
+        assert!(extract_session_cookie("OTHER=value").is_none());
+    }
+
+    #[test]
     fn mutation_version_matrix_is_fail_closed() {
         assert!(is_supported_mutation_version("v5.0.0", "2.13.0"));
         assert!(is_supported_mutation_version("v5.1.2", "2.16.2"));
@@ -840,7 +861,8 @@ mod tests {
     #[tokio::test]
     async fn probe_authenticates_and_reads_versions() {
         let server = FakeHttpServer::spawn(vec![
-            FakeResponse::ok("Ok.").with_header("Set-Cookie", "QBT_SID=test-session; HttpOnly"),
+            FakeResponse::status("204 No Content", "")
+                .with_header("Set-Cookie", "QBT_SID_8080=test-session; HttpOnly"),
             FakeResponse::ok("v5.2.4"),
             FakeResponse::ok("2.16.2"),
         ])
@@ -868,10 +890,10 @@ mod tests {
         assert!(requests[0].contains("password=secret"));
         assert!(requests[1]
             .to_ascii_lowercase()
-            .contains("cookie: qbt_sid=test-session"));
+            .contains("cookie: qbt_sid_8080=test-session"));
         assert!(requests[2]
             .to_ascii_lowercase()
-            .contains("cookie: qbt_sid=test-session"));
+            .contains("cookie: qbt_sid_8080=test-session"));
     }
 
     #[tokio::test]
