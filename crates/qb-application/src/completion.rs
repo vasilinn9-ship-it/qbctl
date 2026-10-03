@@ -664,7 +664,7 @@ pub struct CompletionService {
     client: Arc<dyn TorrentClient>,
     observation_attempts: usize,
     observation_delay: Duration,
-    lane: tokio::sync::Mutex<()>,
+    lane: crate::MutationLane,
 }
 
 impl CompletionService {
@@ -689,8 +689,13 @@ impl CompletionService {
             client,
             observation_attempts: 30,
             observation_delay: Duration::from_millis(100),
-            lane: tokio::sync::Mutex::new(()),
+            lane: crate::mutation_lane(),
         }
+    }
+
+    pub fn with_mutation_lane(mut self, lane: crate::MutationLane) -> Self {
+        self.lane = lane;
+        self
     }
 
     pub fn with_observation_policy(mut self, attempts: usize, delay: Duration) -> Self {
