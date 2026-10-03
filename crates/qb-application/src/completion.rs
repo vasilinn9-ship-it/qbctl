@@ -1383,10 +1383,9 @@ impl CompletionService {
                     );
                 }
                 Err(problem) => {
-                    let unknown = self.journal.mark_unknown_archive_source_delete(
-                        &record.operation_id,
-                        problem.code,
-                    )?;
+                    let unknown = self
+                        .journal
+                        .mark_unknown_archive_source_delete(&record.operation_id, problem.code)?;
                     return Ok(HandoffProgress::Halt {
                         status: CompletionExecutionStatus::UnknownArchiveSourceDelete,
                         record: unknown,
