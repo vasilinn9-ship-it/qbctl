@@ -6,6 +6,7 @@ use std::{
 use anyhow::{Context as _, Result};
 use qb_application::{
     cleanup::IncomingCleanupState,
+    completion::CompletionExecutionStatus,
     mutation::MutationExecutionStatus,
     release::ReleaseExecutionStatus,
     system::{DaemonPhase, RuntimeHealthPort, RuntimeSnapshot},
@@ -253,6 +254,35 @@ async fn initialize_runtime(bootstrap: &bootstrap::Bootstrap) {
             info!(
                 recovered = recovered.len(),
                 "startup durable queue release recovery completed"
+            );
+        }
+    }
+
+    if let Some(completion) = bootstrap.completion.as_ref() {
+        let recovered = match completion.recover_all().await {
+            Ok(results) => results,
+            Err(error) => {
+                bootstrap.runtime.set_phase(DaemonPhase::Degraded);
+                error!(error = %error, "startup completion recovery failed");
+                return;
+            }
+        };
+        let unresolved = recovered
+            .iter()
+            .filter(|execution| execution.status != CompletionExecutionStatus::Finished)
+            .count();
+        if unresolved > 0 {
+            bootstrap.runtime.set_phase(DaemonPhase::Degraded);
+            warn!(
+                unresolved,
+                "one or more durable completions remain unresolved after observation-first recovery"
+            );
+            return;
+        }
+        if !recovered.is_empty() {
+            info!(
+                recovered = recovered.len(),
+                "startup durable completion recovery completed"
             );
         }
     }
