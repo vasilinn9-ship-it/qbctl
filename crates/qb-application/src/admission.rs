@@ -792,11 +792,27 @@ fn capacity_key_order(left: &str, right: &str) -> std::cmp::Ordering {
 
 #[cfg(test)]
 mod tests {
-    use qb_domain::torrent::{ManifestFile, TorrentIdentity, TorrentManifest, TorrentMetainfo};
+    use std::{
+        collections::VecDeque,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Mutex,
+        },
+    };
 
-    use crate::storage::{
-        FileEvidence, FileIdentity, IncomingCandidate, IncomingFileSnapshot, IncomingScan,
-        StorageVolumeStatus,
+    use qb_domain::torrent::{
+        ManifestFile, TorrentId, TorrentIdentity, TorrentManifest, TorrentMetainfo,
+    };
+
+    use crate::{
+        storage::{
+            FileEvidence, FileIdentity, IncomingCandidate, IncomingFileSnapshot, IncomingScan,
+            StorageVolumeStatus,
+        },
+        torrent::{
+            EffectFuture, FileObservation, NetworkPreferences, PortFuture, QbitProbe,
+            QueueSettings, TorrentView, TrackerEvidence, TransferInfo,
+        },
     };
 
     use super::*;
@@ -840,6 +856,678 @@ mod tests {
                 "capacity planning must not reread Incoming",
             ))
         }
+    }
+
+    #[derive(Default)]
+    struct FakeAdmissionJournal {
+        state: Mutex<FakeAdmissionState>,
+    }
+
+    #[derive(Default)]
+    struct FakeAdmissionState {
+        fingerprint: Option<[u8; 32]>,
+        record: Option<AdmissionRecord>,
+    }
+
+    impl FakeAdmissionJournal {
+        fn update(
+            &self,
+            expected: &[MutationDisposition],
+            next: MutationDisposition,
+            checkpoint: &str,
+            pending_effect_kind: Option<&str>,
+            problem_code: Option<&str>,
+            reservation_active: Option<bool>,
+        ) -> Result<AdmissionRecord, PortError> {
+            let mut state = self.state.lock().expect("journal mutex");
+            let record = state
+                .record
+                .as_mut()
+                .ok_or_else(|| PortError::new("OPERATION_NOT_FOUND", "missing fake admission"))?;
+            if !expected.contains(&record.disposition) {
+                return Err(PortError::new(
+                    "OPERATION_TRANSITION_INVALID",
+                    "unexpected fake admission disposition",
+                ));
+            }
+            record.disposition = next;
+            record.checkpoint = checkpoint.into();
+            record.pending_effect_kind = pending_effect_kind.map(str::to_string);
+            record.problem_code = problem_code.map(str::to_string);
+            record.revision += 1;
+            if let Some(active) = reservation_active {
+                record.reservation_active = active;
+            }
+            Ok(record.clone())
+        }
+    }
+
+    impl AdmissionJournal for FakeAdmissionJournal {
+        fn reserve_admission(
+            &self,
+            request: &AdmissionReservationRequest,
+        ) -> Result<AdmissionReservationResult, PortError> {
+            let mut state = self.state.lock().expect("journal mutex");
+            let fingerprint = request.fingerprint();
+            if let Some(record) = state.record.clone() {
+                if state.fingerprint == Some(fingerprint) {
+                    return Ok(AdmissionReservationResult::Replay(record));
+                }
+                return Ok(AdmissionReservationResult::Conflict {
+                    operation_id: record.operation_id,
+                });
+            }
+
+            let record = AdmissionRecord {
+                request_id: request.request_id.clone(),
+                operation_id: OperationId::new("operation-1").expect("operation id"),
+                registry_id: "registry-1".into(),
+                identity: request.identity.clone(),
+                source_relative: request.source_relative.clone(),
+                source_evidence: request.source_evidence.clone(),
+                source_metainfo_digest: request.source_metainfo_digest,
+                working_volume_id: request.working_volume_id,
+                reserved_bytes: request.reserved_bytes,
+                working_save_path: request.working_save_path.clone(),
+                reservation_active: true,
+                checkpoint: "prepared".into(),
+                disposition: MutationDisposition::Prepared,
+                pending_effect_kind: None,
+                problem_code: None,
+                revision: 1,
+            };
+            state.fingerprint = Some(fingerprint);
+            state.record = Some(record.clone());
+            Ok(AdmissionReservationResult::New(record))
+        }
+
+        fn get_admission(
+            &self,
+            operation_id: &OperationId,
+        ) -> Result<Option<AdmissionRecord>, PortError> {
+            let state = self.state.lock().expect("journal mutex");
+            Ok(state
+                .record
+                .as_ref()
+                .filter(|record| &record.operation_id == operation_id)
+                .cloned())
+        }
+
+        fn list_recoverable_admissions(&self) -> Result<Vec<AdmissionRecord>, PortError> {
+            let state = self.state.lock().expect("journal mutex");
+            Ok(state
+                .record
+                .as_ref()
+                .filter(|record| {
+                    matches!(
+                        record.disposition,
+                        MutationDisposition::Prepared
+                            | MutationDisposition::EffectPending
+                            | MutationDisposition::ObservedApplied
+                            | MutationDisposition::Unknown
+                    )
+                })
+                .cloned()
+                .into_iter()
+                .collect())
+        }
+
+        fn capacity_reservations(
+            &self,
+            working_volume_id: u64,
+        ) -> Result<Vec<CapacityReservation>, PortError> {
+            let state = self.state.lock().expect("journal mutex");
+            Ok(state
+                .record
+                .as_ref()
+                .filter(|record| {
+                    record.reservation_active && record.working_volume_id == working_volume_id
+                })
+                .map(|record| {
+                    vec![CapacityReservation {
+                        responsible: record.operation_id.to_string(),
+                        volume_id: record.working_volume_id,
+                        bytes: record.reserved_bytes,
+                    }]
+                })
+                .unwrap_or_default())
+        }
+
+        fn mark_admission_effect_pending(
+            &self,
+            _operation_id: &OperationId,
+        ) -> Result<AdmissionRecord, PortError> {
+            self.update(
+                &[MutationDisposition::Prepared],
+                MutationDisposition::EffectPending,
+                "effect_pending",
+                Some("qbit.add"),
+                None,
+                None,
+            )
+        }
+
+        fn mark_admission_not_submitted(
+            &self,
+            _operation_id: &OperationId,
+            problem_code: &str,
+        ) -> Result<AdmissionRecord, PortError> {
+            self.update(
+                &[MutationDisposition::Prepared],
+                MutationDisposition::Blocked,
+                "not_submitted",
+                None,
+                Some(problem_code),
+                None,
+            )
+        }
+
+        fn mark_admission_retry_ready(
+            &self,
+            _operation_id: &OperationId,
+        ) -> Result<AdmissionRecord, PortError> {
+            let state = self.state.lock().expect("journal mutex");
+            let current = state
+                .record
+                .as_ref()
+                .map(|record| record.disposition)
+                .ok_or_else(|| PortError::new("OPERATION_NOT_FOUND", "missing fake admission"))?;
+            drop(state);
+            let checkpoint = if current == MutationDisposition::Blocked {
+                "retry_ready"
+            } else {
+                "observed_not_applied"
+            };
+            self.update(
+                &[
+                    MutationDisposition::Blocked,
+                    MutationDisposition::EffectPending,
+                    MutationDisposition::Unknown,
+                ],
+                MutationDisposition::Prepared,
+                checkpoint,
+                None,
+                None,
+                None,
+            )
+        }
+
+        fn mark_admission_unknown(
+            &self,
+            _operation_id: &OperationId,
+            problem_code: &str,
+        ) -> Result<AdmissionRecord, PortError> {
+            self.update(
+                &[MutationDisposition::EffectPending],
+                MutationDisposition::Unknown,
+                "unknown",
+                Some("qbit.add"),
+                Some(problem_code),
+                None,
+            )
+        }
+
+        fn mark_admission_observed_applied(
+            &self,
+            _operation_id: &OperationId,
+        ) -> Result<AdmissionRecord, PortError> {
+            self.update(
+                &[
+                    MutationDisposition::EffectPending,
+                    MutationDisposition::Unknown,
+                ],
+                MutationDisposition::ObservedApplied,
+                "observed_applied",
+                Some("qbit.add"),
+                None,
+                None,
+            )
+        }
+
+        fn finish_admission(
+            &self,
+            _operation_id: &OperationId,
+        ) -> Result<AdmissionRecord, PortError> {
+            self.update(
+                &[MutationDisposition::ObservedApplied],
+                MutationDisposition::Finished,
+                "finished",
+                None,
+                None,
+                None,
+            )
+        }
+
+        fn mark_admission_failed(
+            &self,
+            _operation_id: &OperationId,
+            problem_code: &str,
+        ) -> Result<AdmissionRecord, PortError> {
+            self.update(
+                &[MutationDisposition::EffectPending],
+                MutationDisposition::Failed,
+                "failed",
+                Some("qbit.add"),
+                Some(problem_code),
+                Some(false),
+            )
+        }
+    }
+
+    struct FakeAdmissionStorage {
+        snapshot: IncomingFileSnapshot,
+        volume_id: u64,
+        free_bytes: u64,
+        root: String,
+    }
+
+    impl Storage for FakeAdmissionStorage {
+        fn volume_status(&self, root: ManagedRoot) -> Result<StorageVolumeStatus, PortError> {
+            assert_eq!(root, ManagedRoot::Working);
+            Ok(StorageVolumeStatus {
+                root,
+                volume_id: self.volume_id,
+                free_bytes: self.free_bytes,
+                total_bytes: self.free_bytes.saturating_mul(2),
+            })
+        }
+
+        fn root_path(&self, root: ManagedRoot) -> Result<String, PortError> {
+            assert_eq!(root, ManagedRoot::Working);
+            Ok(self.root.clone())
+        }
+
+        fn matches_root_path(&self, root: ManagedRoot, observed: &str) -> Result<bool, PortError> {
+            Ok(self.root_path(root)?.eq_ignore_ascii_case(observed))
+        }
+
+        fn list_incoming(&self) -> Result<Vec<String>, PortError> {
+            Ok(vec![self.snapshot.relative_path.clone()])
+        }
+
+        fn read_incoming(
+            &self,
+            relative_path: &str,
+            _max_bytes: usize,
+        ) -> Result<IncomingFileSnapshot, PortError> {
+            if relative_path != self.snapshot.relative_path {
+                return Err(PortError::new("STORAGE_NOT_FOUND", relative_path));
+            }
+            Ok(self.snapshot.clone())
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum FakeAddEffect {
+        Accepted,
+        Uncertain,
+    }
+
+    struct FakeTorrentClient {
+        observations: Mutex<VecDeque<Result<Option<TorrentView>, PortError>>>,
+        effect: FakeAddEffect,
+        add_calls: AtomicUsize,
+    }
+
+    impl FakeTorrentClient {
+        fn new(
+            observations: Vec<Result<Option<TorrentView>, PortError>>,
+            effect: FakeAddEffect,
+        ) -> Self {
+            Self {
+                observations: Mutex::new(observations.into()),
+                effect,
+                add_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl TorrentClient for FakeTorrentClient {
+        fn probe(&self) -> PortFuture<'_, QbitProbe> {
+            Box::pin(async {
+                Ok(QbitProbe {
+                    application_version: "v5.2.3".into(),
+                    webapi_version: "2.16.1".into(),
+                    mutation_ready: true,
+                })
+            })
+        }
+
+        fn list(&self) -> PortFuture<'_, Vec<TorrentView>> {
+            Box::pin(async { Err(unused_client_call()) })
+        }
+
+        fn get<'a>(&'a self, _id: &'a TorrentId) -> PortFuture<'a, Option<TorrentView>> {
+            Box::pin(async move {
+                self.observations
+                    .lock()
+                    .expect("observations mutex")
+                    .pop_front()
+                    .unwrap_or(Ok(None))
+            })
+        }
+
+        fn transfer_info(&self) -> PortFuture<'_, TransferInfo> {
+            Box::pin(async { Err(unused_client_call()) })
+        }
+
+        fn queue_settings(&self) -> PortFuture<'_, QueueSettings> {
+            Box::pin(async { Err(unused_client_call()) })
+        }
+
+        fn network_preferences(&self) -> PortFuture<'_, NetworkPreferences> {
+            Box::pin(async { Err(unused_client_call()) })
+        }
+
+        fn trackers<'a>(&'a self, _id: &'a TorrentId) -> PortFuture<'a, Vec<TrackerEvidence>> {
+            Box::pin(async { Err(unused_client_call()) })
+        }
+
+        fn files<'a>(&'a self, _id: &'a TorrentId) -> PortFuture<'a, Vec<FileObservation>> {
+            Box::pin(async { Err(unused_client_call()) })
+        }
+
+        fn add_torrent<'a>(&'a self, _request: &'a AddTorrentRequest) -> EffectFuture<'a> {
+            Box::pin(async move {
+                self.add_calls.fetch_add(1, Ordering::SeqCst);
+                match self.effect {
+                    FakeAddEffect::Accepted => EffectAttempt::Accepted,
+                    FakeAddEffect::Uncertain => EffectAttempt::Uncertain(PortError::new(
+                        "QBIT_MUTATION_UNCERTAIN",
+                        "fixture response dropped after send",
+                    )),
+                }
+            })
+        }
+
+        fn stop<'a>(&'a self, _id: &'a TorrentId) -> EffectFuture<'a> {
+            Box::pin(async { EffectAttempt::NotSent(unused_client_call()) })
+        }
+
+        fn start<'a>(&'a self, _id: &'a TorrentId) -> EffectFuture<'a> {
+            Box::pin(async { EffectAttempt::NotSent(unused_client_call()) })
+        }
+
+        fn set_active_downloads(&self, _value: u32) -> EffectFuture<'_> {
+            Box::pin(async { EffectAttempt::NotSent(unused_client_call()) })
+        }
+
+        fn set_download_limit(&self, _bytes_per_sec: u64) -> EffectFuture<'_> {
+            Box::pin(async { EffectAttempt::NotSent(unused_client_call()) })
+        }
+
+        fn set_upload_limit(&self, _bytes_per_sec: u64) -> EffectFuture<'_> {
+            Box::pin(async { EffectAttempt::NotSent(unused_client_call()) })
+        }
+    }
+
+    fn unused_client_call() -> PortError {
+        PortError::new(
+            "INTERNAL_INVARIANT_VIOLATION",
+            "unexpected fake TorrentClient call",
+        )
+    }
+
+    fn admission_fixture() -> (
+        AdmissionReservationRequest,
+        IncomingFileSnapshot,
+        TorrentId,
+    ) {
+        let bytes = b"d4:infod4:name4:testee".to_vec();
+        let source_evidence = FileEvidence {
+            identity: FileIdentity {
+                volume_id: 3,
+                file_id: 5,
+            },
+            size: u64::try_from(bytes.len()).expect("fixture size"),
+            modified_marker: 7,
+        };
+        let identity = TorrentIdentity::new(Some([0x11; 20]), None).expect("identity");
+        let selector = identity.qbit_selector_ids().remove(0);
+        let request = AdmissionReservationRequest {
+            request_id: RequestId::new("admission-service-1").expect("request id"),
+            identity,
+            source_relative: "candidate.torrent".into(),
+            source_evidence: source_evidence.clone(),
+            source_metainfo_digest: Sha256::digest(&bytes).into(),
+            working_volume_id: 9,
+            reserved_bytes: 100,
+            working_save_path: r"C:\Managed\Working".into(),
+        };
+        let snapshot = IncomingFileSnapshot {
+            relative_path: request.source_relative.clone(),
+            evidence: source_evidence,
+            bytes,
+        };
+        (request, snapshot, selector)
+    }
+
+    fn torrent_view(id: TorrentId, state: TorrentState, save_path: &str) -> TorrentView {
+        TorrentView {
+            id,
+            name: "fixture".into(),
+            save_path: save_path.into(),
+            state,
+            total_bytes: 100,
+            remaining_bytes: 100,
+            download_rate_bps: 0,
+            upload_rate_bps: 0,
+            progress_ppm: 0,
+            availability: None,
+            peers_connected: 0,
+            peers_known: 0,
+            seeds_connected: 0,
+            seeds_known: 0,
+        }
+    }
+
+    fn admission_execution_result(result: AdmissionExecutionResult) -> AdmissionExecution {
+        match result {
+            AdmissionExecutionResult::Execution(execution) => *execution,
+            AdmissionExecutionResult::Conflict { operation_id } => {
+                panic!("unexpected conflict: {operation_id}")
+            }
+        }
+    }
+
+    fn admission_service(
+        journal: Arc<FakeAdmissionJournal>,
+        storage: Arc<FakeAdmissionStorage>,
+        client: Arc<FakeTorrentClient>,
+        reserve_bytes: u64,
+    ) -> AdmissionService {
+        AdmissionService::new(journal, storage, client, 1024, reserve_bytes)
+            .with_observation_policy(3, Duration::ZERO)
+    }
+
+
+    #[tokio::test]
+    async fn admission_source_change_blocks_before_qbit_effect() {
+        let (request, mut snapshot, _) = admission_fixture();
+        snapshot.evidence.modified_marker += 1;
+        let journal = Arc::new(FakeAdmissionJournal::default());
+        let storage = Arc::new(FakeAdmissionStorage {
+            snapshot,
+            volume_id: request.working_volume_id,
+            free_bytes: 10_000,
+            root: request.working_save_path.clone(),
+        });
+        let client = Arc::new(FakeTorrentClient::new(
+            Vec::new(),
+            FakeAddEffect::Accepted,
+        ));
+        let service = admission_service(journal, storage, client.clone(), 10);
+
+        let execution =
+            admission_execution_result(service.execute(&request).await.expect("execute"));
+
+        assert_eq!(execution.status, AdmissionExecutionStatus::Blocked);
+        assert_eq!(execution.record.checkpoint, "not_submitted");
+        assert_eq!(
+            execution.problem.as_ref().map(|problem| problem.code),
+            Some("SOURCE_AMBIGUOUS")
+        );
+        assert_eq!(client.add_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn admission_low_space_race_blocks_before_qbit_effect() {
+        let (request, snapshot, _) = admission_fixture();
+        let journal = Arc::new(FakeAdmissionJournal::default());
+        let storage = Arc::new(FakeAdmissionStorage {
+            snapshot,
+            volume_id: request.working_volume_id,
+            free_bytes: request.reserved_bytes + 9,
+            root: request.working_save_path.clone(),
+        });
+        let client = Arc::new(FakeTorrentClient::new(
+            Vec::new(),
+            FakeAddEffect::Accepted,
+        ));
+        let service = admission_service(journal, storage, client.clone(), 10);
+
+        let execution =
+            admission_execution_result(service.execute(&request).await.expect("execute"));
+
+        assert_eq!(execution.status, AdmissionExecutionStatus::Blocked);
+        assert_eq!(
+            execution.problem.as_ref().map(|problem| problem.code),
+            Some("INSUFFICIENT_CAPACITY")
+        );
+        assert_eq!(client.add_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn admission_timeout_after_send_becomes_unknown() {
+        let (request, snapshot, _) = admission_fixture();
+        let journal = Arc::new(FakeAdmissionJournal::default());
+        let storage = Arc::new(FakeAdmissionStorage {
+            snapshot,
+            volume_id: request.working_volume_id,
+            free_bytes: 10_000,
+            root: request.working_save_path.clone(),
+        });
+        let client = Arc::new(FakeTorrentClient::new(
+            vec![Ok(None)],
+            FakeAddEffect::Uncertain,
+        ));
+        let service = admission_service(journal, storage, client.clone(), 10);
+
+        let execution =
+            admission_execution_result(service.execute(&request).await.expect("execute"));
+
+        assert_eq!(execution.status, AdmissionExecutionStatus::Unknown);
+        assert_eq!(execution.record.disposition, MutationDisposition::Unknown);
+        assert_eq!(
+            execution.record.pending_effect_kind.as_deref(),
+            Some("qbit.add")
+        );
+        assert_eq!(client.add_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn admission_acceptance_waits_through_checking_for_stopped_receipt() {
+        let (request, snapshot, selector) = admission_fixture();
+        let journal = Arc::new(FakeAdmissionJournal::default());
+        let storage = Arc::new(FakeAdmissionStorage {
+            snapshot,
+            volume_id: request.working_volume_id,
+            free_bytes: 10_000,
+            root: request.working_save_path.clone(),
+        });
+        let client = Arc::new(FakeTorrentClient::new(
+            vec![
+                Ok(None),
+                Ok(Some(torrent_view(
+                    selector.clone(),
+                    TorrentState::Checking,
+                    &request.working_save_path,
+                ))),
+                Ok(Some(torrent_view(
+                    selector,
+                    TorrentState::Stopped,
+                    &request.working_save_path,
+                ))),
+            ],
+            FakeAddEffect::Accepted,
+        ));
+        let service = admission_service(journal, storage, client.clone(), 10);
+
+        let execution =
+            admission_execution_result(service.execute(&request).await.expect("execute"));
+
+        assert_eq!(execution.status, AdmissionExecutionStatus::Finished);
+        assert_eq!(execution.record.disposition, MutationDisposition::Finished);
+        assert_eq!(client.add_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn admission_restart_observes_effect_pending_without_duplicate_add() {
+        let (request, snapshot, selector) = admission_fixture();
+        let journal = Arc::new(FakeAdmissionJournal::default());
+        let reserved = match journal.reserve_admission(&request).expect("reserve") {
+            AdmissionReservationResult::New(record) => record,
+            other => panic!("unexpected reserve: {other:?}"),
+        };
+        journal
+            .mark_admission_effect_pending(&reserved.operation_id)
+            .expect("effect pending");
+
+        let storage = Arc::new(FakeAdmissionStorage {
+            snapshot,
+            volume_id: request.working_volume_id,
+            free_bytes: 10_000,
+            root: request.working_save_path.clone(),
+        });
+        let client = Arc::new(FakeTorrentClient::new(
+            vec![Ok(Some(torrent_view(
+                selector,
+                TorrentState::Stopped,
+                &request.working_save_path,
+            )))],
+            FakeAddEffect::Accepted,
+        ));
+        let service = admission_service(journal, storage, client.clone(), 10);
+
+        let executions = service.recover_all().await.expect("recover");
+
+        assert_eq!(executions.len(), 1);
+        assert_eq!(executions[0].status, AdmissionExecutionStatus::Finished);
+        assert_eq!(client.add_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn admission_restart_keeps_unknown_absent_without_blind_retry() {
+        let (request, snapshot, _) = admission_fixture();
+        let journal = Arc::new(FakeAdmissionJournal::default());
+        let reserved = match journal.reserve_admission(&request).expect("reserve") {
+            AdmissionReservationResult::New(record) => record,
+            other => panic!("unexpected reserve: {other:?}"),
+        };
+        journal
+            .mark_admission_effect_pending(&reserved.operation_id)
+            .expect("effect pending");
+        journal
+            .mark_admission_unknown(&reserved.operation_id, "QBIT_MUTATION_UNCERTAIN")
+            .expect("unknown");
+
+        let storage = Arc::new(FakeAdmissionStorage {
+            snapshot,
+            volume_id: request.working_volume_id,
+            free_bytes: 10_000,
+            root: request.working_save_path.clone(),
+        });
+        let client = Arc::new(FakeTorrentClient::new(
+            vec![Ok(None), Ok(None), Ok(None)],
+            FakeAddEffect::Accepted,
+        ));
+        let service = admission_service(journal, storage, client.clone(), 10);
+
+        let executions = service.recover_all().await.expect("recover");
+
+        assert_eq!(executions.len(), 1);
+        assert_eq!(executions[0].status, AdmissionExecutionStatus::Unknown);
+        assert_eq!(client.add_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
