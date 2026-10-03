@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use qb_domain::torrent::TorrentMetainfo;
 use sha2::{Digest, Sha256};
@@ -51,8 +51,17 @@ pub struct IncomingRejection {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IncomingRedundantCopy {
+    pub canonical_path: String,
+    pub redundant_path: String,
+    pub source_evidence: FileEvidence,
+    pub torrent_identity: qb_domain::torrent::TorrentIdentity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IncomingScan {
     pub eligible: Vec<IncomingCandidate>,
+    pub redundant_identical: Vec<IncomingRedundantCopy>,
     pub rejected: Vec<IncomingRejection>,
 }
 
@@ -108,7 +117,208 @@ impl IncomingScanService {
             });
         }
 
-        Ok(IncomingScan { eligible, rejected })
+        let (eligible, redundant_identical, duplicate_rejections) =
+            self.reconcile_duplicates(eligible, max_metainfo_bytes);
+        rejected.extend(duplicate_rejections);
+
+        Ok(IncomingScan {
+            eligible,
+            redundant_identical,
+            rejected,
+        })
+    }
+
+    fn reconcile_duplicates(
+        &self,
+        candidates: Vec<IncomingCandidate>,
+        max_metainfo_bytes: usize,
+    ) -> (
+        Vec<IncomingCandidate>,
+        Vec<IncomingRedundantCopy>,
+        Vec<IncomingRejection>,
+    ) {
+        let groups = identity_groups(&candidates);
+        let mut eligible = Vec::new();
+        let mut redundant = Vec::new();
+        let mut rejected = Vec::new();
+
+        for mut group in groups {
+            group.sort_by(|left, right| {
+                path_order(
+                    &candidates[*left].relative_path,
+                    &candidates[*right].relative_path,
+                )
+            });
+
+            if group.len() == 1 {
+                eligible.push(candidates[group[0]].clone());
+                continue;
+            }
+
+            let canonical = &candidates[group[0]];
+            let canonical_snapshot = match self
+                .storage
+                .read_incoming(&canonical.relative_path, max_metainfo_bytes)
+            {
+                Ok(snapshot) if snapshot_matches(canonical, &snapshot) => snapshot,
+                Ok(_) => {
+                    reject_group_as_ambiguous(
+                        &mut rejected,
+                        &candidates,
+                        &group,
+                        "canonical Incoming source changed after scan",
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    reject_group_as_ambiguous(
+                        &mut rejected,
+                        &candidates,
+                        &group,
+                        &format!(
+                            "canonical Incoming source could not be re-read: {}",
+                            error.code
+                        ),
+                    );
+                    continue;
+                }
+            };
+
+            let mut conflict = false;
+            let mut ambiguous = None;
+            for index in group.iter().copied().skip(1) {
+                let candidate = &candidates[index];
+                if candidate.source_sha256 != canonical.source_sha256 {
+                    conflict = true;
+                    break;
+                }
+
+                match self
+                    .storage
+                    .read_incoming(&candidate.relative_path, max_metainfo_bytes)
+                {
+                    Ok(snapshot)
+                        if snapshot_matches(candidate, &snapshot)
+                            && snapshot.bytes == canonical_snapshot.bytes => {}
+                    Ok(snapshot) if !snapshot_matches(candidate, &snapshot) => {
+                        ambiguous = Some(format!(
+                            "Incoming source changed after scan: {}",
+                            candidate.relative_path
+                        ));
+                        break;
+                    }
+                    Ok(_) => {
+                        conflict = true;
+                        break;
+                    }
+                    Err(error) => {
+                        ambiguous = Some(format!(
+                            "Incoming source could not be re-read: {} ({})",
+                            candidate.relative_path, error.code
+                        ));
+                        break;
+                    }
+                }
+            }
+
+            if let Some(message) = ambiguous {
+                reject_group_as_ambiguous(&mut rejected, &candidates, &group, &message);
+                continue;
+            }
+            if conflict {
+                for index in group {
+                    rejected.push(IncomingRejection {
+                        relative_path: candidates[index].relative_path.clone(),
+                        problem_code: "IDENTITY_CONTENT_CONFLICT",
+                        message:
+                            "same torrent identity is represented by different Incoming bytes"
+                                .into(),
+                    });
+                }
+                continue;
+            }
+
+            eligible.push(canonical.clone());
+            for index in group.into_iter().skip(1) {
+                let candidate = &candidates[index];
+                redundant.push(IncomingRedundantCopy {
+                    canonical_path: canonical.relative_path.clone(),
+                    redundant_path: candidate.relative_path.clone(),
+                    source_evidence: candidate.source_evidence.clone(),
+                    torrent_identity: candidate.metainfo.identity.clone(),
+                });
+            }
+        }
+
+        eligible.sort_by(|left, right| path_order(&left.relative_path, &right.relative_path));
+        redundant.sort_by(|left, right| path_order(&left.redundant_path, &right.redundant_path));
+        rejected.sort_by(|left, right| path_order(&left.relative_path, &right.relative_path));
+        (eligible, redundant, rejected)
+    }
+}
+
+fn snapshot_matches(candidate: &IncomingCandidate, snapshot: &IncomingFileSnapshot) -> bool {
+    candidate.relative_path == snapshot.relative_path
+        && candidate.source_evidence == snapshot.evidence
+        && candidate.source_sha256 == Sha256::digest(&snapshot.bytes).into()
+}
+
+fn reject_group_as_ambiguous(
+    rejected: &mut Vec<IncomingRejection>,
+    candidates: &[IncomingCandidate],
+    group: &[usize],
+    message: &str,
+) {
+    for index in group {
+        rejected.push(IncomingRejection {
+            relative_path: candidates[*index].relative_path.clone(),
+            problem_code: "SOURCE_AMBIGUOUS",
+            message: message.to_string(),
+        });
+    }
+}
+
+fn path_order(left: &str, right: &str) -> std::cmp::Ordering {
+    left.to_ascii_lowercase()
+        .cmp(&right.to_ascii_lowercase())
+        .then_with(|| left.cmp(right))
+}
+
+fn identity_groups(candidates: &[IncomingCandidate]) -> Vec<Vec<usize>> {
+    let mut parent: Vec<usize> = (0..candidates.len()).collect();
+
+    for left in 0..candidates.len() {
+        for right in (left + 1)..candidates.len() {
+            if candidates[left]
+                .metainfo
+                .identity
+                .shares_alias_with(&candidates[right].metainfo.identity)
+            {
+                union(&mut parent, left, right);
+            }
+        }
+    }
+
+    let mut groups = BTreeMap::<usize, Vec<usize>>::new();
+    for index in 0..candidates.len() {
+        let root = find(&mut parent, index);
+        groups.entry(root).or_default().push(index);
+    }
+    groups.into_values().collect()
+}
+
+fn find(parent: &mut [usize], index: usize) -> usize {
+    if parent[index] != index {
+        parent[index] = find(parent, parent[index]);
+    }
+    parent[index]
+}
+
+fn union(parent: &mut [usize], left: usize, right: usize) {
+    let left_root = find(parent, left);
+    let right_root = find(parent, right);
+    if left_root != right_root {
+        parent[right_root] = left_root;
     }
 }
 
@@ -152,8 +362,17 @@ mod tests {
                 return Err(PortError::new("METAINFO_INVALID", "bad fixture"));
             }
 
+            let identity = match bytes {
+                b"v1" => TorrentIdentity::new(Some([0x11; 20]), None),
+                b"hybrid" => TorrentIdentity::new(Some([0x11; 20]), Some([0x22; 32])),
+                b"v2" => TorrentIdentity::new(None, Some([0x22; 32])),
+                b"unrelated" => TorrentIdentity::new(Some([0x33; 20]), None),
+                _ => TorrentIdentity::new(Some([0x44; 20]), None),
+            }
+            .expect("fixture identity");
+
             Ok(TorrentMetainfo {
-                identity: TorrentIdentity::new(Some([0x11; 20]), None).expect("fixture identity"),
+                identity,
                 manifest: TorrentManifest::new(vec![ManifestFile {
                     path: "payload.bin".into(),
                     size: 4,
@@ -179,6 +398,70 @@ mod tests {
     }
 
     #[test]
+    fn incoming_scan_selects_deterministic_canonical_for_exact_duplicates() {
+        let storage = Arc::new(FakeStorage {
+            files: vec![
+                snapshot("z.torrent", b"same", 1),
+                snapshot("A.torrent", b"same", 2),
+            ],
+        });
+        let service = IncomingScanService::new(storage, Arc::new(FakeMetainfoReader));
+
+        let scan = service.scan(1024).expect("scan");
+
+        assert_eq!(scan.eligible.len(), 1);
+        assert_eq!(scan.eligible[0].relative_path, "A.torrent");
+        assert_eq!(scan.redundant_identical.len(), 1);
+        assert_eq!(scan.redundant_identical[0].canonical_path, "A.torrent");
+        assert_eq!(scan.redundant_identical[0].redundant_path, "z.torrent");
+        assert!(scan.rejected.is_empty());
+    }
+
+    #[test]
+    fn incoming_scan_blocks_same_identity_when_bytes_differ() {
+        let storage = Arc::new(FakeStorage {
+            files: vec![
+                snapshot("a.torrent", b"first", 1),
+                snapshot("b.torrent", b"second", 2),
+            ],
+        });
+        let service = IncomingScanService::new(storage, Arc::new(FakeMetainfoReader));
+
+        let scan = service.scan(1024).expect("scan");
+
+        assert!(scan.eligible.is_empty());
+        assert!(scan.redundant_identical.is_empty());
+        assert_eq!(scan.rejected.len(), 2);
+        assert!(scan
+            .rejected
+            .iter()
+            .all(|entry| entry.problem_code == "IDENTITY_CONTENT_CONFLICT"));
+    }
+
+    #[test]
+    fn incoming_scan_groups_v1_v2_aliases_transitively_through_hybrid_identity() {
+        let storage = Arc::new(FakeStorage {
+            files: vec![
+                snapshot("a-v1.torrent", b"v1", 1),
+                snapshot("b-hybrid.torrent", b"hybrid", 2),
+                snapshot("c-v2.torrent", b"v2", 3),
+                snapshot("d-other.torrent", b"unrelated", 4),
+            ],
+        });
+        let service = IncomingScanService::new(storage, Arc::new(FakeMetainfoReader));
+
+        let scan = service.scan(1024).expect("scan");
+
+        assert_eq!(scan.eligible.len(), 1);
+        assert_eq!(scan.eligible[0].relative_path, "d-other.torrent");
+        assert_eq!(scan.rejected.len(), 3);
+        assert!(scan
+            .rejected
+            .iter()
+            .all(|entry| entry.problem_code == "IDENTITY_CONTENT_CONFLICT"));
+    }
+
+    #[test]
     fn incoming_scan_keeps_invalid_metainfo_as_per_candidate_rejection() {
         let storage = Arc::new(FakeStorage {
             files: vec![
@@ -193,6 +476,7 @@ mod tests {
         assert_eq!(scan.eligible.len(), 1);
         assert_eq!(scan.eligible[0].relative_path, "a.torrent");
         assert_ne!(scan.eligible[0].source_sha256, [0; 32]);
+        assert!(scan.redundant_identical.is_empty());
         assert_eq!(scan.rejected.len(), 1);
         assert_eq!(scan.rejected[0].relative_path, "b.torrent");
         assert_eq!(scan.rejected[0].problem_code, "METAINFO_INVALID");
