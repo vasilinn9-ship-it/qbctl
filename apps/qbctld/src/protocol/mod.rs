@@ -7,6 +7,7 @@ use std::{sync::Arc, time::Duration};
 use anyhow::{Context as _, Result};
 use prost::Message;
 use qb_application::{
+    completion::CompletionService,
     mutation::MutationService,
     storage::StorageStatusService,
     system::{RuntimeHealthPort, SystemService},
@@ -27,6 +28,7 @@ pub async fn serve_connection(
     storage: Option<Arc<StorageStatusService>>,
     torrents: Option<Arc<TorrentService>>,
     mutations: Arc<MutationService>,
+    completion: Option<Arc<CompletionService>>,
     qbit_startup_problem: Option<Arc<str>>,
 ) -> Result<()> {
     let handshake = timeout(
@@ -57,6 +59,7 @@ pub async fn serve_connection(
             storage.as_deref(),
             torrents.as_deref(),
             Some(mutations.as_ref()),
+            completion.as_deref(),
             mutation_admission_enabled,
             qbit_startup_problem.as_deref(),
         )
