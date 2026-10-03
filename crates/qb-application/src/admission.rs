@@ -306,10 +306,8 @@ impl AdmissionService {
                         let unknown = if record.disposition == MutationDisposition::Unknown {
                             record
                         } else {
-                            self.journal.mark_admission_unknown(
-                                &record.operation_id,
-                                problem.code,
-                            )?
+                            self.journal
+                                .mark_admission_unknown(&record.operation_id, problem.code)?
                         };
                         return Ok(admission_execution(
                             AdmissionExecutionStatus::Unknown,
@@ -404,10 +402,9 @@ impl AdmissionService {
                 ))
             }
             EffectAttempt::Uncertain(problem) => {
-                let unknown = self.journal.mark_admission_unknown(
-                    &pending.operation_id,
-                    "QBIT_MUTATION_UNCERTAIN",
-                )?;
+                let unknown = self
+                    .journal
+                    .mark_admission_unknown(&pending.operation_id, "QBIT_MUTATION_UNCERTAIN")?;
                 Ok(admission_execution(
                     AdmissionExecutionStatus::Unknown,
                     unknown,
@@ -444,10 +441,9 @@ impl AdmissionService {
                     ))
                 }
                 Err(problem) => {
-                    let unknown = self.journal.mark_admission_unknown(
-                        &pending.operation_id,
-                        "QBIT_MUTATION_UNCERTAIN",
-                    )?;
+                    let unknown = self
+                        .journal
+                        .mark_admission_unknown(&pending.operation_id, "QBIT_MUTATION_UNCERTAIN")?;
                     Ok(admission_execution(
                         AdmissionExecutionStatus::Unknown,
                         unknown,
