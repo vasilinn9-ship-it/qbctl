@@ -597,7 +597,7 @@ fn map_state(value: &str) -> TorrentState {
         }
         "stalledDL" => TorrentState::StalledDownloading,
         "queuedDL" => TorrentState::QueuedDownloading,
-        "pausedDL" | "pausedUP" => TorrentState::Stopped,
+        "pausedDL" | "pausedUP" | "stoppedDL" | "stoppedUP" => TorrentState::Stopped,
         "uploading" | "forcedUP" => TorrentState::Uploading,
         "stalledUP" => TorrentState::StalledUploading,
         "queuedUP" => TorrentState::QueuedUploading,
@@ -858,6 +858,9 @@ mod tests {
     #[test]
     fn qbit_state_mapping_is_normalized() {
         assert_eq!(map_state("pausedDL"), TorrentState::Stopped);
+        assert_eq!(map_state("pausedUP"), TorrentState::Stopped);
+        assert_eq!(map_state("stoppedDL"), TorrentState::Stopped);
+        assert_eq!(map_state("stoppedUP"), TorrentState::Stopped);
         assert_eq!(map_state("stalledDL"), TorrentState::StalledDownloading);
         assert_eq!(map_state("future-state"), TorrentState::Unknown);
     }
