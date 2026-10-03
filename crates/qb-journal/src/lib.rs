@@ -1645,7 +1645,7 @@ fn load_admission_record(
         Vec<u8>,
         Vec<u8>,
         String,
-        String,
+        Vec<u8>,
         String,
         Option<String>,
         Option<String>,

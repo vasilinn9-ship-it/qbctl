@@ -25,8 +25,6 @@ impl AdmissionReservationRequest {
     pub fn fingerprint(&self) -> [u8; 32] {
         let mut digest = Sha256::new();
         digest.update(b"qbctl-admission-fingerprint-v1\0");
-        digest.update(self.request_id.as_str().as_bytes());
-        digest.update([0]);
         if let Some(v1) = self.identity.v1 {
             digest.update(b"v1");
             digest.update(v1);
@@ -345,6 +343,9 @@ mod tests {
         changed.working_save_path.push_str("-other");
         assert_ne!(base.fingerprint(), changed.fingerprint());
 
+        let mut different_request = base.clone();
+        different_request.request_id = RequestId::new("admission-2").expect("request id");
+        assert_eq!(base.fingerprint(), different_request.fingerprint());
         assert_eq!(base.fingerprint(), base.fingerprint());
     }
 
