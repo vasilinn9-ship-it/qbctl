@@ -1,0 +1,73 @@
+syntax = "proto3";
+
+package qbctl.v1;
+
+enum TorrentStateView {
+  TORRENT_STATE_VIEW_UNSPECIFIED = 0;
+  TORRENT_STATE_VIEW_DOWNLOADING = 1;
+  TORRENT_STATE_VIEW_STALLED_DOWNLOADING = 2;
+  TORRENT_STATE_VIEW_QUEUED_DOWNLOADING = 3;
+  TORRENT_STATE_VIEW_CHECKING = 4;
+  TORRENT_STATE_VIEW_STOPPED = 5;
+  TORRENT_STATE_VIEW_UPLOADING = 6;
+  TORRENT_STATE_VIEW_STALLED_UPLOADING = 7;
+  TORRENT_STATE_VIEW_QUEUED_UPLOADING = 8;
+  TORRENT_STATE_VIEW_ERROR = 9;
+  TORRENT_STATE_VIEW_UNKNOWN = 10;
+}
+
+message TorrentSummary {
+  string id = 1;
+  string name = 2;
+  TorrentStateView state = 3;
+  uint64 total_bytes = 4;
+  uint64 remaining_bytes = 5;
+  uint64 download_rate_bps = 6;
+  uint64 upload_rate_bps = 7;
+  uint32 progress_ppm = 8;
+  optional double availability = 9;
+  uint64 peers_connected = 10;
+  uint64 peers_known = 11;
+  uint64 seeds_connected = 12;
+  uint64 seeds_known = 13;
+}
+
+message TorrentListRequest {}
+
+message TorrentListResponse {
+  repeated TorrentSummary torrents = 1;
+}
+
+message TorrentGetRequest {
+  string torrent_id = 1;
+}
+
+message TorrentGetResponse {
+  TorrentSummary torrent = 1;
+}
+
+message QueueGetRequest {}
+
+message QueueSettingsResponse {
+  bool queueing_enabled = 1;
+  sint64 max_active_downloads = 2;
+  sint64 max_active_torrents = 3;
+  bool dont_count_slow_torrents = 4;
+}
+
+message TransferLimitsGetRequest {}
+
+message TransferLimitsResponse {
+  uint64 download_limit_bps = 1;
+  uint64 upload_limit_bps = 2;
+  uint64 observed_download_rate_bps = 3;
+  uint64 observed_upload_rate_bps = 4;
+}
+
+message QbitProbeRequest {}
+
+message QbitProbeResponse {
+  string application_version = 1;
+  string webapi_version = 2;
+  bool mutation_ready = 3;
+}
