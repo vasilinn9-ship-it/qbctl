@@ -1,6 +1,5 @@
 use std::{
-    fs,
-    io,
+    fs, io,
     path::{Component, Path, PathBuf},
 };
 
@@ -23,7 +22,7 @@ impl ManagedRelativePath {
         if value.is_empty() {
             return Err(StorageError::RelativePathEmpty);
         }
-        if value.starts_with(['/', '\\']) || looks_drive_relative(value) {
+        if value.starts_with('/') || value.starts_with('\\') || looks_drive_relative(value) {
             return Err(StorageError::RelativePathAbsolute(value.to_string()));
         }
 
@@ -156,7 +155,7 @@ fn validate_relative_component(component: &str) -> Result<(), StorageError> {
             component.to_string(),
         ));
     }
-    if component.ends_with([' ', '.']) {
+    if component.ends_with(' ') || component.ends_with('.') {
         return Err(StorageError::InvalidRelativeComponent(
             component.to_string(),
         ));
@@ -192,18 +191,22 @@ fn is_reserved_device_name(component: &str) -> bool {
 }
 
 fn reserved_numbered_device(value: &str, prefix: &str) -> bool {
-    value
-        .strip_prefix(prefix)
-        .is_some_and(|suffix| matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"))
+    value.strip_prefix(prefix).is_some_and(|suffix| {
+        matches!(
+            suffix,
+            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+        )
+    })
 }
 
 fn validate_root(role: ManagedRootRole, path: &Path) -> Result<PathBuf, StorageError> {
     if !path.is_absolute() {
         return Err(StorageError::RootNotAbsolute { role });
     }
-    if path.components().any(|component| {
-        matches!(component, Component::CurDir | Component::ParentDir)
-    }) {
+    if path
+        .components()
+        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
         return Err(StorageError::RootContainsTraversal { role });
     }
 
@@ -270,7 +273,7 @@ fn is_reparse_metadata(metadata: &fs::Metadata) -> bool {
 
 #[cfg(windows)]
 fn ensure_local_fixed_volume(role: ManagedRootRole, path: &Path) -> Result<(), StorageError> {
-    use std::{ffi::OsString, os::windows::ffi::OsStringExt, path::Prefix};
+    use std::path::Prefix;
 
     use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, DRIVE_FIXED};
 
@@ -293,8 +296,7 @@ fn ensure_local_fixed_volume(role: ManagedRootRole, path: &Path) -> Result<(), S
         }
     };
 
-    let root = OsString::from_wide(&[u16::from(letter), b':' as u16, b'\\' as u16, 0]);
-    let wide: Vec<u16> = root.encode_wide().collect();
+    let wide = [u16::from(letter), b':' as u16, b'\\' as u16, 0];
     let drive_type = unsafe { GetDriveTypeW(wide.as_ptr()) };
     if drive_type != DRIVE_FIXED {
         return Err(StorageError::RootNotLocalFixedVolume {
@@ -316,7 +318,22 @@ fn roots_overlap(first: &Path, second: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    static NEXT_TEMP_ROOT: AtomicU64 = AtomicU64::new(1);
+
+    fn temp_root(label: &str) -> PathBuf {
+        let sequence = NEXT_TEMP_ROOT.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "qbctl-storage-{label}-{}-{sequence}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("temp root");
+        path
+    }
 
     #[test]
     fn managed_relative_path_normalizes_mixed_separators() {
@@ -359,12 +376,12 @@ mod tests {
 
     #[test]
     fn managed_root_layout_rejects_overlap() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let incoming = temp.path().join("incoming");
-        let archive = temp.path().join("archive");
+        let temp = temp_root("overlap");
+        let incoming = temp.join("incoming");
+        let archive = temp.join("archive");
         let working = incoming.join("working");
-        let completed = temp.path().join("completed");
-        let runtime = temp.path().join("runtime");
+        let completed = temp.join("completed");
+        let runtime = temp.join("runtime");
         for path in [&incoming, &archive, &working, &completed, &runtime] {
             fs::create_dir_all(path).expect("create root");
         }
@@ -384,8 +401,8 @@ mod tests {
 
     #[test]
     fn managed_root_layout_accepts_distinct_existing_directories() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let incoming = temp.path().join("incoming");
+        let temp = temp_root("overlap");
+        let incoming = temp.join("incoming");
         let archive = temp.path().join("archive");
         let working = temp.path().join("working");
         let completed = temp.path().join("completed");
@@ -409,6 +426,7 @@ mod tests {
         assert!(validated.working.is_absolute());
         assert!(validated.completed.is_absolute());
         assert!(validated.runtime.is_absolute());
+        fs::remove_dir_all(temp).expect("cleanup");
     }
 
     #[cfg(unix)]
@@ -416,14 +434,14 @@ mod tests {
     fn managed_root_layout_rejects_symlink_component() {
         use std::os::unix::fs::symlink;
 
-        let temp = tempfile::tempdir().expect("tempdir");
-        let real = temp.path().join("real");
-        let link = temp.path().join("link");
+        let temp = temp_root("symlink");
+        let real = temp.join("real");
+        let link = temp.join("link");
         fs::create_dir_all(&real).expect("real");
         symlink(&real, &link).expect("symlink");
 
         let mk = |name: &str| {
-            let path = temp.path().join(name);
+            let path = temp.join(name);
             fs::create_dir_all(&path).expect("root");
             path
         };
@@ -439,5 +457,6 @@ mod tests {
         .expect_err("symlink must fail");
 
         assert!(matches!(error, StorageError::RootReparsePoint { .. }));
+        fs::remove_dir_all(temp).expect("cleanup");
     }
 }
