@@ -162,6 +162,18 @@ pub fn build(runtime_override: Option<PathBuf>) -> Result<Bootstrap> {
         }
     }
 
+    if completion.is_none() {
+        let recoverable = completion_journal
+            .list_recoverable_completions()
+            .map_err(|error| anyhow!("inspect durable completion recovery state: {error}"))?;
+        if !recoverable.is_empty() {
+            return Err(anyhow!(
+                "{} durable completion operation(s) require both managed storage and qBittorrent configuration",
+                recoverable.len()
+            ));
+        }
+    }
+
     Ok(Bootstrap {
         config,
         runtime,
