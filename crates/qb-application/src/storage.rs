@@ -51,6 +51,8 @@ pub trait Storage: Send + Sync {
 
     fn root_path(&self, root: ManagedRoot) -> Result<String, PortError>;
 
+    fn matches_root_path(&self, root: ManagedRoot, observed: &str) -> Result<bool, PortError>;
+
     fn list_incoming(&self) -> Result<Vec<String>, PortError>;
 
     fn read_incoming(
@@ -461,6 +463,14 @@ mod tests {
             .into())
         }
 
+        fn matches_root_path(
+            &self,
+            root: ManagedRoot,
+            observed: &str,
+        ) -> Result<bool, PortError> {
+            Ok(self.root_path(root)?.eq_ignore_ascii_case(observed))
+        }
+
         fn list_incoming(&self) -> Result<Vec<String>, PortError> {
             Ok(self
                 .files
@@ -511,6 +521,14 @@ mod tests {
                 ManagedRoot::Runtime => r"C:\Managed\Runtime",
             }
             .into())
+        }
+
+        fn matches_root_path(
+            &self,
+            root: ManagedRoot,
+            observed: &str,
+        ) -> Result<bool, PortError> {
+            Ok(self.root_path(root)?.eq_ignore_ascii_case(observed))
         }
 
         fn list_incoming(&self) -> Result<Vec<String>, PortError> {

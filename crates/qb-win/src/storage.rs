@@ -196,6 +196,16 @@ impl Storage for ManagedStorage {
             })
     }
 
+    fn matches_root_path(&self, root: ManagedRoot, observed: &str) -> Result<bool, PortError> {
+        let role = managed_root_role(root);
+        self.revalidate_root(role)?;
+        let observed = Path::new(observed);
+        if !observed.is_absolute() {
+            return Ok(false);
+        }
+        Ok(paths_equal(self.roots.path(role), observed))
+    }
+
     fn list_incoming(&self) -> Result<Vec<String>, PortError> {
         self.revalidate_root(ManagedRootRole::Incoming)?;
 
@@ -1004,6 +1014,16 @@ mod tests {
             Path::new(&working_path),
             storage.roots().path(ManagedRootRole::Working)
         );
+        assert!(storage
+            .matches_root_path(ManagedRoot::Working, &working_path)
+            .expect("matching Working path"));
+        #[cfg(windows)]
+        assert!(storage
+            .matches_root_path(ManagedRoot::Working, &working_path.to_ascii_uppercase())
+            .expect("case-insensitive Working path"));
+        assert!(!storage
+            .matches_root_path(ManagedRoot::Working, "relative")
+            .expect("relative path must not match"));
 
         fs::remove_dir_all(temp).expect("cleanup");
     }

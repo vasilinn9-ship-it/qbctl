@@ -333,6 +333,14 @@ mod tests {
             Ok(r"C:\Managed\Working".into())
         }
 
+        fn matches_root_path(
+            &self,
+            root: ManagedRoot,
+            observed: &str,
+        ) -> Result<bool, PortError> {
+            Ok(self.root_path(root)?.eq_ignore_ascii_case(observed))
+        }
+
         fn list_incoming(&self) -> Result<Vec<String>, PortError> {
             Err(PortError::new(
                 "INTERNAL_INVARIANT_VIOLATION",
