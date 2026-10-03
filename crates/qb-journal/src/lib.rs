@@ -4632,12 +4632,7 @@ fn receipt_completion_archive_destination(
                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE operation_id = ?7
                AND revision = ?8
-               AND state IN (
-                   'archive_pending',
-                   'unknown_archive',
-                   'archive_source_delete_pending',
-                   'unknown_archive_source_delete'
-               )",
+               AND state IN ('archive_pending','unknown_archive')",
             params![
                 destination.identity.volume_id.to_be_bytes().as_slice(),
                 destination.identity.file_id.to_be_bytes().as_slice(),
@@ -4815,7 +4810,12 @@ fn receipt_completion_archive(
                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE operation_id = ?7
                AND revision = ?8
-               AND state IN ('archive_pending','unknown_archive')",
+               AND state IN (
+                   'archive_pending',
+                   'unknown_archive',
+                   'archive_source_delete_pending',
+                   'unknown_archive_source_delete'
+               )",
             params![
                 destination.identity.volume_id.to_be_bytes().as_slice(),
                 destination.identity.file_id.to_be_bytes().as_slice(),
