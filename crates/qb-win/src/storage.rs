@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, Read},
+    io::{self, Read, Write},
     path::{Component, Path, PathBuf},
 };
 
@@ -12,6 +12,7 @@ use qb_application::{
     },
     PortError,
 };
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -231,6 +232,40 @@ impl Storage for ManagedStorage {
             managed_root_role(destination_root),
             destination_relative,
             expected_source,
+        )
+    }
+
+    fn copy_to_temp_verified(
+        &self,
+        source_root: ManagedRoot,
+        source_relative: &str,
+        destination_root: ManagedRoot,
+        temp_relative: &str,
+        expected_source: &FileEvidence,
+    ) -> Result<VerifiedCopyOutcome, PortError> {
+        copy_to_temp_verified(
+            &self.roots,
+            managed_root_role(source_root),
+            source_relative,
+            managed_root_role(destination_root),
+            temp_relative,
+            expected_source,
+        )
+    }
+
+    fn delete_managed_exact(
+        &self,
+        root: ManagedRoot,
+        relative_path: &str,
+        expected_evidence: &FileEvidence,
+        expected_sha256: &[u8; 32],
+    ) -> Result<ManagedDeleteOutcome, PortError> {
+        delete_managed_exact(
+            &self.roots,
+            managed_root_role(root),
+            relative_path,
+            expected_evidence,
+            expected_sha256,
         )
     }
 
