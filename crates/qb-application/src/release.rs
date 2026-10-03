@@ -39,6 +39,12 @@ pub enum ReleaseState {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReleaseResolution {
+    PreservedIncomplete,
+    BecameComplete,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReleaseRecord {
     pub request_id: RequestId,
@@ -53,6 +59,7 @@ pub struct ReleaseRecord {
     pub retained_bytes: u64,
     pub working_save_path: String,
     pub state: ReleaseState,
+    pub resolution: Option<ReleaseResolution>,
     pub problem_code: Option<String>,
     pub revision: u64,
 }
@@ -93,6 +100,10 @@ pub trait ReleaseJournal: Send + Sync {
         problem_code: &str,
     ) -> Result<ReleaseRecord, PortError>;
     fn finish_release(&self, operation_id: &OperationId) -> Result<ReleaseRecord, PortError>;
+    fn finish_became_complete(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<ReleaseRecord, PortError>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -255,7 +266,14 @@ impl ReleaseService {
                             );
                         }
                         TargetObservation::Present(torrent) if torrent.is_complete() => {
-                            return self.block(record, complete_problem(), replayed);
+                            let finished =
+                                self.journal.finish_became_complete(&record.operation_id)?;
+                            return Ok(execution(
+                                ReleaseExecutionStatus::Finished,
+                                finished,
+                                None,
+                                replayed,
+                            ));
                         }
                         TargetObservation::Present(torrent) if torrent.state.is_stopped() => {
                             record = self.journal.mark_stopped(&record.operation_id)?;
@@ -356,6 +374,15 @@ impl ReleaseService {
                         Ok(torrent) => torrent,
                         Err(problem) => return self.block(record, problem, replayed),
                     };
+                    if torrent.is_complete() {
+                        let finished = self.journal.finish_became_complete(&record.operation_id)?;
+                        return Ok(execution(
+                            ReleaseExecutionStatus::Finished,
+                            finished,
+                            None,
+                            replayed,
+                        ));
+                    }
                     if torrent.state.is_stopped() {
                         record = self.journal.mark_stopped(&record.operation_id)?;
                         continue;
@@ -405,6 +432,15 @@ impl ReleaseService {
                         Ok(torrent) => torrent,
                         Err(problem) => return self.block(record, problem, replayed),
                     };
+                    if torrent.is_complete() {
+                        let finished = self.journal.finish_became_complete(&record.operation_id)?;
+                        return Ok(execution(
+                            ReleaseExecutionStatus::Finished,
+                            finished,
+                            None,
+                            replayed,
+                        ));
+                    }
                     let pending = self.journal.mark_delete_pending(&record.operation_id)?;
                     match self.client.remove_keep_files(&torrent.id).await {
                         EffectAttempt::NotSent(problem) => {
@@ -465,9 +501,6 @@ impl ReleaseService {
             }
             TargetObservation::Present(torrent) => torrent,
         };
-        if torrent.is_complete() {
-            return Err(complete_problem());
-        }
         if require_stopped && !torrent.state.is_stopped() {
             return Err(PortError::new(
                 "TORRENT_NOT_STOPPED",
@@ -712,6 +745,7 @@ mod tests {
                 ));
             }
             record.state = next;
+            record.resolution = None;
             record.problem_code = problem_code.map(str::to_owned);
             record.revision += 1;
             Ok(record.clone())
@@ -757,6 +791,7 @@ mod tests {
                 retained_bytes: 100,
                 working_save_path: r"C:\Managed\Working".into(),
                 state: ReleaseState::Prepared,
+                resolution: None,
                 problem_code: None,
                 revision: 1,
             };
@@ -884,11 +919,33 @@ mod tests {
         }
 
         fn finish_release(&self, _operation_id: &OperationId) -> Result<ReleaseRecord, PortError> {
-            self.update(
+            let mut record = self.update(
                 &[ReleaseState::DeletePending, ReleaseState::UnknownDelete],
                 ReleaseState::Finished,
                 None,
-            )
+            )?;
+            record.resolution = Some(ReleaseResolution::PreservedIncomplete);
+            self.state.lock().expect("release journal mutex").record = Some(record.clone());
+            Ok(record)
+        }
+
+        fn finish_became_complete(
+            &self,
+            _operation_id: &OperationId,
+        ) -> Result<ReleaseRecord, PortError> {
+            let mut record = self.update(
+                &[
+                    ReleaseState::Prepared,
+                    ReleaseState::StopPending,
+                    ReleaseState::Stopped,
+                    ReleaseState::UnknownStop,
+                ],
+                ReleaseState::Finished,
+                None,
+            )?;
+            record.resolution = Some(ReleaseResolution::BecameComplete);
+            self.state.lock().expect("release journal mutex").record = Some(record.clone());
+            Ok(record)
         }
     }
 
@@ -1279,7 +1336,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn becoming_complete_before_delete_blocks_without_delete_effect() {
+    async fn becoming_complete_before_delete_finishes_without_delete_effect() {
         let journal = Arc::new(FakeReleaseJournal::default());
         let storage = release_storage();
         let client = Arc::new(FakeReleaseClient::new(
@@ -1299,12 +1356,13 @@ mod tests {
                 .expect("execute release"),
         );
 
-        assert_eq!(result.status, ReleaseExecutionStatus::Blocked);
-        assert_eq!(result.record.state, ReleaseState::Blocked);
+        assert_eq!(result.status, ReleaseExecutionStatus::Finished);
+        assert_eq!(result.record.state, ReleaseState::Finished);
         assert_eq!(
-            result.problem.as_ref().map(|problem| problem.code),
-            Some("TORRENT_COMPLETE")
+            result.record.resolution,
+            Some(ReleaseResolution::BecameComplete)
         );
+        assert!(result.problem.is_none());
         assert_eq!(client.delete_calls.load(Ordering::SeqCst), 0);
     }
 
