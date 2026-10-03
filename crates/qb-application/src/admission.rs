@@ -1,7 +1,100 @@
+use qb_domain::{torrent::TorrentIdentity, OperationId, RequestId};
+use sha2::{Digest, Sha256};
+
 use crate::{
-    storage::{IncomingScan, ManagedRoot, Storage},
+    mutation::MutationDisposition,
+    storage::{FileEvidence, IncomingScan, ManagedRoot, Storage},
     PortError,
 };
+
+pub const ADMISSION_FINGERPRINT_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdmissionReservationRequest {
+    pub request_id: RequestId,
+    pub identity: TorrentIdentity,
+    pub source_relative: String,
+    pub source_evidence: FileEvidence,
+    pub source_metainfo_digest: [u8; 32],
+    pub working_volume_id: u64,
+    pub reserved_bytes: u64,
+    pub working_save_path: String,
+}
+
+impl AdmissionReservationRequest {
+    pub fn fingerprint(&self) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(b"qbctl-admission-fingerprint-v1\0");
+        digest.update(self.request_id.as_str().as_bytes());
+        digest.update([0]);
+        if let Some(v1) = self.identity.v1 {
+            digest.update(b"v1");
+            digest.update(v1);
+        }
+        digest.update([0]);
+        if let Some(v2) = self.identity.v2 {
+            digest.update(b"v2");
+            digest.update(v2);
+        }
+        digest.update([0]);
+        digest.update(self.source_relative.as_bytes());
+        digest.update([0]);
+        digest.update(self.source_evidence.identity.volume_id.to_be_bytes());
+        digest.update(self.source_evidence.identity.file_id.to_be_bytes());
+        digest.update(self.source_evidence.size.to_be_bytes());
+        digest.update(self.source_evidence.modified_marker.to_be_bytes());
+        digest.update(self.source_metainfo_digest);
+        digest.update(self.working_volume_id.to_be_bytes());
+        digest.update(self.reserved_bytes.to_be_bytes());
+        digest.update(self.working_save_path.as_bytes());
+        digest.finalize().into()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdmissionRecord {
+    pub request_id: RequestId,
+    pub operation_id: OperationId,
+    pub registry_id: String,
+    pub identity: TorrentIdentity,
+    pub source_relative: String,
+    pub source_evidence: FileEvidence,
+    pub source_metainfo_digest: [u8; 32],
+    pub working_volume_id: u64,
+    pub reserved_bytes: u64,
+    pub working_save_path: String,
+    pub checkpoint: String,
+    pub disposition: MutationDisposition,
+    pub pending_effect_kind: Option<String>,
+    pub problem_code: Option<String>,
+    pub revision: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AdmissionReservationResult {
+    New(AdmissionRecord),
+    Replay(AdmissionRecord),
+    Conflict { operation_id: OperationId },
+}
+
+pub trait AdmissionJournal: Send + Sync {
+    fn reserve_admission(
+        &self,
+        request: &AdmissionReservationRequest,
+    ) -> Result<AdmissionReservationResult, PortError>;
+
+    fn get_admission(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<AdmissionRecord>, PortError>;
+
+    fn list_recoverable_admissions(&self) -> Result<Vec<AdmissionRecord>, PortError>;
+
+    fn capacity_reservations(
+        &self,
+        working_volume_id: u64,
+    ) -> Result<Vec<CapacityReservation>, PortError>;
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapacityReservation {
@@ -218,6 +311,41 @@ mod tests {
                 "capacity planning must not reread Incoming",
             ))
         }
+    }
+
+    #[test]
+    fn admission_fingerprint_covers_source_and_capacity_identity() {
+        let base = AdmissionReservationRequest {
+            request_id: RequestId::new("admission-1").expect("request id"),
+            identity: TorrentIdentity::new(Some([0x11; 20]), Some([0x22; 32]))
+                .expect("identity"),
+            source_relative: "candidate.torrent".into(),
+            source_evidence: FileEvidence {
+                identity: crate::storage::FileIdentity {
+                    volume_id: 7,
+                    file_id: 9,
+                },
+                size: 123,
+                modified_marker: 456,
+            },
+            source_metainfo_digest: [0x33; 32],
+            working_volume_id: 42,
+            reserved_bytes: 1_000,
+            working_save_path: r"C:\Managed\Working".into(),
+        };
+        let mut changed = base.clone();
+        changed.source_evidence.modified_marker += 1;
+        assert_ne!(base.fingerprint(), changed.fingerprint());
+
+        changed = base.clone();
+        changed.reserved_bytes += 1;
+        assert_ne!(base.fingerprint(), changed.fingerprint());
+
+        changed = base.clone();
+        changed.working_save_path.push_str("-other");
+        assert_ne!(base.fingerprint(), changed.fingerprint());
+
+        assert_eq!(base.fingerprint(), base.fingerprint());
     }
 
     #[test]
