@@ -571,6 +571,11 @@ impl TorrentRegistry for Journal {
         }
     }
 
+    fn get_by_id(&self, registry_id: &str) -> Result<Option<RegistryRecord>, PortError> {
+        let connection = self.connection.lock().expect("journal mutex poisoned");
+        load_registry_record(&connection, registry_id).map_err(map_port_error)
+    }
+
     fn register_incoming(
         &self,
         candidate: &RegisterIncoming,
