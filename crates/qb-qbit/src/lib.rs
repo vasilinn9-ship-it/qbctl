@@ -339,7 +339,7 @@ impl QbitClient {
                 continue;
             }
 
-            if response.status().is_success() {
+            if response.status().is_success() || response.status() == StatusCode::CONFLICT {
                 return EffectAttempt::Accepted;
             }
 
@@ -1218,6 +1218,33 @@ mod tests {
         assert!(wire.contains("name=\"stopped\""));
         assert!(wire.contains("\r\ntrue\r\n"));
         assert!(!wire.contains("skip_checking"));
+    }
+
+    #[tokio::test]
+    async fn add_conflict_requires_postcondition_observation() {
+        let server = FakeHttpServer::spawn(vec![
+            FakeResponse::ok("Ok.").with_header("Set-Cookie", "SID=test; HttpOnly"),
+            FakeResponse::status("409 Conflict", "torrent already exists"),
+        ])
+        .await;
+        let client = QbitClient::new(
+            &server.url,
+            QbitCredentials::new("admin", "secret"),
+            Duration::from_secs(2),
+        )
+        .expect("client");
+        let request = AddTorrentRequest {
+            metainfo: b"d4:infod4:name4:testee".to_vec(),
+            save_path: r"C:\Managed\Working".into(),
+            stopped: true,
+        };
+
+        assert!(matches!(
+            client.add_torrent_inner(&request).await,
+            EffectAttempt::Accepted
+        ));
+
+        server.finish().await;
     }
 
     #[tokio::test]
