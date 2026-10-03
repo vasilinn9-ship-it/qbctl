@@ -12,8 +12,8 @@ use qb_proto::{
         PauseTorrentRequest, ProblemCategory, QbitProbeRequest, QueueGetRequest,
         QueueTargetGetRequest, Request, Response, ResumeTorrentRequest, ServerHello,
         SetActiveDownloadsRequest, SetDownloadLimitRequest, SetQueueTargetRequest,
-        SetUploadLimitRequest, Status, StatusRequest, TorrentGetRequest, TorrentListRequest,
-        TorrentStateView, TransferLimitsGetRequest,
+        SetUploadLimitRequest, Status, StatusRequest, TorrentDiagnoseRequest, TorrentGetRequest,
+        TorrentListRequest, TorrentStateView, TrackerStatusView, TransferLimitsGetRequest,
     },
     PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
@@ -77,6 +77,9 @@ enum QbitCommand {
 enum TorrentCommand {
     List,
     Get {
+        torrent_id: String,
+    },
+    Diagnose {
         torrent_id: String,
     },
     Pause {
@@ -254,6 +257,12 @@ fn command_request(command: Command) -> (request::Command, Option<String>) {
             command: TorrentCommand::Get { torrent_id },
         } => (
             request::Command::TorrentGet(TorrentGetRequest { torrent_id }),
+            None,
+        ),
+        Command::Torrent {
+            command: TorrentCommand::Diagnose { torrent_id },
+        } => (
+            request::Command::TorrentDiagnose(TorrentDiagnoseRequest { torrent_id }),
             None,
         ),
         Command::Torrent {
@@ -461,6 +470,32 @@ fn render_human(response: &Response) -> Result<(), CliError> {
                 );
             }
         }
+        Some(response::Payload::TorrentDiagnose(value)) => {
+            if let Some(torrent) = value.torrent.as_ref() {
+                println!("{} {}", torrent.id, torrent.name);
+                println!(
+                    "  state: {} · rate: {} B/s · peers: {}/{} · seeds: {}/{}",
+                    torrent_state_name(torrent.state),
+                    torrent.download_rate_bps,
+                    torrent.peers_connected,
+                    torrent.peers_known,
+                    torrent.seeds_connected,
+                    torrent.seeds_known
+                );
+            }
+            println!("  trackers: {}", value.trackers.len());
+            for tracker in &value.trackers {
+                println!(
+                    "    {} · {} · peers {} · seeds {} · leeches {} · {}",
+                    tracker.identity,
+                    tracker_status_name(tracker.status),
+                    tracker.peers,
+                    tracker.seeds,
+                    tracker.leeches,
+                    tracker.message
+                );
+            }
+        }
         Some(response::Payload::QueueSettings(value)) => {
             println!(
                 "queueing {} · active downloads {} · active torrents {} · slow torrents {}",
@@ -559,6 +594,30 @@ fn render_fields(response: &Response) -> Result<(), CliError> {
             println!("torrent_present={}", value.torrent.is_some());
             if let Some(torrent) = value.torrent.as_ref() {
                 print_torrent_fields(0, torrent);
+            }
+        }
+        Some(response::Payload::TorrentDiagnose(value)) => {
+            println!("torrent_present={}", value.torrent.is_some());
+            if let Some(torrent) = value.torrent.as_ref() {
+                print_torrent_fields(0, torrent);
+            }
+            println!("tracker_count={}", value.trackers.len());
+            for (index, tracker) in value.trackers.iter().enumerate() {
+                println!(
+                    "tracker.{index}.identity={}",
+                    sanitize_field(&tracker.identity)
+                );
+                println!(
+                    "tracker.{index}.status={}",
+                    tracker_status_name(tracker.status)
+                );
+                println!("tracker.{index}.peers={}", tracker.peers);
+                println!("tracker.{index}.seeds={}", tracker.seeds);
+                println!("tracker.{index}.leeches={}", tracker.leeches);
+                println!(
+                    "tracker.{index}.message={}",
+                    sanitize_field(&tracker.message)
+                );
             }
         }
         Some(response::Payload::QueueSettings(value)) => {
@@ -663,6 +722,12 @@ fn daemon_state_name(value: i32) -> &'static str {
 fn torrent_state_name(value: i32) -> &'static str {
     TorrentStateView::try_from(value)
         .unwrap_or(TorrentStateView::Unknown)
+        .as_str_name()
+}
+
+fn tracker_status_name(value: i32) -> &'static str {
+    TrackerStatusView::try_from(value)
+        .unwrap_or(TrackerStatusView::Unknown)
         .as_str_name()
 }
 
