@@ -105,6 +105,7 @@ pub async fn run(runtime_override: Option<PathBuf>) -> Result<()> {
                         let runtime = Arc::clone(&bootstrap.runtime);
                         let system = Arc::clone(&bootstrap.system);
                         let torrents = bootstrap.torrents.as_ref().map(Arc::clone);
+                        let mutations = Arc::clone(&bootstrap.mutations);
                         let qbit_startup_problem =
                             bootstrap.qbit_startup_problem.as_deref().map(Arc::<str>::from);
                         tasks.spawn(async move {
@@ -113,6 +114,7 @@ pub async fn run(runtime_override: Option<PathBuf>) -> Result<()> {
                                 runtime,
                                 system,
                                 torrents,
+                                mutations,
                                 qbit_startup_problem,
                             )
                             .await
@@ -143,6 +145,29 @@ pub async fn run(runtime_override: Option<PathBuf>) -> Result<()> {
 }
 
 async fn initialize_runtime(bootstrap: &bootstrap::Bootstrap) {
+    bootstrap.runtime.set_phase(DaemonPhase::Recovering);
+
+    let unresolved = match bootstrap.mutations.recover_all().await {
+        Ok(results) => results
+            .iter()
+            .filter(|result| result.status != MutationExecutionStatus::Finished)
+            .count(),
+        Err(error) => {
+            bootstrap.runtime.set_phase(DaemonPhase::Degraded);
+            error!(error = %error, "startup mutation recovery failed");
+            return;
+        }
+    };
+
+    if unresolved > 0 {
+        bootstrap.runtime.set_phase(DaemonPhase::Degraded);
+        warn!(
+            unresolved,
+            "one or more durable mutations remain unresolved after startup recovery"
+        );
+        return;
+    }
+
     let Some(torrents) = bootstrap.torrents.as_ref() else {
         bootstrap.runtime.set_phase(DaemonPhase::Degraded);
         warn!(
@@ -156,7 +181,9 @@ async fn initialize_runtime(bootstrap: &bootstrap::Bootstrap) {
     };
 
     match torrents.probe().await {
-        Ok(probe) if probe.mutation_ready => {}
+        Ok(probe) if probe.mutation_ready => {
+            bootstrap.runtime.set_phase(DaemonPhase::Ready);
+        }
         Ok(probe) => {
             bootstrap.runtime.set_phase(DaemonPhase::Degraded);
             warn!(
@@ -164,44 +191,10 @@ async fn initialize_runtime(bootstrap: &bootstrap::Bootstrap) {
                 webapi_version = %probe.webapi_version,
                 "qBittorrent is readable but not mutation-ready"
             );
-            return;
         }
         Err(error) => {
             bootstrap.runtime.set_phase(DaemonPhase::Degraded);
             warn!(error = %error, "qBittorrent probe failed; daemon is degraded");
-            return;
-        }
-    }
-
-    let Some(mutations) = bootstrap.mutations.as_ref() else {
-        bootstrap.runtime.set_phase(DaemonPhase::Degraded);
-        warn!("mutation service is unavailable");
-        return;
-    };
-
-    bootstrap.runtime.set_phase(DaemonPhase::Recovering);
-    match mutations.recover_all().await {
-        Ok(results)
-            if results
-                .iter()
-                .all(|result| result.status == MutationExecutionStatus::Finished) =>
-        {
-            bootstrap.runtime.set_phase(DaemonPhase::Ready);
-        }
-        Ok(results) => {
-            bootstrap.runtime.set_phase(DaemonPhase::Degraded);
-            let unresolved = results
-                .iter()
-                .filter(|result| result.status != MutationExecutionStatus::Finished)
-                .count();
-            warn!(
-                unresolved,
-                "one or more durable mutations remain unresolved after startup recovery"
-            );
-        }
-        Err(error) => {
-            bootstrap.runtime.set_phase(DaemonPhase::Degraded);
-            error!(error = %error, "startup mutation recovery failed");
         }
     }
 }
