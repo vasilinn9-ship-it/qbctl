@@ -226,14 +226,14 @@ pub enum MutationExecutionResult {
 
 pub struct MutationService {
     journal: std::sync::Arc<dyn MutationJournal>,
-    client: std::sync::Arc<dyn crate::torrent::TorrentClient>,
+    client: Option<std::sync::Arc<dyn crate::torrent::TorrentClient>>,
     lane: tokio::sync::Mutex<()>,
 }
 
 impl MutationService {
     pub fn new(
         journal: std::sync::Arc<dyn MutationJournal>,
-        client: std::sync::Arc<dyn crate::torrent::TorrentClient>,
+        client: Option<std::sync::Arc<dyn crate::torrent::TorrentClient>>,
     ) -> Self {
         Self {
             journal,
@@ -490,8 +490,20 @@ impl MutationService {
         ))
     }
 
+    fn qbit_client(
+        &self,
+    ) -> Result<&std::sync::Arc<dyn crate::torrent::TorrentClient>, PortError> {
+        self.client.as_ref().ok_or_else(|| {
+            PortError::new(
+                "QBIT_UNAVAILABLE",
+                "qBittorrent client is unavailable for this mutation",
+            )
+        })
+    }
+
     async fn preflight(&self, command: &MutationCommand) -> Result<(), PortError> {
-        let probe = self.client.probe().await?;
+        let client = self.qbit_client()?;
+        let probe = client.probe().await?;
         if !probe.mutation_ready {
             return Err(PortError::new(
                 "QBIT_API_UNSUPPORTED",
@@ -505,7 +517,7 @@ impl MutationService {
         match command {
             MutationCommand::TorrentControl { torrent_id, .. } => {
                 let torrent =
-                    self.client.get(torrent_id).await?.ok_or_else(|| {
+                    client.get(torrent_id).await?.ok_or_else(|| {
                         PortError::new("TORRENT_NOT_FOUND", "torrent was not found")
                     })?;
                 if torrent.state == qb_domain::torrent::TorrentState::Unknown {
@@ -516,7 +528,7 @@ impl MutationService {
                 }
             }
             MutationCommand::SetActiveDownloads { .. } => {
-                let queue = self.client.queue_settings().await?;
+                let queue = client.queue_settings().await?;
                 if !queue.queueing_enabled {
                     return Err(PortError::new(
                         "QBIT_QUEUEING_DISABLED",
@@ -532,10 +544,15 @@ impl MutationService {
     }
 
     async fn observe_desired(&self, command: &MutationCommand) -> Result<bool, PortError> {
+        let client = match command {
+            MutationCommand::SetQueueTarget { .. } => None,
+            _ => Some(self.qbit_client()?),
+        };
+
         match command {
             MutationCommand::TorrentControl { torrent_id, action } => {
                 let torrent =
-                    self.client.get(torrent_id).await?.ok_or_else(|| {
+                    client.get(torrent_id).await?.ok_or_else(|| {
                         PortError::new("TORRENT_NOT_FOUND", "torrent was not found")
                     })?;
                 if torrent.state == qb_domain::torrent::TorrentState::Unknown {
@@ -552,7 +569,7 @@ impl MutationService {
             MutationCommand::SetActiveDownloads {
                 max_active_downloads,
             } => {
-                let queue = self.client.queue_settings().await?;
+                let queue = client.queue_settings().await?;
                 if !queue.queueing_enabled {
                     return Err(PortError::new(
                         "QBIT_QUEUEING_DISABLED",
@@ -562,10 +579,10 @@ impl MutationService {
                 Ok(queue.max_active_downloads == i64::from(*max_active_downloads))
             }
             MutationCommand::SetDownloadLimit { bytes_per_sec } => {
-                Ok(self.client.transfer_info().await?.download_limit_bps == *bytes_per_sec)
+                Ok(client.transfer_info().await?.download_limit_bps == *bytes_per_sec)
             }
             MutationCommand::SetUploadLimit { bytes_per_sec } => {
-                Ok(self.client.transfer_info().await?.upload_limit_bps == *bytes_per_sec)
+                Ok(client.transfer_info().await?.upload_limit_bps == *bytes_per_sec)
             }
             MutationCommand::SetQueueTarget {
                 target_client_count,
@@ -574,10 +591,15 @@ impl MutationService {
     }
 
     async fn perform_effect(&self, command: &MutationCommand) -> crate::torrent::EffectAttempt {
+        let client = match self.qbit_client() {
+            Ok(client) => client,
+            Err(problem) => return crate::torrent::EffectAttempt::NotSent(problem),
+        };
+
         match command {
             MutationCommand::TorrentControl { torrent_id, action } => match action {
-                TorrentControlAction::Stop => self.client.stop(torrent_id).await,
-                TorrentControlAction::Start => self.client.start(torrent_id).await,
+                TorrentControlAction::Stop => client.stop(torrent_id).await,
+                TorrentControlAction::Start => client.start(torrent_id).await,
             },
             MutationCommand::SetActiveDownloads {
                 max_active_downloads,
@@ -587,10 +609,10 @@ impl MutationService {
                     .await
             }
             MutationCommand::SetDownloadLimit { bytes_per_sec } => {
-                self.client.set_download_limit(*bytes_per_sec).await
+                client.set_download_limit(*bytes_per_sec).await
             }
             MutationCommand::SetUploadLimit { bytes_per_sec } => {
-                self.client.set_upload_limit(*bytes_per_sec).await
+                client.set_upload_limit(*bytes_per_sec).await
             }
             MutationCommand::SetQueueTarget { .. } => unreachable!("handled locally"),
         }
