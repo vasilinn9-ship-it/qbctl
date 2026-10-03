@@ -10,14 +10,24 @@ pub const MAX_FRAME_LENGTH: usize = 16 * 1024 * 1024;
 pub enum IpcError {
     #[error("IPC connection closed")]
     Closed,
+    #[error("IPC timed out")]
+    TimedOut,
     #[error("IPC is only supported on Windows")]
     UnsupportedPlatform,
     #[error("IPC I/O error: {0}")]
     Io(#[from] io::Error),
 }
 
+fn checked_frame(frame: impl Into<Bytes>) -> Result<Bytes, IpcError> {
+    let frame = frame.into();
+    validate_frame_size(&frame)?;
+    Ok(frame)
+}
+
 #[cfg(windows)]
 mod platform {
+    use std::{ffi::c_void, io, mem::size_of, ptr};
+
     use bytes::Bytes;
     use futures_util::{SinkExt, StreamExt};
     use tokio::{
@@ -27,8 +37,19 @@ mod platform {
         },
     };
     use tokio_util::codec::{Framed, LengthDelimitedCodec};
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::{
+            Authorization::{
+                ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+            },
+            PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+        },
+    };
 
-    use super::{IpcError, MAX_FRAME_LENGTH};
+    use super::{checked_frame, IpcError, MAX_FRAME_LENGTH};
+
+    const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)";
 
     fn codec() -> LengthDelimitedCodec {
         LengthDelimitedCodec::builder()
@@ -44,7 +65,7 @@ mod platform {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        framed.send(frame).await?;
+        framed.send(checked_frame(frame)?).await?;
         Ok(())
     }
 
@@ -72,7 +93,7 @@ mod platform {
         }
 
         pub async fn send_frame(&mut self, frame: impl Into<Bytes>) -> Result<(), IpcError> {
-            send_frame(&mut self.framed, frame.into()).await
+            send_frame(&mut self.framed, checked_frame(frame)?).await
         }
 
         pub async fn recv_frame(&mut self) -> Result<Bytes, IpcError> {
@@ -86,7 +107,7 @@ mod platform {
 
     impl ServerConnection {
         pub async fn send_frame(&mut self, frame: impl Into<Bytes>) -> Result<(), IpcError> {
-            send_frame(&mut self.framed, frame.into()).await
+            send_frame(&mut self.framed, checked_frame(frame)?).await
         }
 
         pub async fn recv_frame(&mut self) -> Result<Bytes, IpcError> {
@@ -97,28 +118,32 @@ mod platform {
     pub struct ServerListener {
         pipe_name: String,
         pending: Option<NamedPipeServer>,
-        first: bool,
     }
 
     impl ServerListener {
         pub fn bind(pipe_name: impl Into<String>) -> Result<Self, IpcError> {
             let pipe_name = pipe_name.into();
             let pending = Some(create_server(&pipe_name, true)?);
-            Ok(Self {
-                pipe_name,
-                pending,
-                first: false,
-            })
+            Ok(Self { pipe_name, pending })
         }
 
         pub async fn accept(&mut self) -> Result<ServerConnection, IpcError> {
-            if self.pending.is_none() {
-                self.pending = Some(create_server(&self.pipe_name, self.first)?);
-                self.first = false;
-            }
+            // Keep the pending instance owned by the listener while awaiting.
+            // NamedPipeServer::connect is cancel-safe, so a cancelled accept
+            // must leave this instance available for the next poll.
+            self.pending
+                .as_ref()
+                .expect("pending server exists")
+                .connect()
+                .await?;
 
-            let server = self.pending.take().expect("pending server exists");
-            server.connect().await?;
+            let server = self.pending.take().expect("connected server exists");
+
+            // Create the next listening instance before handing the connected
+            // instance to a client task. This keeps the pipe continuously
+            // available between short-lived clients.
+            self.pending = Some(create_server(&self.pipe_name, false)?);
+
             Ok(ServerConnection {
                 framed: Framed::new(server, codec()),
             })
@@ -126,10 +151,88 @@ mod platform {
     }
 
     fn create_server(pipe_name: &str, first: bool) -> Result<NamedPipeServer, IpcError> {
+        let sddl: Vec<u16> = PIPE_SDDL.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+
+        let converted = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                ptr::null_mut(),
+            )
+        };
+        if converted == 0 {
+            return Err(IpcError::Io(io::Error::last_os_error()));
+        }
+
+        let mut attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor,
+            bInheritHandle: 0,
+        };
+
         let mut options = ServerOptions::new();
         options.first_pipe_instance(first);
         options.reject_remote_clients(true);
-        Ok(options.create(pipe_name)?)
+
+        let created = unsafe {
+            options.create_with_security_attributes_raw(
+                pipe_name,
+                (&mut attributes as *mut SECURITY_ATTRIBUTES).cast::<c_void>(),
+            )
+        };
+
+        unsafe {
+            LocalFree(descriptor);
+        }
+
+        Ok(created?)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn secure_server_can_be_created() {
+            let name = format!(r"\\.\pipe\qbctl-ipc-test-{}", std::process::id());
+            let _server = create_server(&name, true).expect("secure pipe");
+        }
+
+        #[tokio::test]
+        async fn listener_accept_is_cancel_safe_and_keeps_a_pending_instance() {
+            let name = format!(r"\\.\pipe\qbctl-ipc-reconnect-test-{}", std::process::id());
+            let mut listener = ServerListener::bind(&name).expect("listener");
+
+            let cancelled =
+                tokio::time::timeout(std::time::Duration::from_millis(10), listener.accept()).await;
+            assert!(cancelled.is_err(), "accept unexpectedly completed");
+
+            let first_client = ClientConnection::connect(&name)
+                .await
+                .expect("first client after cancelled accept");
+            let first_server = listener.accept().await.expect("first accept");
+            drop(first_client);
+            drop(first_server);
+
+            let second_client = ClientConnection::connect(&name)
+                .await
+                .expect("second client without accept gap");
+            let second_server = listener.accept().await.expect("second accept");
+            drop(second_client);
+            drop(second_server);
+        }
+
+        #[test]
+        fn security_descriptor_is_protected_and_local_principals_only() {
+            assert!(PIPE_SDDL.starts_with("D:P"));
+            assert!(PIPE_SDDL.contains(";;;SY)"));
+            assert!(PIPE_SDDL.contains(";;;BA)"));
+            assert!(PIPE_SDDL.contains(";;;OW)"));
+            assert!(!PIPE_SDDL.contains(";;;WD)"));
+            assert!(!PIPE_SDDL.contains(";;;AN)"));
+        }
     }
 }
 

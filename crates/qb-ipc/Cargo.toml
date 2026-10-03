@@ -10,3 +10,6 @@ futures-util.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

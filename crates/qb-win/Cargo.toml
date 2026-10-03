@@ -7,3 +7,6 @@ publish.workspace = true
 [dependencies]
 fs2.workspace = true
 thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

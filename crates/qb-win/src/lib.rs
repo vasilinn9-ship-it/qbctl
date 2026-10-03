@@ -1,3 +1,5 @@
+pub mod credentials;
+
 use std::{
     env,
     fs::{self, File, OpenOptions},

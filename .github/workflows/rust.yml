@@ -14,7 +14,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: rustfmt, clippy
       - name: Architecture invariants
@@ -31,3 +31,82 @@ jobs:
       - name: Control plane acceptance
         shell: pwsh
         run: ./scripts/test-control-plane.ps1
+
+  real-qbit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - name: Start disposable qBittorrent 5.2.3
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="qbittorrentofficial/qbittorrent-nox:5.2.3-1@sha256:9ebb534fe30bab98622cb84a8c3acecfd88319b2d540f52ecdec7b9f866374d7"
+          docker run -d \
+            --name qbctl-real-qbit \
+            --network host \
+            --read-only \
+            --tmpfs /tmp \
+            --tmpfs /config:rw,uid=1000,gid=1000,mode=1770 \
+            --tmpfs /downloads:rw,uid=1000,gid=1000,mode=1770 \
+            --stop-timeout 1800 \
+            -e QBT_LEGAL_NOTICE=confirm \
+            -e QBT_WEBUI_PORT=18080 \
+            -e QBT_TORRENTING_PORT=16881 \
+            "$image"
+
+          password=""
+          for attempt in $(seq 1 60); do
+            logs="$(docker logs qbctl-real-qbit 2>&1 || true)"
+            password="$(printf '%s\n' "$logs" |
+              sed -n 's/.*temporary password is provided for this session: //p' |
+              tail -n 1 |
+              tr -d '\r')"
+            if [[ -n "$password" ]]; then
+              break
+            fi
+            if ! docker ps --format '{{.Names}}' | grep -qx qbctl-real-qbit; then
+              printf '%s\n' "$logs" |
+                sed '/[Pp]assword/s/.*/<redacted qBittorrent password log line>/'
+              exit 1
+            fi
+            sleep 1
+          done
+
+          if [[ -z "$password" ]]; then
+            docker logs qbctl-real-qbit 2>&1 |
+              sed '/[Pp]assword/s/.*/<redacted qBittorrent password log line>/'
+            echo "qBittorrent temporary password was not observed" >&2
+            exit 1
+          fi
+
+          echo "::add-mask::$password"
+          printf 'QBCTL_QBIT_PASSWORD=%s\n' "$password" >> "$GITHUB_ENV"
+
+          for attempt in $(seq 1 30); do
+            status="$(curl -sS -o /dev/null -w '%{http_code}' \
+              http://127.0.0.1:18080/api/v2/app/version || true)"
+            if [[ "$status" != "000" && -n "$status" ]]; then
+              exit 0
+            fi
+            sleep 1
+          done
+
+          docker logs qbctl-real-qbit
+          echo "qBittorrent WebAPI listener did not become ready" >&2
+          exit 1
+      - name: Real qBittorrent adapter acceptance
+        env:
+          QBCTL_REAL_QBIT: "1"
+          QBCTL_QBIT_URL: http://127.0.0.1:18080
+          QBCTL_QBIT_USERNAME: admin
+        run: cargo test -p qb-qbit --test real_qbit --locked -- --nocapture
+      - name: Dump qBittorrent logs on failure
+        if: failure()
+        shell: bash
+        run: |
+          docker logs qbctl-real-qbit 2>&1 |
+            sed '/[Pp]assword/s/.*/<redacted qBittorrent password log line>/'
+      - name: Stop disposable qBittorrent
+        if: always()
+        run: docker rm -f qbctl-real-qbit || true

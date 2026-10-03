@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use qb_application::{
+    mutation::MutationExecutionStatus,
     system::{DaemonPhase, RuntimeHealthPort, RuntimeSnapshot},
     PortError,
 };
@@ -12,6 +13,8 @@ use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
 use crate::{bootstrap, protocol, server::Server};
+
+const MAX_CLIENT_TASKS: usize = 32;
 
 pub struct RuntimeContext {
     instance_id: String,
@@ -24,7 +27,7 @@ impl RuntimeContext {
         Self {
             instance_id,
             runtime_root,
-            phase: RwLock::new(DaemonPhase::Ready),
+            phase: RwLock::new(DaemonPhase::Starting),
         }
     }
 
@@ -56,8 +59,7 @@ impl RuntimeHealthPort for RuntimeContext {
         RuntimeSnapshot {
             phase: self.phase(),
             instance_id: self.instance_id.clone(),
-            // Slice 1 has no external mutation commands yet.
-            mutation_admission_enabled: false,
+            mutation_admission_enabled: self.phase() == DaemonPhase::Ready,
         }
     }
 
@@ -78,6 +80,7 @@ impl RuntimeHealthPort for RuntimeContext {
 
 pub async fn run(runtime_override: Option<PathBuf>) -> Result<()> {
     let bootstrap = bootstrap::build(runtime_override)?;
+    initialize_runtime(&bootstrap).await;
     let mut server = Server::bind(bootstrap.config.pipe.clone()).context("bind named pipe")?;
     let mut tasks = JoinSet::new();
 
@@ -96,13 +99,26 @@ pub async fn run(runtime_override: Option<PathBuf>) -> Result<()> {
                 info!("shutdown requested");
                 break;
             }
-            accepted = server.accept() => {
+            accepted = server.accept(), if tasks.len() < MAX_CLIENT_TASKS => {
                 match accepted {
                     Ok(connection) => {
                         let runtime = Arc::clone(&bootstrap.runtime);
                         let system = Arc::clone(&bootstrap.system);
+                        let torrents = bootstrap.torrents.as_ref().map(Arc::clone);
+                        let mutations = Arc::clone(&bootstrap.mutations);
+                        let qbit_startup_problem =
+                            bootstrap.qbit_startup_problem.as_deref().map(Arc::<str>::from);
                         tasks.spawn(async move {
-                            if let Err(error) = protocol::serve_connection(connection, runtime, system).await {
+                            if let Err(error) = protocol::serve_connection(
+                                connection,
+                                runtime,
+                                system,
+                                torrents,
+                                mutations,
+                                qbit_startup_problem,
+                            )
+                            .await
+                            {
                                 warn!(error = %error, "client connection ended with error");
                             }
                         });
@@ -128,6 +144,61 @@ pub async fn run(runtime_override: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+async fn initialize_runtime(bootstrap: &bootstrap::Bootstrap) {
+    bootstrap.runtime.set_phase(DaemonPhase::Recovering);
+
+    let unresolved = match bootstrap.mutations.recover_all().await {
+        Ok(results) => results
+            .iter()
+            .filter(|result| result.status != MutationExecutionStatus::Finished)
+            .count(),
+        Err(error) => {
+            bootstrap.runtime.set_phase(DaemonPhase::Degraded);
+            error!(error = %error, "startup mutation recovery failed");
+            return;
+        }
+    };
+
+    if unresolved > 0 {
+        bootstrap.runtime.set_phase(DaemonPhase::Degraded);
+        warn!(
+            unresolved,
+            "one or more durable mutations remain unresolved after startup recovery"
+        );
+        return;
+    }
+
+    let Some(torrents) = bootstrap.torrents.as_ref() else {
+        bootstrap.runtime.set_phase(DaemonPhase::Degraded);
+        warn!(
+            problem = %bootstrap
+                .qbit_startup_problem
+                .as_deref()
+                .unwrap_or("qBittorrent is unavailable"),
+            "daemon started without qBittorrent mutation capability"
+        );
+        return;
+    };
+
+    match torrents.probe().await {
+        Ok(probe) if probe.mutation_ready => {
+            bootstrap.runtime.set_phase(DaemonPhase::Ready);
+        }
+        Ok(probe) => {
+            bootstrap.runtime.set_phase(DaemonPhase::Degraded);
+            warn!(
+                application_version = %probe.application_version,
+                webapi_version = %probe.webapi_version,
+                "qBittorrent is readable but not mutation-ready"
+            );
+        }
+        Err(error) => {
+            bootstrap.runtime.set_phase(DaemonPhase::Degraded);
+            warn!(error = %error, "qBittorrent probe failed; daemon is degraded");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,8 +208,12 @@ mod tests {
         let context = RuntimeContext::new("instance".into(), PathBuf::from("."));
         let snapshot = RuntimeHealthPort::snapshot(&context);
 
-        assert_eq!(snapshot.phase, DaemonPhase::Ready);
+        assert_eq!(snapshot.phase, DaemonPhase::Starting);
         assert_eq!(snapshot.instance_id, "instance");
         assert!(!snapshot.mutation_admission_enabled);
+
+        context.set_phase(DaemonPhase::Ready);
+        let ready = RuntimeHealthPort::snapshot(&context);
+        assert!(ready.mutation_admission_enabled);
     }
 }
