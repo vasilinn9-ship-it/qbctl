@@ -1278,7 +1278,7 @@ impl AdmissionJournal for Journal {
                     WHERE working_volume_id = ?1
                       AND reservation_state = 'active'
                     UNION ALL
-                    SELECT source_relative AS responsible,
+                    SELECT 'retained:' || source_relative AS responsible,
                            retained_bytes AS bytes
                     FROM retained_capacity
                     WHERE working_volume_id = ?1
@@ -4550,7 +4550,7 @@ mod tests {
                 .reservation_active);
             let reservations = journal.capacity_reservations(42).expect("capacity");
             assert_eq!(reservations.len(), 1);
-            assert_eq!(reservations[0].responsible, "candidate.torrent");
+            assert_eq!(reservations[0].responsible, "retained:candidate.torrent");
             assert_eq!(reservations[0].bytes, 4096);
             record.operation_id
         };
@@ -4607,7 +4607,7 @@ mod tests {
 
         let reservations = reopened.capacity_reservations(42).expect("retained capacity");
         assert_eq!(reservations.len(), 1);
-        assert_eq!(reservations[0].responsible, "candidate.torrent");
+        assert_eq!(reservations[0].responsible, "retained:candidate.torrent");
 
         let mut readmission = admission_request("readmission-after-release");
         readmission.identity = admission.identity.clone();
