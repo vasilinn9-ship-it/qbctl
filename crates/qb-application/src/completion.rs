@@ -185,6 +185,27 @@ pub trait CompletionJournal: Send + Sync {
         problem_code: &str,
     ) -> Result<CompletionRecord, PortError>;
 
+    fn mark_file_destination_receipted(
+        &self,
+        operation_id: &OperationId,
+        file_index: u32,
+        destination: &FileEvidence,
+        destination_sha256: [u8; 32],
+    ) -> Result<CompletionRecord, PortError>;
+
+    fn mark_file_source_delete_pending(
+        &self,
+        operation_id: &OperationId,
+        file_index: u32,
+    ) -> Result<CompletionRecord, PortError>;
+
+    fn mark_file_unknown_source_delete(
+        &self,
+        operation_id: &OperationId,
+        file_index: u32,
+        problem_code: &str,
+    ) -> Result<CompletionRecord, PortError>;
+
     fn mark_file_handed_off(
         &self,
         operation_id: &OperationId,
@@ -1887,15 +1908,33 @@ mod tests {
                     CompletionFileState::Prepared | CompletionFileState::UnknownMove
                 ),
                 CompletionFileState::UnknownMove => file.state == CompletionFileState::MovePending,
-                CompletionFileState::HandedOff => matches!(
+                CompletionFileState::DestinationReceipted => matches!(
                     file.state,
                     CompletionFileState::MovePending | CompletionFileState::UnknownMove
+                ),
+                CompletionFileState::SourceDeletePending => matches!(
+                    file.state,
+                    CompletionFileState::DestinationReceipted
+                        | CompletionFileState::UnknownSourceDelete
+                ),
+                CompletionFileState::UnknownSourceDelete => {
+                    file.state == CompletionFileState::SourceDeletePending
+                }
+                CompletionFileState::HandedOff => matches!(
+                    file.state,
+                    CompletionFileState::MovePending
+                        | CompletionFileState::UnknownMove
+                        | CompletionFileState::SourceDeletePending
+                        | CompletionFileState::UnknownSourceDelete
                 ),
                 CompletionFileState::Blocked => matches!(
                     file.state,
                     CompletionFileState::Prepared
                         | CompletionFileState::MovePending
                         | CompletionFileState::UnknownMove
+                        | CompletionFileState::DestinationReceipted
+                        | CompletionFileState::SourceDeletePending
+                        | CompletionFileState::UnknownSourceDelete
                 ),
                 _ => false,
             };
@@ -1906,8 +1945,12 @@ mod tests {
                 ));
             }
             file.state = next;
-            file.destination_evidence = destination.cloned();
-            file.destination_sha256 = destination_sha256;
+            if let Some(destination) = destination {
+                file.destination_evidence = Some(destination.clone());
+            }
+            if let Some(destination_sha256) = destination_sha256 {
+                file.destination_sha256 = Some(destination_sha256);
+            }
             file.problem_code = problem_code.map(str::to_owned);
             file.revision += 1;
             Ok(record.clone())
@@ -2205,6 +2248,54 @@ mod tests {
                 operation_id,
                 file_index,
                 CompletionFileState::UnknownMove,
+                None,
+                None,
+                Some(problem_code),
+            )
+        }
+
+        fn mark_file_destination_receipted(
+            &self,
+            operation_id: &OperationId,
+            file_index: u32,
+            destination: &FileEvidence,
+            destination_sha256: [u8; 32],
+        ) -> Result<CompletionRecord, PortError> {
+            self.transition_file(
+                operation_id,
+                file_index,
+                CompletionFileState::DestinationReceipted,
+                Some(destination),
+                Some(destination_sha256),
+                None,
+            )
+        }
+
+        fn mark_file_source_delete_pending(
+            &self,
+            operation_id: &OperationId,
+            file_index: u32,
+        ) -> Result<CompletionRecord, PortError> {
+            self.transition_file(
+                operation_id,
+                file_index,
+                CompletionFileState::SourceDeletePending,
+                None,
+                None,
+                None,
+            )
+        }
+
+        fn mark_file_unknown_source_delete(
+            &self,
+            operation_id: &OperationId,
+            file_index: u32,
+            problem_code: &str,
+        ) -> Result<CompletionRecord, PortError> {
+            self.transition_file(
+                operation_id,
+                file_index,
+                CompletionFileState::UnknownSourceDelete,
                 None,
                 None,
                 Some(problem_code),
