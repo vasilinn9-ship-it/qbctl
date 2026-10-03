@@ -103,10 +103,7 @@ fn decode_secret(blob: &[u8]) -> Option<String> {
         return None;
     }
 
-    let utf16: Vec<u16> = pairs
-        .iter()
-        .map(|pair| u16::from_le_bytes(*pair))
-        .collect();
+    let utf16: Vec<u16> = pairs.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
     String::from_utf16(&utf16)
         .ok()
         .map(|value| value.trim_end_matches('\0').to_string())
