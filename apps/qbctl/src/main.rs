@@ -630,6 +630,7 @@ fn render_fields(response: &Response) -> Result<(), CliError> {
             );
         }
         Some(response::Payload::QueueTarget(value)) => {
+            println!("policy_revision={}", value.revision);
             if let Some(target) = value.target_client_count {
                 println!("target_client_count={target}");
             } else {
