@@ -1,3 +1,4 @@
+pub mod admission;
 pub mod mutation;
 pub mod registry;
 pub mod storage;
