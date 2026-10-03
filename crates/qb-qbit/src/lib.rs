@@ -243,11 +243,7 @@ impl QbitClient {
         Err(QbitError::Authentication)
     }
 
-    async fn mutation_post_form(
-        &self,
-        endpoint: &str,
-        form: &[(&str, String)],
-    ) -> EffectAttempt {
+    async fn mutation_post_form(&self, endpoint: &str, form: &[(&str, String)]) -> EffectAttempt {
         for attempt in 0..2 {
             let sid = match self.ensure_session().await {
                 Ok(sid) => sid,
@@ -848,10 +844,12 @@ mod tests {
             Duration::from_secs(2),
         )
         .expect("client");
-        let id =
-            TorrentId::new("abcdef0123456789abcdef0123456789abcdef01").expect("torrent id");
+        let id = TorrentId::new("abcdef0123456789abcdef0123456789abcdef01").expect("torrent id");
 
-        assert!(matches!(client.stop_inner(&id).await, EffectAttempt::Accepted));
+        assert!(matches!(
+            client.stop_inner(&id).await,
+            EffectAttempt::Accepted
+        ));
 
         let requests = server.finish().await;
         assert_eq!(requests.len(), 2);
@@ -874,10 +872,12 @@ mod tests {
             Duration::from_secs(2),
         )
         .expect("client");
-        let id =
-            TorrentId::new("abcdef0123456789abcdef0123456789abcdef01").expect("torrent id");
+        let id = TorrentId::new("abcdef0123456789abcdef0123456789abcdef01").expect("torrent id");
 
-        assert!(matches!(client.start_inner(&id).await, EffectAttempt::Accepted));
+        assert!(matches!(
+            client.start_inner(&id).await,
+            EffectAttempt::Accepted
+        ));
 
         let requests = server.finish().await;
         assert_eq!(requests.len(), 4);
@@ -898,8 +898,7 @@ mod tests {
             Duration::from_secs(2),
         )
         .expect("client");
-        let id =
-            TorrentId::new("abcdef0123456789abcdef0123456789abcdef01").expect("torrent id");
+        let id = TorrentId::new("abcdef0123456789abcdef0123456789abcdef01").expect("torrent id");
 
         let result = client.stop_inner(&id).await;
         assert!(matches!(
