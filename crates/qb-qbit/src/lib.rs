@@ -925,7 +925,7 @@ mod tests {
     async fn probe_authenticates_and_reads_versions() {
         let server = FakeHttpServer::spawn(vec![
             FakeResponse::status("204 No Content", "")
-                .with_header("Set-Cookie", "QBT_SID_8080=test-session; HttpOnly"),
+                .with_header("Set-Cookie", "SID=test-session; HttpOnly"),
             FakeResponse::ok("v5.2.4"),
             FakeResponse::ok("2.16.2"),
         ])
@@ -953,10 +953,10 @@ mod tests {
         assert!(requests[0].contains("password=secret"));
         assert!(requests[1]
             .to_ascii_lowercase()
-            .contains("cookie: qbt_sid_8080=test-session"));
+            .contains("cookie: sid=test-session"));
         assert!(requests[2]
             .to_ascii_lowercase()
-            .contains("cookie: qbt_sid_8080=test-session"));
+            .contains("cookie: sid=test-session"));
     }
 
     #[tokio::test]
