@@ -835,6 +835,112 @@ mod tests {
         server.finish().await;
     }
 
+    #[tokio::test]
+    async fn stop_posts_exact_hash_once() {
+        let server = FakeHttpServer::spawn(vec![
+            FakeResponse::ok("Ok.").with_header("Set-Cookie", "SID=test; HttpOnly"),
+            FakeResponse::ok(""),
+        ])
+        .await;
+        let client = QbitClient::new(
+            &server.url,
+            QbitCredentials::new("admin", "secret"),
+            Duration::from_secs(2),
+        )
+        .expect("client");
+        let id =
+            TorrentId::new("abcdef0123456789abcdef0123456789abcdef01").expect("torrent id");
+
+        assert!(matches!(client.stop_inner(&id).await, EffectAttempt::Accepted));
+
+        let requests = server.finish().await;
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].starts_with("post /api/v2/torrents/stop http/1.1"));
+        assert!(requests[1].contains("hashes=abcdef0123456789abcdef0123456789abcdef01"));
+    }
+
+    #[tokio::test]
+    async fn mutation_reauthenticates_only_after_explicit_forbidden() {
+        let server = FakeHttpServer::spawn(vec![
+            FakeResponse::ok("Ok.").with_header("Set-Cookie", "SID=first; HttpOnly"),
+            FakeResponse::status("403 Forbidden", ""),
+            FakeResponse::ok("Ok.").with_header("Set-Cookie", "SID=second; HttpOnly"),
+            FakeResponse::ok(""),
+        ])
+        .await;
+        let client = QbitClient::new(
+            &server.url,
+            QbitCredentials::new("admin", "secret"),
+            Duration::from_secs(2),
+        )
+        .expect("client");
+        let id =
+            TorrentId::new("abcdef0123456789abcdef0123456789abcdef01").expect("torrent id");
+
+        assert!(matches!(client.start_inner(&id).await, EffectAttempt::Accepted));
+
+        let requests = server.finish().await;
+        assert_eq!(requests.len(), 4);
+        assert!(requests[1].contains("cookie: sid=first"));
+        assert!(requests[3].contains("cookie: sid=second"));
+    }
+
+    #[tokio::test]
+    async fn dropped_mutation_response_is_uncertain() {
+        let server = FakeHttpServer::spawn(vec![
+            FakeResponse::ok("Ok.").with_header("Set-Cookie", "SID=test; HttpOnly"),
+            FakeResponse::drop_connection(),
+        ])
+        .await;
+        let client = QbitClient::new(
+            &server.url,
+            QbitCredentials::new("admin", "secret"),
+            Duration::from_secs(2),
+        )
+        .expect("client");
+        let id =
+            TorrentId::new("abcdef0123456789abcdef0123456789abcdef01").expect("torrent id");
+
+        let result = client.stop_inner(&id).await;
+        assert!(matches!(
+            result,
+            EffectAttempt::Uncertain(ref error) if error.code == "QBIT_MUTATION_UNCERTAIN"
+        ));
+
+        server.finish().await;
+    }
+
+    #[tokio::test]
+    async fn queue_and_transfer_mutations_use_narrow_endpoints() {
+        let server = FakeHttpServer::spawn(vec![
+            FakeResponse::ok("Ok.").with_header("Set-Cookie", "SID=test; HttpOnly"),
+            FakeResponse::ok(""),
+            FakeResponse::ok(""),
+        ])
+        .await;
+        let client = QbitClient::new(
+            &server.url,
+            QbitCredentials::new("admin", "secret"),
+            Duration::from_secs(2),
+        )
+        .expect("client");
+
+        assert!(matches!(
+            client.set_active_downloads_inner(10).await,
+            EffectAttempt::Accepted
+        ));
+        assert!(matches!(
+            client.set_download_limit_inner(24_000_000).await,
+            EffectAttempt::Accepted
+        ));
+
+        let requests = server.finish().await;
+        assert!(requests[1].starts_with("post /api/v2/app/setpreferences http/1.1"));
+        assert!(requests[1].contains("max_active_downloads"));
+        assert!(requests[2].starts_with("post /api/v2/transfer/setdownloadlimit http/1.1"));
+        assert!(requests[2].contains("limit=24000000"));
+    }
+
     use std::sync::{Arc, Mutex};
 
     use tokio::{
@@ -847,6 +953,7 @@ mod tests {
         status: &'static str,
         headers: Vec<(&'static str, &'static str)>,
         body: &'static str,
+        drop_connection: bool,
     }
 
     impl FakeResponse {
@@ -859,6 +966,16 @@ mod tests {
                 status,
                 headers: Vec::new(),
                 body,
+                drop_connection: false,
+            }
+        }
+
+        fn drop_connection() -> Self {
+            Self {
+                status: "200 OK",
+                headers: Vec::new(),
+                body: "",
+                drop_connection: true,
             }
         }
 
@@ -886,6 +1003,11 @@ mod tests {
                     let (mut socket, _) = listener.accept().await.expect("accept");
                     let request = read_http_request(&mut socket).await;
                     recorded.lock().expect("requests mutex").push(request);
+
+                    if response.drop_connection {
+                        drop(socket);
+                        continue;
+                    }
 
                     let mut headers = String::new();
                     for (name, value) in response.headers {
