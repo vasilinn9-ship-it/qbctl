@@ -1083,9 +1083,7 @@ impl AdmissionJournal for Journal {
             MutationDisposition::EffectPending => {
                 (MutationDisposition::EffectPending, "observed_not_applied")
             }
-            MutationDisposition::Unknown => {
-                (MutationDisposition::Unknown, "observed_not_applied")
-            }
+            MutationDisposition::Unknown => (MutationDisposition::Unknown, "observed_not_applied"),
             other => {
                 return Err(PortError::new(
                     "OPERATION_TRANSITION_INVALID",
