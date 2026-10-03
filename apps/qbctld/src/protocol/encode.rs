@@ -15,9 +15,9 @@ use qb_domain::torrent::TorrentState;
 use qb_proto::v1::{
     DaemonState, DoctorCheck, DoctorResponse, IncomingStatusEntry, ManagedRootView,
     OperationFileView, OperationSummary, OperationView, QbitProbeResponse, QueueSettingsResponse,
-    StatusResponse, StorageListResponse, StorageRootView, StorageStatusResponse, TorrentListResponse,
-    TorrentStateView, TorrentSummary,
-    TrackerEvidenceView, TrackerStatusView, TransferLimitsResponse,
+    StatusResponse, StorageListResponse, StorageRootView, StorageStatusResponse,
+    TorrentListResponse, TorrentStateView, TorrentSummary, TrackerEvidenceView, TrackerStatusView,
+    TransferLimitsResponse,
 };
 
 pub fn daemon_state(phase: DaemonPhase) -> DaemonState {
