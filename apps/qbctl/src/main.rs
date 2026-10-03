@@ -9,11 +9,12 @@ use qb_ipc::{ClientConnection, IpcError, DEFAULT_PIPE};
 use qb_proto::{
     v1::{
         request, response, CapabilitiesRequest, ClientHello, DaemonState, DoctorRequest,
-        PauseTorrentRequest, ProblemCategory, QbitProbeRequest, QueueGetRequest,
+        ManagedRootView, PauseTorrentRequest, ProblemCategory, QbitProbeRequest, QueueGetRequest,
         QueueTargetGetRequest, Request, Response, ResumeTorrentRequest, ServerHello,
         SetActiveDownloadsRequest, SetDownloadLimitRequest, SetQueueTargetRequest,
-        SetUploadLimitRequest, Status, StatusRequest, TorrentDiagnoseRequest, TorrentGetRequest,
-        TorrentListRequest, TorrentStateView, TrackerStatusView, TransferLimitsGetRequest,
+        SetUploadLimitRequest, Status, StatusRequest, StorageListRequest, StorageStatusRequest,
+        TorrentDiagnoseRequest, TorrentGetRequest, TorrentListRequest, TorrentStateView,
+        TrackerStatusView, TransferLimitsGetRequest,
     },
     PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
@@ -60,6 +61,10 @@ enum Command {
     Transfer {
         #[command(subcommand)]
         command: TransferCommand,
+    },
+    Storage {
+        #[command(subcommand)]
+        command: StorageCommand,
     },
 }
 
@@ -144,6 +149,12 @@ enum TransferCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum StorageCommand {
+    List,
+    Status,
+}
+
+#[derive(Debug, Subcommand)]
 enum TransferLimitsCommand {
     Get,
 }
@@ -215,6 +226,7 @@ async fn execute(cli: Cli) -> Result<Response, CliError> {
             "torrent.read.v1".into(),
             "torrent.control.v1".into(),
             "request-idempotency.v1".into(),
+            "storage.read.v1".into(),
         ],
     };
     connection.send_frame(client_hello.encode_to_vec()).await?;
@@ -247,6 +259,12 @@ fn command_request(command: Command) -> (request::Command, Option<String>) {
             command: DaemonCommand::Status,
         } => (request::Command::Status(StatusRequest {}), None),
         Command::Doctor => (request::Command::Doctor(DoctorRequest {}), None),
+        Command::Storage {
+            command: StorageCommand::List,
+        } => (request::Command::StorageList(StorageListRequest {}), None),
+        Command::Storage {
+            command: StorageCommand::Status,
+        } => (request::Command::StorageStatus(StorageStatusRequest {}), None),
         Command::Qbit {
             command: QbitCommand::Status,
         } => (request::Command::QbitProbe(QbitProbeRequest {}), None),
@@ -424,6 +442,54 @@ fn render_human(response: &Response) -> Result<(), CliError> {
                 );
             }
         }
+        Some(response::Payload::StorageList(value)) => {
+            println!("{} managed storage root(s)", value.roots.len());
+            for root in &value.roots {
+                println!(
+                    "{} · {} · free {} / {} bytes · volume {}",
+                    managed_root_name(root.root),
+                    root.path,
+                    root.free_bytes,
+                    root.total_bytes,
+                    root.volume_id
+                );
+            }
+        }
+        Some(response::Payload::StorageStatus(value)) => {
+            println!(
+                "Incoming: {} eligible · {} already processed · {} redundant exact · {} rejected",
+                value.eligible_count,
+                value.already_processed_count,
+                value.redundant_identical_count,
+                value.rejected_count
+            );
+            for root in &value.roots {
+                println!(
+                    "  {}: {} · free {} / {} bytes · volume {}",
+                    managed_root_name(root.root),
+                    root.path,
+                    root.free_bytes,
+                    root.total_bytes,
+                    root.volume_id
+                );
+            }
+            for entry in &value.incoming {
+                let mut suffix = String::new();
+                if let Some(registry_id) = entry.registry_id.as_deref() {
+                    suffix.push_str(&format!(" · registry {registry_id}"));
+                }
+                if let Some(problem_code) = entry.problem_code.as_deref() {
+                    suffix.push_str(&format!(" · {problem_code}"));
+                }
+                if let Some(detail) = entry.detail.as_deref() {
+                    suffix.push_str(&format!(" · {detail}"));
+                }
+                println!(
+                    "  {} · {}{}",
+                    entry.classification, entry.relative_path, suffix
+                );
+            }
+        }
         Some(response::Payload::QbitProbe(value)) => {
             println!(
                 "qBittorrent {} · WebAPI {} · mutations {}",
@@ -579,6 +645,50 @@ fn render_fields(response: &Response) -> Result<(), CliError> {
             println!("check_count={}", value.checks.len());
             println!("checks_ok={}", value.checks.iter().all(|check| check.ok));
         }
+        Some(response::Payload::StorageList(value)) => {
+            println!("storage_root_count={}", value.roots.len());
+            for (index, root) in value.roots.iter().enumerate() {
+                print_storage_root_fields(index, root);
+            }
+        }
+        Some(response::Payload::StorageStatus(value)) => {
+            println!("storage_root_count={}", value.roots.len());
+            println!("incoming_eligible_count={}", value.eligible_count);
+            println!(
+                "incoming_already_processed_count={}",
+                value.already_processed_count
+            );
+            println!(
+                "incoming_redundant_identical_count={}",
+                value.redundant_identical_count
+            );
+            println!("incoming_rejected_count={}", value.rejected_count);
+            for (index, root) in value.roots.iter().enumerate() {
+                print_storage_root_fields(index, root);
+            }
+            for (index, entry) in value.incoming.iter().enumerate() {
+                println!(
+                    "incoming.{index}.relative_path={}",
+                    sanitize_field(&entry.relative_path)
+                );
+                println!(
+                    "incoming.{index}.classification={}",
+                    sanitize_field(&entry.classification)
+                );
+                println!(
+                    "incoming.{index}.registry_id={}",
+                    sanitize_field(entry.registry_id.as_deref().unwrap_or(""))
+                );
+                println!(
+                    "incoming.{index}.problem_code={}",
+                    sanitize_field(entry.problem_code.as_deref().unwrap_or(""))
+                );
+                println!(
+                    "incoming.{index}.detail={}",
+                    sanitize_field(entry.detail.as_deref().unwrap_or(""))
+                );
+            }
+        }
         Some(response::Payload::QbitProbe(value)) => {
             println!("application_version={}", value.application_version);
             println!("webapi_version={}", value.webapi_version);
@@ -668,6 +778,17 @@ fn render_fields(response: &Response) -> Result<(), CliError> {
     Ok(())
 }
 
+fn print_storage_root_fields(index: usize, root: &qb_proto::v1::StorageRootView) {
+    println!("storage_root.{index}.role={}", managed_root_name(root.root));
+    println!(
+        "storage_root.{index}.path={}",
+        sanitize_field(&root.path)
+    );
+    println!("storage_root.{index}.volume_id={}", root.volume_id);
+    println!("storage_root.{index}.free_bytes={}", root.free_bytes);
+    println!("storage_root.{index}.total_bytes={}", root.total_bytes);
+}
+
 fn print_torrent_fields(index: usize, torrent: &qb_proto::v1::TorrentSummary) {
     println!("torrent.{index}.id={}", torrent.id);
     println!("torrent.{index}.name={}", sanitize_field(&torrent.name));
@@ -723,6 +844,12 @@ fn daemon_state_name(value: i32) -> &'static str {
 fn torrent_state_name(value: i32) -> &'static str {
     TorrentStateView::try_from(value)
         .unwrap_or(TorrentStateView::Unknown)
+        .as_str_name()
+}
+
+fn managed_root_name(value: i32) -> &'static str {
+    ManagedRootView::try_from(value)
+        .unwrap_or(ManagedRootView::Unspecified)
         .as_str_name()
 }
 
