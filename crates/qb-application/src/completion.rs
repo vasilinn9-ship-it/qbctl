@@ -75,6 +75,7 @@ pub struct CompletionFileRecord {
     pub state: CompletionFileState,
     pub destination_evidence: Option<FileEvidence>,
     pub destination_sha256: Option<[u8; 32]>,
+    pub problem_code: Option<String>,
     pub revision: u64,
 }
 
@@ -1368,6 +1369,7 @@ mod tests {
                         state: CompletionFileState::Prepared,
                         destination_evidence: None,
                         destination_sha256: None,
+                        problem_code: None,
                         revision: 1,
                     })
                     .collect(),
