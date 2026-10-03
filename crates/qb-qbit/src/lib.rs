@@ -790,7 +790,10 @@ mod tests {
                         headers,
                         response.body
                     );
-                    socket.write_all(wire.as_bytes()).await.expect("write response");
+                    socket
+                        .write_all(wire.as_bytes())
+                        .await
+                        .expect("write response");
                     socket.shutdown().await.expect("shutdown");
                 }
             });
