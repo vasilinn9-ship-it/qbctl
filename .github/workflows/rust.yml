@@ -91,19 +91,16 @@ jobs:
           printf 'QBCTL_QBIT_PASSWORD=%s\n' "$password" >> "$GITHUB_ENV"
 
           for attempt in $(seq 1 30); do
-            response="$(curl -sS \
-              -H 'Origin: http://127.0.0.1:18080' \
-              --data-urlencode 'username=admin' \
-              --data-urlencode "password=$password" \
-              http://127.0.0.1:18080/api/v2/auth/login || true)"
-            if [[ "$response" == "Ok." ]]; then
+            status="$(curl -sS -o /dev/null -w '%{http_code}' \
+              http://127.0.0.1:18080/api/v2/app/version || true)"
+            if [[ "$status" != "000" && -n "$status" ]]; then
               exit 0
             fi
             sleep 1
           done
 
           docker logs qbctl-real-qbit
-          echo "qBittorrent WebAPI did not become ready" >&2
+          echo "qBittorrent WebAPI listener did not become ready" >&2
           exit 1
       - name: Real qBittorrent adapter acceptance
         env:
