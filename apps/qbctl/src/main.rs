@@ -474,7 +474,11 @@ fn render_human(response: &Response) -> Result<(), CliError> {
                 } else {
                     "disabled"
                 },
-                value.recovery_blockers.iter().map(|blocker| blocker.count).sum::<u64>()
+                value
+                    .recovery_blockers
+                    .iter()
+                    .map(|blocker| blocker.count)
+                    .sum::<u64>()
             );
             for blocker in &value.recovery_blockers {
                 println!(
@@ -729,7 +733,11 @@ fn render_fields(response: &Response) -> Result<(), CliError> {
             println!("recovery_blocker_count={}", value.recovery_blockers.len());
             println!(
                 "recovery_blocked_operation_count={}",
-                value.recovery_blockers.iter().map(|blocker| blocker.count).sum::<u64>()
+                value
+                    .recovery_blockers
+                    .iter()
+                    .map(|blocker| blocker.count)
+                    .sum::<u64>()
             );
             for (index, blocker) in value.recovery_blockers.iter().enumerate() {
                 println!(
