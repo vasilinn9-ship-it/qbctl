@@ -463,9 +463,9 @@ impl MutationJournal for Journal {
             .get_operation(operation_id)?
             .ok_or_else(|| PortError::new("OPERATION_NOT_FOUND", operation_id.to_string()))?;
         let expected = match current.disposition {
-            MutationDisposition::EffectPending | MutationDisposition::Unknown => {
-                current.disposition
-            }
+            MutationDisposition::EffectPending
+            | MutationDisposition::Blocked
+            | MutationDisposition::Unknown => current.disposition,
             other => {
                 return Err(PortError::new(
                     "OPERATION_TRANSITION_INVALID",
