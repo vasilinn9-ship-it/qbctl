@@ -8,7 +8,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     registry::{RegistryState, TorrentRegistry},
-    storage::{FileEvidence, ManagedRoot, SameVolumeMoveOutcome, Storage},
+    storage::{
+        FileEvidence, ManagedDeleteOutcome, ManagedRoot, SameVolumeMoveOutcome, Storage,
+        VerifiedCopyOutcome,
+    },
     torrent::{EffectAttempt, FileObservation, MetainfoReader, TorrentClient, TorrentView},
     PortError,
 };
@@ -288,6 +291,7 @@ pub enum CompletionExecutionStatus {
     UnknownStop,
     UnknownArchive,
     UnknownMove,
+    UnknownSourceDelete,
     Failed,
 }
 
@@ -907,14 +911,16 @@ impl CompletionService {
         &self,
         mut record: CompletionRecord,
         replayed: bool,
-        _explicit_request: bool,
+        explicit_request: bool,
     ) -> Result<CompletionExecution, PortError> {
         loop {
             let progress = match record.state {
                 CompletionState::Stopped
                 | CompletionState::ArchivePending
                 | CompletionState::UnknownArchive => self.advance_archive(record).await?,
-                CompletionState::PayloadPending => self.advance_payload(record).await?,
+                CompletionState::PayloadPending => {
+                    self.advance_payload(record, explicit_request).await?
+                }
                 CompletionState::RemoveRecordPending => {
                     return Ok(completion_execution(
                         CompletionExecutionStatus::RemoveRecordPending,
@@ -1124,6 +1130,7 @@ impl CompletionService {
     async fn advance_payload(
         &self,
         mut record: CompletionRecord,
+        explicit_request: bool,
     ) -> Result<HandoffProgress, PortError> {
         for index in 0..record.files.len() {
             let file = record.files[index].clone();
@@ -1131,17 +1138,13 @@ impl CompletionService {
                 continue;
             }
             if file.strategy == CompletionHandoffStrategy::CrossVolume {
-                return Ok(HandoffProgress::Halt {
-                    status: CompletionExecutionStatus::PayloadPending,
-                    record,
-                    problem: Some(PortError::new(
-                        "CROSS_VOLUME_PAYLOAD_PENDING",
-                        format!(
-                            "verified cross-volume copy is required for {}",
-                            file.relative_path
-                        ),
-                    )),
-                });
+                match self.advance_cross_volume_file(record, &file, explicit_request)? {
+                    HandoffProgress::Continue(next) => {
+                        record = next;
+                        continue;
+                    }
+                    halt @ HandoffProgress::Halt { .. } => return Ok(halt),
+                }
             }
 
             let observation = self.observe_same_volume_handoff(
@@ -1320,6 +1323,611 @@ impl CompletionService {
         let ready = self.journal.mark_payload_handed_off(&record.operation_id)?;
         Ok(HandoffProgress::Continue(ready))
     }
+
+    fn advance_cross_volume_file(
+        &self,
+        mut record: CompletionRecord,
+        original_file: &CompletionFileRecord,
+        explicit_request: bool,
+    ) -> Result<HandoffProgress, PortError> {
+        let temp_relative = completion_temp_relative(&record.operation_id, original_file.index);
+        let mut delete_intent_created_now = false;
+
+        loop {
+            let file = record
+                .files
+                .iter()
+                .find(|file| file.index == original_file.index)
+                .cloned()
+                .ok_or_else(|| {
+                    PortError::new(
+                        "COMPLETION_FILE_NOT_FOUND",
+                        original_file.index.to_string(),
+                    )
+                })?;
+
+            match file.state {
+                CompletionFileState::Prepared => {
+                    let source = self
+                        .storage
+                        .observe_file(ManagedRoot::Working, &file.relative_path)?;
+                    match source {
+                        Some(source) if source == file.source_evidence => {}
+                        Some(_) => {
+                            return self.block_file_handoff(
+                                record,
+                                &file,
+                                PortError::new(
+                                    "HANDOFF_SOURCE_CHANGED",
+                                    format!("Working source changed: {}", file.relative_path),
+                                ),
+                            );
+                        }
+                        None => {
+                            return self.block_file_handoff(
+                                record,
+                                &file,
+                                PortError::new(
+                                    "HANDOFF_SOURCE_MISSING",
+                                    format!("Working source is missing: {}", file.relative_path),
+                                ),
+                            );
+                        }
+                    }
+
+                    if self
+                        .storage
+                        .observe_file(ManagedRoot::Completed, &file.relative_path)?
+                        .is_some()
+                    {
+                        return self.block_file_handoff(
+                            record,
+                            &file,
+                            PortError::new(
+                                "HANDOFF_EFFECT_WITHOUT_INTENT",
+                                format!(
+                                    "Completed contains {} before a durable move intent",
+                                    file.relative_path
+                                ),
+                            ),
+                        );
+                    }
+                    if self
+                        .storage
+                        .observe_file(ManagedRoot::Completed, &temp_relative)?
+                        .is_some()
+                    {
+                        return self.block_file_handoff(
+                            record,
+                            &file,
+                            PortError::new(
+                                "HANDOFF_TEMP_WITHOUT_INTENT",
+                                format!(
+                                    "operation temp exists before a durable move intent: {temp_relative}"
+                                ),
+                            ),
+                        );
+                    }
+
+                    record = self
+                        .journal
+                        .mark_file_move_pending(&record.operation_id, file.index)?;
+                }
+                CompletionFileState::MovePending | CompletionFileState::UnknownMove => {
+                    let source = self
+                        .storage
+                        .observe_file(ManagedRoot::Working, &file.relative_path)?;
+                    match source {
+                        Some(source) if source == file.source_evidence => {}
+                        Some(_) => {
+                            return self.block_file_handoff(
+                                record,
+                                &file,
+                                PortError::new(
+                                    "HANDOFF_SOURCE_CHANGED",
+                                    format!("Working source changed: {}", file.relative_path),
+                                ),
+                            );
+                        }
+                        None => {
+                            return self.block_file_handoff(
+                                record,
+                                &file,
+                                PortError::new(
+                                    "HANDOFF_SOURCE_MISSING",
+                                    format!(
+                                        "Working source disappeared before destination receipt: {}",
+                                        file.relative_path
+                                    ),
+                                ),
+                            );
+                        }
+                    }
+
+                    if self
+                        .storage
+                        .observe_file(ManagedRoot::Completed, &file.relative_path)?
+                        .is_some()
+                    {
+                        match self.storage.copy_to_temp_verified(
+                            ManagedRoot::Working,
+                            &file.relative_path,
+                            ManagedRoot::Completed,
+                            &file.relative_path,
+                            &file.source_evidence,
+                        )? {
+                            VerifiedCopyOutcome::Verified {
+                                temp: destination,
+                                sha256,
+                                ..
+                            } => {
+                                record = self.journal.mark_file_destination_receipted(
+                                    &record.operation_id,
+                                    file.index,
+                                    &destination,
+                                    sha256,
+                                )?;
+                                continue;
+                            }
+                            VerifiedCopyOutcome::SourceMissing => {
+                                return self.block_file_handoff(
+                                    record,
+                                    &file,
+                                    PortError::new(
+                                        "HANDOFF_SOURCE_MISSING",
+                                        format!(
+                                            "Working source disappeared while verifying published destination: {}",
+                                            file.relative_path
+                                        ),
+                                    ),
+                                );
+                            }
+                            VerifiedCopyOutcome::SourceChanged { .. } => {
+                                return self.block_file_handoff(
+                                    record,
+                                    &file,
+                                    PortError::new(
+                                        "HANDOFF_SOURCE_CHANGED",
+                                        format!(
+                                            "Working source changed while verifying published destination: {}",
+                                            file.relative_path
+                                        ),
+                                    ),
+                                );
+                            }
+                            VerifiedCopyOutcome::TempConflict { .. } => {
+                                return self.block_file_handoff(
+                                    record,
+                                    &file,
+                                    PortError::new(
+                                        "DESTINATION_CONFLICT",
+                                        format!(
+                                            "Completed destination does not match Working source: {}",
+                                            file.relative_path
+                                        ),
+                                    ),
+                                );
+                            }
+                        }
+                    }
+
+                    let verified = match self.storage.copy_to_temp_verified(
+                        ManagedRoot::Working,
+                        &file.relative_path,
+                        ManagedRoot::Completed,
+                        &temp_relative,
+                        &file.source_evidence,
+                    ) {
+                        Ok(VerifiedCopyOutcome::Verified {
+                            temp,
+                            sha256,
+                            ..
+                        }) => (temp, sha256),
+                        Ok(VerifiedCopyOutcome::SourceMissing) => {
+                            return self.block_file_handoff(
+                                record,
+                                &file,
+                                PortError::new(
+                                    "HANDOFF_SOURCE_MISSING",
+                                    format!(
+                                        "Working source disappeared during verified copy: {}",
+                                        file.relative_path
+                                    ),
+                                ),
+                            );
+                        }
+                        Ok(VerifiedCopyOutcome::SourceChanged { .. }) => {
+                            return self.block_file_handoff(
+                                record,
+                                &file,
+                                PortError::new(
+                                    "HANDOFF_SOURCE_CHANGED",
+                                    format!(
+                                        "Working source changed during verified copy: {}",
+                                        file.relative_path
+                                    ),
+                                ),
+                            );
+                        }
+                        Ok(VerifiedCopyOutcome::TempConflict { .. }) => {
+                            return self.block_file_handoff(
+                                record,
+                                &file,
+                                PortError::new(
+                                    "HANDOFF_TEMP_CONFLICT",
+                                    format!(
+                                        "operation temp does not match Working source: {temp_relative}"
+                                    ),
+                                ),
+                            );
+                        }
+                        Err(problem) => {
+                            record = self.journal.mark_file_unknown_move(
+                                &record.operation_id,
+                                file.index,
+                                problem.code,
+                            )?;
+                            return Ok(HandoffProgress::Halt {
+                                status: CompletionExecutionStatus::UnknownMove,
+                                record,
+                                problem: Some(problem),
+                            });
+                        }
+                    };
+
+                    match self.storage.move_same_volume_no_replace(
+                        ManagedRoot::Completed,
+                        &temp_relative,
+                        ManagedRoot::Completed,
+                        &file.relative_path,
+                        &verified.0,
+                    ) {
+                        Ok(SameVolumeMoveOutcome::Moved { destination }) => {
+                            record = self.journal.mark_file_destination_receipted(
+                                &record.operation_id,
+                                file.index,
+                                &destination,
+                                verified.1,
+                            )?;
+                        }
+                        Ok(SameVolumeMoveOutcome::DestinationExists { .. })
+                        | Ok(SameVolumeMoveOutcome::SourceMissing) => {
+                            match self.storage.copy_to_temp_verified(
+                                ManagedRoot::Working,
+                                &file.relative_path,
+                                ManagedRoot::Completed,
+                                &file.relative_path,
+                                &file.source_evidence,
+                            )? {
+                                VerifiedCopyOutcome::Verified {
+                                    temp: destination,
+                                    sha256,
+                                    ..
+                                } => {
+                                    record = self.journal.mark_file_destination_receipted(
+                                        &record.operation_id,
+                                        file.index,
+                                        &destination,
+                                        sha256,
+                                    )?;
+                                }
+                                _ => {
+                                    record = self.journal.mark_file_unknown_move(
+                                        &record.operation_id,
+                                        file.index,
+                                        "HANDOFF_PUBLISH_UNCERTAIN",
+                                    )?;
+                                    return Ok(HandoffProgress::Halt {
+                                        status: CompletionExecutionStatus::UnknownMove,
+                                        record,
+                                        problem: Some(PortError::new(
+                                            "HANDOFF_PUBLISH_UNCERTAIN",
+                                            format!(
+                                                "published destination could not be verified for {}",
+                                                file.relative_path
+                                            ),
+                                        )),
+                                    });
+                                }
+                            }
+                        }
+                        Ok(SameVolumeMoveOutcome::SourceChanged { .. }) => {
+                            return self.block_file_handoff(
+                                record,
+                                &file,
+                                PortError::new(
+                                    "HANDOFF_TEMP_CHANGED",
+                                    format!(
+                                        "operation temp changed before publish: {temp_relative}"
+                                    ),
+                                ),
+                            );
+                        }
+                        Err(problem) => {
+                            record = self.journal.mark_file_unknown_move(
+                                &record.operation_id,
+                                file.index,
+                                problem.code,
+                            )?;
+                            return Ok(HandoffProgress::Halt {
+                                status: CompletionExecutionStatus::UnknownMove,
+                                record,
+                                problem: Some(problem),
+                            });
+                        }
+                    }
+                }
+                CompletionFileState::DestinationReceipted => {
+                    let destination = file.destination_evidence.as_ref().ok_or_else(|| {
+                        PortError::new(
+                            "JOURNAL_STATE_INVALID",
+                            "destination-receipted file has no destination evidence",
+                        )
+                    })?;
+                    let sha256 = file.destination_sha256.ok_or_else(|| {
+                        PortError::new(
+                            "JOURNAL_STATE_INVALID",
+                            "destination-receipted file has no destination digest",
+                        )
+                    })?;
+                    if self
+                        .storage
+                        .observe_file(ManagedRoot::Completed, &file.relative_path)?
+                        .as_ref()
+                        != Some(destination)
+                    {
+                        return self.block_file_handoff(
+                            record,
+                            &file,
+                            PortError::new(
+                                "DESTINATION_CHANGED",
+                                format!(
+                                    "Completed destination changed after receipt: {}",
+                                    file.relative_path
+                                ),
+                            ),
+                        );
+                    }
+                    match self
+                        .storage
+                        .observe_file(ManagedRoot::Working, &file.relative_path)?
+                    {
+                        Some(source) if source == file.source_evidence => {}
+                        Some(_) => {
+                            return self.block_file_handoff(
+                                record,
+                                &file,
+                                PortError::new(
+                                    "HANDOFF_SOURCE_CHANGED",
+                                    format!(
+                                        "Working source changed after destination receipt: {}",
+                                        file.relative_path
+                                    ),
+                                ),
+                            );
+                        }
+                        None => {
+                            return self.block_file_handoff(
+                                record,
+                                &file,
+                                PortError::new(
+                                    "HANDOFF_DELETE_WITHOUT_INTENT",
+                                    format!(
+                                        "Working source disappeared before source-delete intent: {}",
+                                        file.relative_path
+                                    ),
+                                ),
+                            );
+                        }
+                    }
+                    let _ = sha256;
+                    record = self.journal.mark_file_source_delete_pending(
+                        &record.operation_id,
+                        file.index,
+                    )?;
+                    delete_intent_created_now = true;
+                }
+                CompletionFileState::SourceDeletePending
+                | CompletionFileState::UnknownSourceDelete => {
+                    let destination = file.destination_evidence.as_ref().ok_or_else(|| {
+                        PortError::new(
+                            "JOURNAL_STATE_INVALID",
+                            "source-delete file has no destination evidence",
+                        )
+                    })?;
+                    let sha256 = file.destination_sha256.ok_or_else(|| {
+                        PortError::new(
+                            "JOURNAL_STATE_INVALID",
+                            "source-delete file has no destination digest",
+                        )
+                    })?;
+                    if self
+                        .storage
+                        .observe_file(ManagedRoot::Completed, &file.relative_path)?
+                        .as_ref()
+                        != Some(destination)
+                    {
+                        return self.block_file_handoff(
+                            record,
+                            &file,
+                            PortError::new(
+                                "DESTINATION_CHANGED",
+                                format!(
+                                    "Completed destination changed before source delete: {}",
+                                    file.relative_path
+                                ),
+                            ),
+                        );
+                    }
+
+                    match self
+                        .storage
+                        .observe_file(ManagedRoot::Working, &file.relative_path)?
+                    {
+                        None => {
+                            record = self.journal.mark_file_handed_off(
+                                &record.operation_id,
+                                file.index,
+                                destination,
+                                Some(sha256),
+                            )?;
+                            return Ok(HandoffProgress::Continue(record));
+                        }
+                        Some(source) if source == file.source_evidence => {}
+                        Some(_) => {
+                            return self.block_file_handoff(
+                                record,
+                                &file,
+                                PortError::new(
+                                    "HANDOFF_SOURCE_CHANGED",
+                                    format!(
+                                        "Working source changed before exact delete: {}",
+                                        file.relative_path
+                                    ),
+                                ),
+                            );
+                        }
+                    }
+
+                    if file.state == CompletionFileState::UnknownSourceDelete && !explicit_request {
+                        return Ok(HandoffProgress::Halt {
+                            status: CompletionExecutionStatus::UnknownSourceDelete,
+                            record,
+                            problem: Some(PortError::new(
+                                "HANDOFF_SOURCE_DELETE_UNCERTAIN",
+                                format!(
+                                    "source delete remains uncertain for {}; explicit replay is required",
+                                    file.relative_path
+                                ),
+                            )),
+                        });
+                    }
+                    if file.state == CompletionFileState::SourceDeletePending
+                        && !delete_intent_created_now
+                        && !explicit_request
+                    {
+                        record = self.journal.mark_file_unknown_source_delete(
+                            &record.operation_id,
+                            file.index,
+                            "HANDOFF_SOURCE_DELETE_UNCERTAIN",
+                        )?;
+                        return Ok(HandoffProgress::Halt {
+                            status: CompletionExecutionStatus::UnknownSourceDelete,
+                            record,
+                            problem: Some(PortError::new(
+                                "HANDOFF_SOURCE_DELETE_UNCERTAIN",
+                                format!(
+                                    "restart observed source still present after durable delete intent for {}",
+                                    file.relative_path
+                                ),
+                            )),
+                        });
+                    }
+                    if file.state == CompletionFileState::UnknownSourceDelete {
+                        record = self.journal.mark_file_source_delete_pending(
+                            &record.operation_id,
+                            file.index,
+                        )?;
+                    }
+
+                    match self.storage.delete_managed_exact(
+                        ManagedRoot::Working,
+                        &file.relative_path,
+                        &file.source_evidence,
+                        &sha256,
+                    ) {
+                        Ok(ManagedDeleteOutcome::Deleted | ManagedDeleteOutcome::Missing) => {
+                            if self
+                                .storage
+                                .observe_file(ManagedRoot::Working, &file.relative_path)?
+                                .is_none()
+                            {
+                                record = self.journal.mark_file_handed_off(
+                                    &record.operation_id,
+                                    file.index,
+                                    destination,
+                                    Some(sha256),
+                                )?;
+                                return Ok(HandoffProgress::Continue(record));
+                            }
+                            record = self.journal.mark_file_unknown_source_delete(
+                                &record.operation_id,
+                                file.index,
+                                "HANDOFF_SOURCE_DELETE_UNCERTAIN",
+                            )?;
+                            return Ok(HandoffProgress::Halt {
+                                status: CompletionExecutionStatus::UnknownSourceDelete,
+                                record,
+                                problem: Some(PortError::new(
+                                    "HANDOFF_SOURCE_DELETE_UNCERTAIN",
+                                    format!(
+                                        "source delete did not produce an absent source observation for {}",
+                                        file.relative_path
+                                    ),
+                                )),
+                            });
+                        }
+                        Ok(ManagedDeleteOutcome::Changed) => {
+                            return self.block_file_handoff(
+                                record,
+                                &file,
+                                PortError::new(
+                                    "HANDOFF_SOURCE_CHANGED",
+                                    format!(
+                                        "Working source changed at exact-delete boundary: {}",
+                                        file.relative_path
+                                    ),
+                                ),
+                            );
+                        }
+                        Err(problem) => {
+                            record = self.journal.mark_file_unknown_source_delete(
+                                &record.operation_id,
+                                file.index,
+                                problem.code,
+                            )?;
+                            return Ok(HandoffProgress::Halt {
+                                status: CompletionExecutionStatus::UnknownSourceDelete,
+                                record,
+                                problem: Some(problem),
+                            });
+                        }
+                    }
+                }
+                CompletionFileState::HandedOff => return Ok(HandoffProgress::Continue(record)),
+                CompletionFileState::Blocked => {
+                    return self.block_handoff(
+                        record,
+                        PortError::new(
+                            "HANDOFF_FILE_BLOCKED",
+                            format!("file handoff is blocked: {}", file.relative_path),
+                        ),
+                    );
+                }
+                CompletionFileState::Failed => {
+                    return Ok(HandoffProgress::Halt {
+                        status: CompletionExecutionStatus::Failed,
+                        record,
+                        problem: Some(PortError::new(
+                            "HANDOFF_FILE_FAILED",
+                            format!("file handoff failed: {}", file.relative_path),
+                        )),
+                    });
+                }
+            }
+        }
+    }
+
+fn completion_temp_relative(operation_id: &OperationId, file_index: u32) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(operation_id.as_str().as_bytes());
+    let mut token = String::with_capacity(32);
+    for byte in &digest[..16] {
+        token.push(char::from(HEX[usize::from(byte >> 4)]));
+        token.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    format!("_qbctl_tmp/{token}/{file_index}.part")
+}
 
     fn observe_same_volume_handoff(
         &self,
