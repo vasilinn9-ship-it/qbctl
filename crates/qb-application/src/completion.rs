@@ -4317,6 +4317,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recover_operation_rejects_wrong_request_id_before_any_effect() {
+        let journal = Arc::new(FakeCompletionJournal::default());
+        let storage = FakeStorage::populated();
+        let client = FakeClient::complete();
+        client.with_stop_effects(vec![FakeStopEffect::Uncertain]);
+
+        let first = execution(
+            completion_service(journal.clone(), storage.clone(), client.clone())
+                .execute(&request())
+                .await
+                .expect("execute completion"),
+        );
+        assert_eq!(first.status, CompletionExecutionStatus::UnknownStop);
+        assert_eq!(client.stop_calls.load(Ordering::SeqCst), 1);
+
+        let wrong_request_id =
+            RequestId::new("different-completion-request").expect("wrong request id");
+        let problem = completion_service(journal, storage, client.clone())
+            .recover_operation(&first.record.operation_id, &wrong_request_id)
+            .await
+            .expect_err("wrong RequestId must be rejected");
+
+        assert_eq!(problem.code, "REQUEST_ID_CONFLICT");
+        assert_eq!(client.stop_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn explicit_replay_retries_unknown_stop_only_after_running_observation() {
         let journal = Arc::new(FakeCompletionJournal::default());
         let storage = FakeStorage::populated();
