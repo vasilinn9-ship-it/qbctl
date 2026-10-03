@@ -3,12 +3,13 @@ use qb_application::{
         DaemonPhase, DoctorReport as ApplicationDoctorReport,
         SystemStatus as ApplicationSystemStatus,
     },
-    torrent::{QbitProbe, QueueSettings, TorrentView, TransferInfo},
+    torrent::{QbitProbe, QueueSettings, TorrentView, TrackerEvidence, TrackerStatus, TransferInfo},
 };
 use qb_domain::torrent::TorrentState;
 use qb_proto::v1::{
     DaemonState, DoctorCheck, DoctorResponse, QbitProbeResponse, QueueSettingsResponse,
-    StatusResponse, TorrentListResponse, TorrentStateView, TorrentSummary, TransferLimitsResponse,
+    StatusResponse, TorrentListResponse, TorrentStateView, TorrentSummary, TrackerEvidenceView,
+    TrackerStatusView, TransferLimitsResponse,
 };
 
 pub fn daemon_state(phase: DaemonPhase) -> DaemonState {
@@ -109,5 +110,28 @@ fn torrent_state(value: TorrentState) -> TorrentStateView {
         TorrentState::QueuedUploading => TorrentStateView::QueuedUploading,
         TorrentState::Error => TorrentStateView::Error,
         TorrentState::Unknown => TorrentStateView::Unknown,
+    }
+}
+
+
+pub fn tracker_evidence(value: TrackerEvidence) -> TrackerEvidenceView {
+    TrackerEvidenceView {
+        identity: value.identity,
+        status: tracker_status(value.status) as i32,
+        peers: value.peers,
+        seeds: value.seeds,
+        leeches: value.leeches,
+        message: value.message,
+    }
+}
+
+fn tracker_status(value: TrackerStatus) -> TrackerStatusView {
+    match value {
+        TrackerStatus::Disabled => TrackerStatusView::Disabled,
+        TrackerStatus::NotContacted => TrackerStatusView::NotContacted,
+        TrackerStatus::Working => TrackerStatusView::Working,
+        TrackerStatus::Updating => TrackerStatusView::Updating,
+        TrackerStatus::Error => TrackerStatusView::Error,
+        TrackerStatus::Unknown => TrackerStatusView::Unknown,
     }
 }
