@@ -44,7 +44,7 @@ Baseline authentication remains `auth/login` session-cookie auth. The adapter ac
 - password/session cookies are never logged or persisted in operational SQLite.
 - DTOs deserialize only fields required by a use case.
 - required observation fields fail closed when absent; incompatible responses are not silently defaulted to zero/false evidence.
-- tracker URLs are redacted before leaving qb-qbit.
+- tracker URLs are reduced to scheme/host/port before leaving qb-qbit; credentials, query values and secret-like path tokens derived from the tracker URL are also redacted from diagnostic messages.
 
 ## Mutation contract
 
