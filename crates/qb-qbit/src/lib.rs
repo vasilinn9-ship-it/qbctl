@@ -184,7 +184,7 @@ impl QbitClient {
                 peers: row.num_peers,
                 seeds: row.num_seeds,
                 leeches: row.num_leeches,
-                message: sanitize_tracker_message(&row.msg, 512),
+                message: sanitize_tracker_message(&row.msg, &row.url, 512),
             })
             .collect())
     }
@@ -631,8 +631,45 @@ fn redact_tracker_identity(value: &str) -> String {
     }
 }
 
-fn sanitize_tracker_message(value: &str, max_chars: usize) -> String {
-    sanitize_untrusted_text(value, max_chars)
+fn sanitize_tracker_message(value: &str, tracker_url: &str, max_chars: usize) -> String {
+    let mut sanitized: String = value
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+
+    if let Ok(url) = Url::parse(tracker_url) {
+        let mut secrets = Vec::new();
+        if !url.username().is_empty() {
+            secrets.push(url.username().to_string());
+        }
+        if let Some(password) = url.password().filter(|value| !value.is_empty()) {
+            secrets.push(password.to_string());
+        }
+        secrets.extend(
+            url.query_pairs()
+                .map(|(_, value)| value.into_owned())
+                .filter(|value| !value.is_empty()),
+        );
+        if let Some(segments) = url.path_segments() {
+            secrets.extend(
+                segments
+                    .filter(|segment| {
+                        segment.len() >= 8
+                            && !segment.eq_ignore_ascii_case("announce")
+                            && !segment.eq_ignore_ascii_case("scrape")
+                    })
+                    .map(str::to_string),
+            );
+        }
+
+        secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+        secrets.dedup();
+        for secret in secrets {
+            sanitized = sanitized.replace(&secret, "<redacted>");
+        }
+    }
+
+    sanitized
         .split_whitespace()
         .map(|token| {
             if token.contains("://") {
@@ -643,6 +680,9 @@ fn sanitize_tracker_message(value: &str, max_chars: usize) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+        .chars()
+        .take(max_chars)
+        .collect()
 }
 
 fn sanitize_untrusted_text(value: &str, max_chars: usize) -> String {
@@ -805,12 +845,20 @@ mod tests {
             "<invalid-tracker>"
         );
 
+        let tracker_url =
+            "https://user:password@tracker.example/announce/secret-passkey?passkey=query-secret";
         let message = sanitize_tracker_message(
-            "timeout from https://tracker.example/announce/secret-passkey",
+            "timeout from https://tracker.example/announce/secret-passkey; passkey=query-secret user password secret-passkey",
+            tracker_url,
             512,
         );
-        assert_eq!(message, "timeout from <tracker-url>");
-        assert!(!message.contains("secret-passkey"));
+        assert_eq!(
+            message,
+            "timeout from <tracker-url> passkey=<redacted> <redacted> <redacted> <redacted>"
+        );
+        for secret in ["query-secret", "secret-passkey", "password", "user"] {
+            assert!(!message.contains(secret));
+        }
     }
 
     #[test]
