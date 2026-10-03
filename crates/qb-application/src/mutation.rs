@@ -282,7 +282,7 @@ pub enum MutationExecutionResult {
 pub struct MutationService {
     journal: std::sync::Arc<dyn MutationJournal>,
     client: Option<std::sync::Arc<dyn crate::torrent::TorrentClient>>,
-    lane: tokio::sync::Mutex<()>,
+    lane: crate::MutationLane,
 }
 
 impl MutationService {
@@ -293,8 +293,13 @@ impl MutationService {
         Self {
             journal,
             client,
-            lane: tokio::sync::Mutex::new(()),
+            lane: crate::mutation_lane(),
         }
+    }
+
+    pub fn with_mutation_lane(mut self, lane: crate::MutationLane) -> Self {
+        self.lane = lane;
+        self
     }
 
     pub async fn execute(
