@@ -168,8 +168,7 @@ impl TorrentClient for FakeTorrentClient {
 
 fn stop_command() -> MutationCommand {
     MutationCommand::TorrentControl {
-        torrent_id: TorrentId::new("abcdef0123456789abcdef0123456789abcdef01")
-            .expect("torrent id"),
+        torrent_id: TorrentId::new("abcdef0123456789abcdef0123456789abcdef01").expect("torrent id"),
         action: TorrentControlAction::Stop,
     }
 }
