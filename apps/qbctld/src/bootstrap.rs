@@ -75,45 +75,44 @@ pub fn build(runtime_override: Option<PathBuf>) -> Result<Bootstrap> {
         .map(|storage| build_managed_storage(storage, runtime_root.path()))
         .transpose()?;
     let incoming = storage.as_ref().map(|storage| {
-        build_incoming_service(
-            storage.clone(),
-            registry.clone(),
-            cleanup_journal.clone(),
-        )
+        build_incoming_service(storage.clone(), registry.clone(), cleanup_journal.clone())
     });
 
     let (torrents, mutation_client, release_client, qbit_startup_problem) =
         match config.qbittorrent.as_ref() {
-        Some(qbit) => match build_qbit_client(qbit) {
-            Ok(client) => {
-                let torrent_port: Arc<dyn TorrentClient> = client.clone();
-                let mutation_port: Arc<dyn TorrentClient> = client;
-                let release_port: Arc<dyn TorrentClient> = client;
-                (
-                    Some(Arc::new(TorrentService::new(torrent_port))),
-                    Some(mutation_port),
-                    Some(release_port),
-                    None,
-                )
-            }
-            Err(error) => (None, None, None, Some(error.to_string())),
-        },
-        None => (
-            None,
-            None,
-            None,
-            Some("qBittorrent is not configured for the Rust daemon".into()),
-        ),
-    };
+            Some(qbit) => match build_qbit_client(qbit) {
+                Ok(client) => {
+                    let torrent_port: Arc<dyn TorrentClient> = client.clone();
+                    let mutation_port: Arc<dyn TorrentClient> = client;
+                    let release_port: Arc<dyn TorrentClient> = client;
+                    (
+                        Some(Arc::new(TorrentService::new(torrent_port))),
+                        Some(mutation_port),
+                        Some(release_port),
+                        None,
+                    )
+                }
+                Err(error) => (None, None, None, Some(error.to_string())),
+            },
+            None => (
+                None,
+                None,
+                None,
+                Some("qBittorrent is not configured for the Rust daemon".into()),
+            ),
+        };
     let mutations = Arc::new(MutationService::new(mutation_journal, mutation_client));
-    let release = storage.as_ref().zip(release_client).map(|(storage, client)| {
-        Arc::new(ReleaseService::new(
-            release_journal.clone(),
-            storage.clone(),
-            client,
-            MAX_METAINFO_BYTES,
-        ))
-    });
+    let release = storage
+        .as_ref()
+        .zip(release_client)
+        .map(|(storage, client)| {
+            Arc::new(ReleaseService::new(
+                release_journal.clone(),
+                storage.clone(),
+                client,
+                MAX_METAINFO_BYTES,
+            ))
+        });
 
     if release.is_none() {
         let recoverable = release_journal
@@ -140,10 +139,7 @@ pub fn build(runtime_override: Option<PathBuf>) -> Result<Bootstrap> {
     })
 }
 
-fn build_managed_storage(
-    config: &StorageConfig,
-    runtime_root: &Path,
-) -> Result<Arc<dyn Storage>> {
+fn build_managed_storage(config: &StorageConfig, runtime_root: &Path) -> Result<Arc<dyn Storage>> {
     let roots = ManagedRootLayout {
         incoming: config.incoming.clone(),
         archive: config.archive.clone(),
