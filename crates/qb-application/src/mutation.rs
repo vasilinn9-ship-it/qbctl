@@ -282,11 +282,14 @@ impl MutationService {
         record: MutationRecord,
         replayed: bool,
     ) -> Result<MutationExecution, PortError> {
-        if let MutationCommand::SetQueueTarget {
-            target_client_count,
-        } = &record.command
-        {
-            return self.advance_queue_target(record, *target_client_count, replayed);
+        let local_queue_target = match &record.command {
+            MutationCommand::SetQueueTarget {
+                target_client_count,
+            } => Some(*target_client_count),
+            _ => None,
+        };
+        if let Some(target_client_count) = local_queue_target {
+            return self.advance_queue_target(record, target_client_count, replayed);
         }
 
         match record.disposition {
