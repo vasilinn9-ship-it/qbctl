@@ -8,6 +8,7 @@ use anyhow::{Context as _, Result};
 use prost::Message;
 use qb_application::{
     mutation::MutationService,
+    storage::StorageStatusService,
     system::{RuntimeHealthPort, SystemService},
     torrent::TorrentService,
 };
@@ -23,6 +24,7 @@ pub async fn serve_connection(
     mut connection: ServerConnection,
     runtime: Arc<RuntimeContext>,
     system: Arc<SystemService>,
+    storage: Option<Arc<StorageStatusService>>,
     torrents: Option<Arc<TorrentService>>,
     mutations: Arc<MutationService>,
     qbit_startup_problem: Option<Arc<str>>,
@@ -52,6 +54,7 @@ pub async fn serve_connection(
         let response = dispatch::dispatch(
             request,
             &system,
+            storage.as_deref(),
             torrents.as_deref(),
             Some(mutations.as_ref()),
             mutation_admission_enabled,
@@ -82,5 +85,7 @@ pub(crate) fn capabilities() -> Vec<String> {
         "transfer.limits.write.v1".into(),
         "request-idempotency.v1".into(),
         "operation.recovery.v1".into(),
+        "storage.read.v1".into(),
+        "incoming.status.v1".into(),
     ]
 }
