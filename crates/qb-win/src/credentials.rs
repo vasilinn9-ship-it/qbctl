@@ -91,7 +91,7 @@ unsafe fn read_wide_z(pointer: *mut u16) -> Option<String> {
 #[cfg(windows)]
 fn decode_secret(blob: &[u8]) -> Option<String> {
     let looks_utf16_le = blob.len().is_multiple_of(2)
-        && (blob.starts_with(&[0xff, 0xfe]) || blob.iter().any(|byte| *byte == 0));
+        && (blob.starts_with(&[0xff, 0xfe]) || blob.contains(&0));
 
     if looks_utf16_le {
         if let Some(value) = decode_utf16_le(blob) {
