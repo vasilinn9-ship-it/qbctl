@@ -100,6 +100,12 @@ pub struct ManifestFile {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TorrentMetainfo {
+    pub identity: TorrentIdentity,
+    pub manifest: TorrentManifest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TorrentManifest {
     pub files: Vec<ManifestFile>,
     pub total_size: u64,
