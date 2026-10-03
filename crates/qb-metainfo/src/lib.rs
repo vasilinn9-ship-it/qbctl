@@ -442,18 +442,15 @@ fn merkle_root_from_piece_layer(
     layer: &[u8],
     piece_length: u64,
 ) -> Result<[u8; 32], MetainfoError> {
-    if layer.is_empty() || layer.len() % 32 != 0 {
+    if layer.is_empty() || !layer.len().is_multiple_of(32) {
         return Err(invalid("piece layer must contain 32-byte hashes"));
     }
 
-    let mut hashes: Vec<[u8; 32]> = layer
-        .chunks_exact(32)
-        .map(|chunk| {
-            let mut hash = [0_u8; 32];
-            hash.copy_from_slice(chunk);
-            hash
-        })
-        .collect();
+    let (chunks, remainder) = layer.as_chunks::<32>();
+    if !remainder.is_empty() {
+        return Err(invalid("piece layer must contain 32-byte hashes"));
+    }
+    let mut hashes: Vec<[u8; 32]> = chunks.to_vec();
 
     let padded_len = hashes
         .len()
@@ -464,7 +461,9 @@ fn merkle_root_from_piece_layer(
 
     while hashes.len() > 1 {
         let mut parents = Vec::with_capacity(hashes.len() / 2);
-        for pair in hashes.chunks_exact(2) {
+        let (pairs, remainder) = hashes.as_slice().as_chunks::<2>();
+        debug_assert!(remainder.is_empty());
+        for pair in pairs {
             let mut input = [0_u8; 64];
             input[..32].copy_from_slice(&pair[0]);
             input[32..].copy_from_slice(&pair[1]);
@@ -502,7 +501,7 @@ fn validate_hybrid(v1: &V1Parsed, v2: &V2Parsed) -> Result<(), MetainfoError> {
 
     let mut offset = 0_u64;
     for entry in &v1.layout {
-        if !entry.padding && entry.size > 0 && offset % v1.piece_length != 0 {
+        if !entry.padding && entry.size > 0 && !offset.is_multiple_of(v1.piece_length) {
             return Err(invalid(
                 "hybrid v1 layout does not align content files to piece boundaries",
             ));
@@ -661,8 +660,8 @@ fn join_path(path: &[String]) -> String {
     path.join("/")
 }
 
-const fn div_ceil(value: u64, divisor: u64) -> u64 {
-    value / divisor + if value % divisor != 0 { 1 } else { 0 }
+fn div_ceil(value: u64, divisor: u64) -> u64 {
+    value.div_ceil(divisor)
 }
 
 fn display_key(key: &[u8]) -> String {
