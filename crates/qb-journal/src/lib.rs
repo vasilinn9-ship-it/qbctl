@@ -743,8 +743,18 @@ impl AdmissionJournal for Journal {
                     operation_id.as_str(),
                     registry_id,
                     request.source_relative,
-                    request.source_evidence.identity.volume_id.to_be_bytes().as_slice(),
-                    request.source_evidence.identity.file_id.to_be_bytes().as_slice(),
+                    request
+                        .source_evidence
+                        .identity
+                        .volume_id
+                        .to_be_bytes()
+                        .as_slice(),
+                    request
+                        .source_evidence
+                        .identity
+                        .file_id
+                        .to_be_bytes()
+                        .as_slice(),
                     request.source_evidence.size.to_be_bytes().as_slice(),
                     request
                         .source_evidence
@@ -1767,10 +1777,7 @@ fn load_admission_record(
                 file_id: decode_u64_blob(&source_file_id, "source_file_id")?,
             },
             size: decode_u64_blob(&source_size, "source_size")?,
-            modified_marker: decode_u128_blob(
-                &source_modified_marker,
-                "source_modified_marker",
-            )?,
+            modified_marker: decode_u128_blob(&source_modified_marker, "source_modified_marker")?,
         },
         source_metainfo_digest,
         working_volume_id: decode_u64_blob(&working_volume_id, "working_volume_id")?,
@@ -1785,9 +1792,9 @@ fn load_admission_record(
 }
 
 fn decode_u64_blob(bytes: &[u8], field: &str) -> Result<u64, JournalError> {
-    let value: [u8; 8] = bytes.try_into().map_err(|_| {
-        JournalError::InvalidState(format!("{field} must contain exactly 8 bytes"))
-    })?;
+    let value: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| JournalError::InvalidState(format!("{field} must contain exactly 8 bytes")))?;
     Ok(u64::from_be_bytes(value))
 }
 
@@ -2329,8 +2336,7 @@ mod tests {
     fn admission_request(id: &str) -> AdmissionReservationRequest {
         AdmissionReservationRequest {
             request_id: RequestId::new(id).expect("request id"),
-            identity: TorrentIdentity::new(Some([0x91; 20]), Some([0xa2; 32]))
-                .expect("identity"),
+            identity: TorrentIdentity::new(Some([0x91; 20]), Some([0xa2; 32])).expect("identity"),
             source_relative: "candidate.torrent".into(),
             source_evidence: qb_application::storage::FileEvidence {
                 identity: qb_application::storage::FileIdentity {
@@ -2362,7 +2368,10 @@ mod tests {
             assert_eq!(record.disposition, MutationDisposition::Prepared);
             assert_eq!(record.checkpoint, "prepared");
             assert_eq!(record.source_evidence, request.source_evidence);
-            assert_eq!(record.source_metainfo_digest, request.source_metainfo_digest);
+            assert_eq!(
+                record.source_metainfo_digest,
+                request.source_metainfo_digest
+            );
             assert_eq!(record.working_volume_id, 42);
             assert_eq!(record.reserved_bytes, 4096);
 
@@ -2375,7 +2384,9 @@ mod tests {
                 other => panic!("unexpected replay: {other:?}"),
             }
 
-            let reservations = journal.capacity_reservations(42).expect("capacity reservations");
+            let reservations = journal
+                .capacity_reservations(42)
+                .expect("capacity reservations");
             assert_eq!(reservations.len(), 1);
             assert_eq!(reservations[0].responsible, record.operation_id.as_str());
             assert_eq!(reservations[0].bytes, 4096);
@@ -2390,8 +2401,17 @@ mod tests {
         assert_eq!(record.request_id, request.request_id);
         assert_eq!(record.identity, request.identity);
         assert_eq!(record.source_evidence, request.source_evidence);
-        assert_eq!(reopened.list_recoverable_admissions().expect("recoverable").len(), 1);
-        assert!(reopened.list_recoverable().expect("mutation recovery").is_empty());
+        assert_eq!(
+            reopened
+                .list_recoverable_admissions()
+                .expect("recoverable")
+                .len(),
+            1
+        );
+        assert!(reopened
+            .list_recoverable()
+            .expect("mutation recovery")
+            .is_empty());
     }
 
     #[test]

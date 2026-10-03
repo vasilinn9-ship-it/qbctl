@@ -315,8 +315,7 @@ mod tests {
     fn admission_fingerprint_covers_source_and_capacity_identity() {
         let base = AdmissionReservationRequest {
             request_id: RequestId::new("admission-1").expect("request id"),
-            identity: TorrentIdentity::new(Some([0x11; 20]), Some([0x22; 32]))
-                .expect("identity"),
+            identity: TorrentIdentity::new(Some([0x11; 20]), Some([0x22; 32])).expect("identity"),
             source_relative: "candidate.torrent".into(),
             source_evidence: FileEvidence {
                 identity: crate::storage::FileIdentity {
