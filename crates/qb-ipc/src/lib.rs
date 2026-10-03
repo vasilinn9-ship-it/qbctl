@@ -194,10 +194,7 @@ mod platform {
 
         #[tokio::test]
         async fn listener_keeps_a_pending_instance_for_immediate_reconnect() {
-            let name = format!(
-                r"\\.\pipe\qbctl-ipc-reconnect-test-{}",
-                std::process::id()
-            );
+            let name = format!(r"\\.\pipe\qbctl-ipc-reconnect-test-{}", std::process::id());
             let mut listener = ServerListener::bind(&name).expect("listener");
 
             let first_client = ClientConnection::connect(&name)
