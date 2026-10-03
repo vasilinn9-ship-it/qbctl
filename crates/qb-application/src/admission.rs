@@ -1,9 +1,15 @@
-use qb_domain::{torrent::TorrentIdentity, OperationId, RequestId};
+use std::{sync::Arc, time::Duration};
+
+use qb_domain::{
+    torrent::{TorrentIdentity, TorrentState},
+    OperationId, RequestId,
+};
 use sha2::{Digest, Sha256};
 
 use crate::{
     mutation::MutationDisposition,
     storage::{FileEvidence, IncomingScan, ManagedRoot, Storage},
+    torrent::{AddTorrentRequest, EffectAttempt, TorrentClient},
     PortError,
 };
 
@@ -129,6 +135,491 @@ pub trait AdmissionJournal: Send + Sync {
         problem_code: &str,
     ) -> Result<AdmissionRecord, PortError>;
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdmissionExecutionStatus {
+    Finished,
+    Blocked,
+    Unknown,
+    Failed,
+}
+
+#[derive(Debug)]
+pub struct AdmissionExecution {
+    pub status: AdmissionExecutionStatus,
+    pub record: AdmissionRecord,
+    pub problem: Option<PortError>,
+    pub replayed: bool,
+}
+
+#[derive(Debug)]
+pub enum AdmissionExecutionResult {
+    Execution(Box<AdmissionExecution>),
+    Conflict { operation_id: OperationId },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AddObservation {
+    Absent,
+    Pending,
+    Applied,
+}
+
+pub struct AdmissionService {
+    journal: Arc<dyn AdmissionJournal>,
+    storage: Arc<dyn Storage>,
+    client: Arc<dyn TorrentClient>,
+    max_metainfo_bytes: usize,
+    capacity_reserve_bytes: u64,
+    observation_attempts: usize,
+    observation_delay: Duration,
+    lane: tokio::sync::Mutex<()>,
+}
+
+impl AdmissionService {
+    pub fn new(
+        journal: Arc<dyn AdmissionJournal>,
+        storage: Arc<dyn Storage>,
+        client: Arc<dyn TorrentClient>,
+        max_metainfo_bytes: usize,
+        capacity_reserve_bytes: u64,
+    ) -> Self {
+        Self {
+            journal,
+            storage,
+            client,
+            max_metainfo_bytes,
+            capacity_reserve_bytes,
+            observation_attempts: 30,
+            observation_delay: Duration::from_millis(100),
+            lane: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    pub fn with_observation_policy(mut self, attempts: usize, delay: Duration) -> Self {
+        self.observation_attempts = attempts.max(1);
+        self.observation_delay = delay;
+        self
+    }
+
+    pub async fn execute(
+        &self,
+        request: &AdmissionReservationRequest,
+    ) -> Result<AdmissionExecutionResult, PortError> {
+        let _guard = self.lane.lock().await;
+        let (record, replayed) = match self.journal.reserve_admission(request)? {
+            AdmissionReservationResult::New(record) => (record, false),
+            AdmissionReservationResult::Replay(record) => (record, true),
+            AdmissionReservationResult::Conflict { operation_id } => {
+                return Ok(AdmissionExecutionResult::Conflict { operation_id });
+            }
+        };
+
+        self.advance(record, replayed, true)
+            .await
+            .map(|execution| AdmissionExecutionResult::Execution(Box::new(execution)))
+    }
+
+    pub async fn recover_all(&self) -> Result<Vec<AdmissionExecution>, PortError> {
+        let _guard = self.lane.lock().await;
+        let records = self.journal.list_recoverable_admissions()?;
+        let mut executions = Vec::with_capacity(records.len());
+        for record in records {
+            executions.push(self.advance(record, true, false).await?);
+        }
+        Ok(executions)
+    }
+
+    async fn advance(
+        &self,
+        mut record: AdmissionRecord,
+        replayed: bool,
+        explicit_request: bool,
+    ) -> Result<AdmissionExecution, PortError> {
+        if explicit_request && record.disposition == MutationDisposition::Blocked {
+            record = self
+                .journal
+                .mark_admission_retry_ready(&record.operation_id)?;
+        }
+
+        match record.disposition {
+            MutationDisposition::Finished => {
+                return Ok(admission_execution(
+                    AdmissionExecutionStatus::Finished,
+                    record,
+                    None,
+                    replayed,
+                ));
+            }
+            MutationDisposition::Failed => {
+                let problem = record
+                    .problem_code
+                    .as_deref()
+                    .map(|code| PortError::new(admission_problem_code(code), "admission failed"));
+                return Ok(admission_execution(
+                    AdmissionExecutionStatus::Failed,
+                    record,
+                    problem,
+                    replayed,
+                ));
+            }
+            MutationDisposition::Blocked => {
+                let problem = record
+                    .problem_code
+                    .as_deref()
+                    .map(|code| PortError::new(admission_problem_code(code), "admission blocked"));
+                return Ok(admission_execution(
+                    AdmissionExecutionStatus::Blocked,
+                    record,
+                    problem,
+                    replayed,
+                ));
+            }
+            MutationDisposition::ObservedApplied => {
+                let finished = self.journal.finish_admission(&record.operation_id)?;
+                return Ok(admission_execution(
+                    AdmissionExecutionStatus::Finished,
+                    finished,
+                    None,
+                    replayed,
+                ));
+            }
+            MutationDisposition::EffectPending | MutationDisposition::Unknown => {
+                match self.observe_bounded(&record).await {
+                    Ok(AddObservation::Applied) => {
+                        let observed = self
+                            .journal
+                            .mark_admission_observed_applied(&record.operation_id)?;
+                        let finished = self.journal.finish_admission(&observed.operation_id)?;
+                        return Ok(admission_execution(
+                            AdmissionExecutionStatus::Finished,
+                            finished,
+                            None,
+                            replayed,
+                        ));
+                    }
+                    Ok(AddObservation::Pending) => {
+                        let problem = PortError::new(
+                            "QBIT_POSTCONDITION_UNCONFIRMED",
+                            "qBittorrent contains the intended torrent at the managed Working path, but it has not settled into the requested stopped state",
+                        );
+                        let unknown = if record.disposition == MutationDisposition::Unknown {
+                            record
+                        } else {
+                            self.journal.mark_admission_unknown(
+                                &record.operation_id,
+                                problem.code,
+                            )?
+                        };
+                        return Ok(admission_execution(
+                            AdmissionExecutionStatus::Unknown,
+                            unknown,
+                            Some(problem),
+                            replayed,
+                        ));
+                    }
+                    Ok(AddObservation::Absent) => {
+                        if record.disposition == MutationDisposition::Unknown && !explicit_request {
+                            let problem = PortError::new(
+                                "QBIT_MUTATION_UNCERTAIN",
+                                "admission remains uncertain after restart because the intended torrent was not observed; an explicit replay is required before a new add attempt",
+                            );
+                            return Ok(admission_execution(
+                                AdmissionExecutionStatus::Unknown,
+                                record,
+                                Some(problem),
+                                replayed,
+                            ));
+                        }
+                        record = self
+                            .journal
+                            .mark_admission_retry_ready(&record.operation_id)?;
+                    }
+                    Err(problem) => {
+                        let unknown = if record.disposition == MutationDisposition::Unknown {
+                            record
+                        } else {
+                            self.journal.mark_admission_unknown(
+                                &record.operation_id,
+                                "QBIT_MUTATION_UNCERTAIN",
+                            )?
+                        };
+                        return Ok(admission_execution(
+                            AdmissionExecutionStatus::Unknown,
+                            unknown,
+                            Some(problem),
+                            replayed,
+                        ));
+                    }
+                }
+            }
+            MutationDisposition::Prepared => {}
+        }
+
+        let metainfo = match self.final_preflight(&record).await {
+            Ok(metainfo) => metainfo,
+            Err(problem) => {
+                let blocked = self
+                    .journal
+                    .mark_admission_not_submitted(&record.operation_id, problem.code)?;
+                return Ok(admission_execution(
+                    AdmissionExecutionStatus::Blocked,
+                    blocked,
+                    Some(problem),
+                    replayed,
+                ));
+            }
+        };
+
+        let pending = self
+            .journal
+            .mark_admission_effect_pending(&record.operation_id)?;
+        let request = AddTorrentRequest {
+            metainfo,
+            save_path: record.working_save_path.clone(),
+            stopped: true,
+        };
+
+        match self.client.add_torrent(&request).await {
+            EffectAttempt::NotSent(problem) => {
+                let prepared = self
+                    .journal
+                    .mark_admission_retry_ready(&pending.operation_id)?;
+                Ok(admission_execution(
+                    AdmissionExecutionStatus::Blocked,
+                    prepared,
+                    Some(problem),
+                    replayed,
+                ))
+            }
+            EffectAttempt::Rejected(problem) => {
+                let failed = self
+                    .journal
+                    .mark_admission_failed(&pending.operation_id, problem.code)?;
+                Ok(admission_execution(
+                    AdmissionExecutionStatus::Failed,
+                    failed,
+                    Some(problem),
+                    replayed,
+                ))
+            }
+            EffectAttempt::Uncertain(problem) => {
+                let unknown = self.journal.mark_admission_unknown(
+                    &pending.operation_id,
+                    "QBIT_MUTATION_UNCERTAIN",
+                )?;
+                Ok(admission_execution(
+                    AdmissionExecutionStatus::Unknown,
+                    unknown,
+                    Some(problem),
+                    replayed,
+                ))
+            }
+            EffectAttempt::Accepted => match self.observe_bounded(&pending).await {
+                Ok(AddObservation::Applied) => {
+                    let observed = self
+                        .journal
+                        .mark_admission_observed_applied(&pending.operation_id)?;
+                    let finished = self.journal.finish_admission(&observed.operation_id)?;
+                    Ok(admission_execution(
+                        AdmissionExecutionStatus::Finished,
+                        finished,
+                        None,
+                        replayed,
+                    ))
+                }
+                Ok(AddObservation::Absent | AddObservation::Pending) => {
+                    let unknown = self.journal.mark_admission_unknown(
+                        &pending.operation_id,
+                        "QBIT_POSTCONDITION_UNCONFIRMED",
+                    )?;
+                    Ok(admission_execution(
+                        AdmissionExecutionStatus::Unknown,
+                        unknown,
+                        Some(PortError::new(
+                            "QBIT_POSTCONDITION_UNCONFIRMED",
+                            "qBittorrent accepted the add request but bounded fresh observation did not confirm stopped state at the managed Working path",
+                        )),
+                        replayed,
+                    ))
+                }
+                Err(problem) => {
+                    let unknown = self.journal.mark_admission_unknown(
+                        &pending.operation_id,
+                        "QBIT_MUTATION_UNCERTAIN",
+                    )?;
+                    Ok(admission_execution(
+                        AdmissionExecutionStatus::Unknown,
+                        unknown,
+                        Some(problem),
+                        replayed,
+                    ))
+                }
+            },
+        }
+    }
+
+    async fn final_preflight(&self, record: &AdmissionRecord) -> Result<Vec<u8>, PortError> {
+        if !record.reservation_active {
+            return Err(PortError::new(
+                "ADMISSION_RESERVATION_INACTIVE",
+                "admission capacity reservation is no longer active",
+            ));
+        }
+
+        let snapshot = self
+            .storage
+            .read_incoming(&record.source_relative, self.max_metainfo_bytes)?;
+        if snapshot.evidence != record.source_evidence {
+            return Err(PortError::new(
+                "SOURCE_AMBIGUOUS",
+                "Incoming source evidence changed after admission reservation",
+            ));
+        }
+        let digest: [u8; 32] = Sha256::digest(&snapshot.bytes).into();
+        if digest != record.source_metainfo_digest {
+            return Err(PortError::new(
+                "SOURCE_AMBIGUOUS",
+                "Incoming metainfo bytes changed after admission reservation",
+            ));
+        }
+
+        let volume = self.storage.volume_status(ManagedRoot::Working)?;
+        if volume.volume_id != record.working_volume_id {
+            return Err(PortError::new(
+                "STORAGE_VOLUME_CHANGED",
+                "Working volume identity changed after admission reservation",
+            ));
+        }
+        if !self
+            .storage
+            .matches_root_path(ManagedRoot::Working, &record.working_save_path)?
+        {
+            return Err(PortError::new(
+                "STORAGE_ROOT_CHANGED",
+                "managed Working path changed after admission reservation",
+            ));
+        }
+
+        let reservations = self
+            .journal
+            .capacity_reservations(record.working_volume_id)?;
+        let reserved_bytes = checked_sum(
+            reservations.iter().map(|reservation| reservation.bytes),
+            "durable admission reservations",
+        )?;
+        let required_bytes = reserved_bytes
+            .checked_add(self.capacity_reserve_bytes)
+            .ok_or_else(|| {
+                PortError::new(
+                    "INTERNAL_INVARIANT_VIOLATION",
+                    "final admission capacity calculation overflow",
+                )
+            })?;
+        if required_bytes > volume.free_bytes {
+            return Err(PortError::new(
+                "INSUFFICIENT_CAPACITY",
+                format!(
+                    "Working volume has {} free bytes but {} are required by durable reservations plus reserve",
+                    volume.free_bytes, required_bytes
+                ),
+            ));
+        }
+
+        let probe = self.client.probe().await?;
+        if !probe.mutation_ready {
+            return Err(PortError::new(
+                "QBIT_API_UNSUPPORTED",
+                format!(
+                    "qBittorrent {} WebAPI {} is not mutation-ready",
+                    probe.application_version, probe.webapi_version
+                ),
+            ));
+        }
+
+        match self.observe_once(record).await? {
+            AddObservation::Absent => Ok(snapshot.bytes),
+            AddObservation::Applied | AddObservation::Pending => Err(PortError::new(
+                "TORRENT_ALREADY_PRESENT",
+                "qBittorrent already contains the intended torrent before this add effect",
+            )),
+        }
+    }
+
+    async fn observe_bounded(&self, record: &AdmissionRecord) -> Result<AddObservation, PortError> {
+        let mut last = AddObservation::Absent;
+        for attempt in 0..self.observation_attempts {
+            let observation = self.observe_once(record).await?;
+            match observation {
+                AddObservation::Applied => return Ok(AddObservation::Applied),
+                AddObservation::Pending => last = AddObservation::Pending,
+                AddObservation::Absent => {}
+            }
+            if attempt + 1 < self.observation_attempts && !self.observation_delay.is_zero() {
+                tokio::time::sleep(self.observation_delay).await;
+            }
+        }
+        Ok(last)
+    }
+
+    async fn observe_once(&self, record: &AdmissionRecord) -> Result<AddObservation, PortError> {
+        for selector in record.identity.qbit_selector_ids() {
+            let Some(torrent) = self.client.get(&selector).await? else {
+                continue;
+            };
+            if !self
+                .storage
+                .matches_root_path(ManagedRoot::Working, &torrent.save_path)?
+            {
+                return Err(PortError::new(
+                    "QBIT_SAVE_PATH_CONFLICT",
+                    format!(
+                        "qBittorrent already has {} outside the managed Working path",
+                        selector
+                    ),
+                ));
+            }
+            return if torrent.state == TorrentState::Stopped {
+                Ok(AddObservation::Applied)
+            } else {
+                Ok(AddObservation::Pending)
+            };
+        }
+        Ok(AddObservation::Absent)
+    }
+}
+
+fn admission_execution(
+    status: AdmissionExecutionStatus,
+    record: AdmissionRecord,
+    problem: Option<PortError>,
+    replayed: bool,
+) -> AdmissionExecution {
+    AdmissionExecution {
+        status,
+        record,
+        problem,
+        replayed,
+    }
+}
+
+fn admission_problem_code(code: &str) -> &'static str {
+    match code {
+        "SOURCE_AMBIGUOUS" => "SOURCE_AMBIGUOUS",
+        "STORAGE_VOLUME_CHANGED" => "STORAGE_VOLUME_CHANGED",
+        "STORAGE_ROOT_CHANGED" => "STORAGE_ROOT_CHANGED",
+        "INSUFFICIENT_CAPACITY" => "INSUFFICIENT_CAPACITY",
+        "QBIT_API_UNSUPPORTED" => "QBIT_API_UNSUPPORTED",
+        "TORRENT_ALREADY_PRESENT" => "TORRENT_ALREADY_PRESENT",
+        "QBIT_SAVE_PATH_CONFLICT" => "QBIT_SAVE_PATH_CONFLICT",
+        "QBIT_MUTATION_UNCERTAIN" => "QBIT_MUTATION_UNCERTAIN",
+        "QBIT_POSTCONDITION_UNCONFIRMED" => "QBIT_POSTCONDITION_UNCONFIRMED",
+        "QBIT_MUTATION_REJECTED" => "QBIT_MUTATION_REJECTED",
+        "QBIT_UNAVAILABLE" => "QBIT_UNAVAILABLE",
+        _ => "ADMISSION_FAILED",
+    }
+}
+
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapacityReservation {
