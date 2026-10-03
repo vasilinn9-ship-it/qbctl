@@ -333,11 +333,7 @@ mod tests {
             Ok(r"C:\Managed\Working".into())
         }
 
-        fn matches_root_path(
-            &self,
-            root: ManagedRoot,
-            observed: &str,
-        ) -> Result<bool, PortError> {
+        fn matches_root_path(&self, root: ManagedRoot, observed: &str) -> Result<bool, PortError> {
             Ok(self.root_path(root)?.eq_ignore_ascii_case(observed))
         }
 
