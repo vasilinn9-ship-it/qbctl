@@ -2398,12 +2398,12 @@ mod tests {
             .all(|file| file.destination_evidence.is_some()));
 
         let files = storage.files.lock().expect("files mutex");
-        assert!(!files.iter().any(|(root, path, _)| {
-            *root == ManagedRoot::Incoming && path == "sample.torrent"
-        }));
-        assert!(files.iter().any(|(root, path, _)| {
-            *root == ManagedRoot::Archive && path == "sample.torrent"
-        }));
+        assert!(!files
+            .iter()
+            .any(|(root, path, _)| { *root == ManagedRoot::Incoming && path == "sample.torrent" }));
+        assert!(files
+            .iter()
+            .any(|(root, path, _)| { *root == ManagedRoot::Archive && path == "sample.torrent" }));
         assert!(!files
             .iter()
             .any(|(root, _, _)| *root == ManagedRoot::Working));
