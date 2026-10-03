@@ -7,6 +7,10 @@ use std::{
 };
 
 use qb_application::{
+    admission::{
+        AdmissionJournal, AdmissionRecord, AdmissionReservationRequest, AdmissionReservationResult,
+        CapacityReservation, ADMISSION_FINGERPRINT_VERSION,
+    },
     mutation::{
         MutationCommand, MutationDisposition, MutationJournal, MutationRecord, QueueTargetPolicy,
         RequestReservation, TorrentControlAction, FINGERPRINT_VERSION,
@@ -24,7 +28,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, Transact
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Error)]
 pub enum JournalError {
@@ -44,6 +48,8 @@ pub enum JournalError {
     InvalidTransition(String),
     #[error("torrent identity conflict: {0}")]
     IdentityConflict(String),
+    #[error("torrent is already processed: {0}")]
+    AlreadyProcessed(String),
 }
 
 pub struct Journal {
@@ -848,6 +854,11 @@ fn migrate(connection: &mut Connection) -> Result<(), JournalError> {
         version = 3;
     }
 
+    if version == 3 {
+        migrate_v3_to_v4(connection)?;
+        version = 4;
+    }
+
     if version != SCHEMA_VERSION {
         return Err(JournalError::InvalidState(format!(
             "migration stopped at schema {version}"
@@ -985,6 +996,44 @@ fn migrate_v2_to_v3(connection: &mut Connection) -> Result<(), JournalError> {
         WHERE singleton = 1;
 
         PRAGMA user_version = 3;
+        "#,
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v3_to_v4(connection: &mut Connection) -> Result<(), JournalError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE admission_reservations (
+            operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id),
+            registry_id TEXT NOT NULL UNIQUE REFERENCES torrent_registry(registry_id),
+            source_relative TEXT NOT NULL CHECK(length(source_relative) > 0),
+            source_volume_id BLOB NOT NULL CHECK(length(source_volume_id) = 8),
+            source_file_id BLOB NOT NULL CHECK(length(source_file_id) = 8),
+            source_size BLOB NOT NULL CHECK(length(source_size) = 8),
+            source_modified_marker BLOB NOT NULL CHECK(length(source_modified_marker) = 16),
+            source_metainfo_digest BLOB NOT NULL CHECK(length(source_metainfo_digest) = 32),
+            working_volume_id BLOB NOT NULL CHECK(length(working_volume_id) = 8),
+            reserved_bytes BLOB NOT NULL CHECK(length(reserved_bytes) = 8),
+            working_save_path TEXT NOT NULL CHECK(length(working_save_path) > 0),
+            reservation_state TEXT NOT NULL
+                CHECK(reservation_state IN ('active','released')),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX admission_reservations_volume_state_idx
+        ON admission_reservations(working_volume_id, reservation_state);
+
+        UPDATE schema_meta
+        SET schema_version = 4,
+            application_min_version = '0.1.0',
+            migrated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE singleton = 1;
+
+        PRAGMA user_version = 4;
         "#,
     )?;
     transaction.commit()?;
@@ -1577,6 +1626,7 @@ fn map_port_error(error: JournalError) -> PortError {
         JournalError::InvalidTransition(_) => "OPERATION_TRANSITION_INVALID",
         JournalError::InvalidState(_) => "JOURNAL_STATE_INVALID",
         JournalError::IdentityConflict(_) => "IDENTITY_CONFLICT",
+        JournalError::AlreadyProcessed(_) => "ALREADY_PROCESSED",
         _ => "JOURNAL_UNAVAILABLE",
     };
     PortError::new(code, error.to_string())
@@ -1634,13 +1684,14 @@ mod tests {
                     'operation_events',
                     'controller_policy',
                     'torrent_registry',
-                    'torrent_aliases'
+                    'torrent_aliases',
+                    'admission_reservations'
                  )",
                 [],
                 |row| row.get(0),
             )
             .expect("table count");
-        assert_eq!(table_count, 6);
+        assert_eq!(table_count, 7);
     }
 
     #[test]
