@@ -108,7 +108,7 @@ impl IncomingScanService {
                 }
             };
 
-            let source_sha256 = Sha256::digest(&snapshot.bytes).into();
+            let source_sha256 = source_digest(&snapshot.bytes);
             eligible.push(IncomingCandidate {
                 relative_path: snapshot.relative_path,
                 source_evidence: snapshot.evidence,
@@ -230,9 +230,8 @@ impl IncomingScanService {
                     rejected.push(IncomingRejection {
                         relative_path: candidates[index].relative_path.clone(),
                         problem_code: "IDENTITY_CONTENT_CONFLICT",
-                        message:
-                            "same torrent identity is represented by different Incoming bytes"
-                                .into(),
+                        message: "same torrent identity is represented by different Incoming bytes"
+                            .into(),
                     });
                 }
                 continue;
@@ -257,10 +256,14 @@ impl IncomingScanService {
     }
 }
 
+fn source_digest(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
 fn snapshot_matches(candidate: &IncomingCandidate, snapshot: &IncomingFileSnapshot) -> bool {
     candidate.relative_path == snapshot.relative_path
         && candidate.source_evidence == snapshot.evidence
-        && candidate.source_sha256 == Sha256::digest(&snapshot.bytes).into()
+        && candidate.source_sha256 == source_digest(&snapshot.bytes)
 }
 
 fn reject_group_as_ambiguous(
