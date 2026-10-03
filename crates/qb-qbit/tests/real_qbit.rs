@@ -74,16 +74,29 @@ async fn disposable_qbittorrent_authenticates_and_probes() {
 
     let id =
         TorrentId::new("9a3b4b94ae398193bcc849dd8b2024f607c5c27a").expect("fixture torrent id");
-    let mut observed = None;
-    for _ in 0..30 {
+    let mut last_observed = None;
+    for _ in 0..50 {
         if let Some(torrent) = client.get(&id).await.expect("observe added torrent") {
-            observed = Some(torrent);
-            break;
+            let save_path_matches = torrent.save_path.trim_end_matches('/') == "/downloads";
+            let stopped = torrent.state == TorrentState::Stopped;
+            last_observed = Some(torrent);
+            if stopped && save_path_matches {
+                break;
+            }
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let observed = observed.expect("added torrent must become observable");
+
+    let observed = last_observed.expect("added torrent must become observable");
     assert_eq!(observed.id, id);
-    assert_eq!(observed.state, TorrentState::Stopped);
-    assert_eq!(observed.save_path.trim_end_matches('/'), "/downloads");
+    assert_eq!(
+        observed.state,
+        TorrentState::Stopped,
+        "added torrent did not settle into stopped state"
+    );
+    assert_eq!(
+        observed.save_path.trim_end_matches('/'),
+        "/downloads",
+        "added torrent did not settle on the managed save path"
+    );
 }
