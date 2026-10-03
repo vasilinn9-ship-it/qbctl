@@ -683,6 +683,38 @@ impl TorrentRegistry for Journal {
             .map_err(map_port_error)?;
         Ok(result)
     }
+
+    fn list_processing(&self) -> Result<Vec<RegistryRecord>, PortError> {
+        let connection = self.connection.lock().expect("journal mutex poisoned");
+        let mut statement = connection
+            .prepare(
+                "SELECT registry_id
+                 FROM torrent_registry
+                 WHERE state = 'processing'
+                 ORDER BY source_relative COLLATE NOCASE, source_relative, registry_id",
+            )
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        let mut records = Vec::new();
+        for row in rows {
+            let registry_id = row.map_err(JournalError::from).map_err(map_port_error)?;
+            let record = load_registry_record(&connection, &registry_id)
+                .map_err(map_port_error)?
+                .ok_or_else(|| {
+                    PortError::new(
+                        "JOURNAL_STATE_INVALID",
+                        "processing registry record disappeared during enumeration",
+                    )
+                })?;
+            records.push(record);
+        }
+        Ok(records)
+    }
+
 }
 
 impl IncomingCleanupJournal for Journal {
