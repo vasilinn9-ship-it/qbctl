@@ -1611,7 +1611,7 @@ mod tests {
                 .expect("files mutex")
                 .iter()
                 .find(|(candidate_root, candidate_path, _)| {
-                    *candidate_root == root && candidate_path == source_relative
+                    *candidate_root == root && candidate_path == relative_path
                 })
                 .map(|(_, _, evidence)| evidence.clone()))
         }
