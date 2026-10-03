@@ -60,6 +60,13 @@ message Request {
     QueueGetRequest queue_get = 22;
     TransferLimitsGetRequest transfer_limits_get = 23;
     QbitProbeRequest qbit_probe = 24;
+    PauseTorrentRequest torrent_pause = 30;
+    ResumeTorrentRequest torrent_resume = 31;
+    QueueTargetGetRequest queue_target_get = 32;
+    SetQueueTargetRequest queue_target_set = 33;
+    SetActiveDownloadsRequest queue_downloads_set = 34;
+    SetDownloadLimitRequest transfer_download_limit_set = 35;
+    SetUploadLimitRequest transfer_upload_limit_set = 36;
   }
 }
 
@@ -81,5 +88,7 @@ message Response {
     QueueSettingsResponse queue_settings = 25;
     TransferLimitsResponse transfer_limits = 26;
     QbitProbeResponse qbit_probe = 27;
+    QueueTargetResponse queue_target = 28;
+    MutationResultResponse mutation_result = 29;
   }
 }
