@@ -131,8 +131,7 @@ fn build_incoming_service(
     let storage: Arc<dyn Storage> = Arc::new(ManagedStorage::new(roots));
     let metainfo: Arc<dyn MetainfoReader> = Arc::new(LocalMetainfoReader);
     let scan = IncomingScanService::new(storage.clone(), metainfo, registry);
-    let cleanup =
-        IncomingCleanupService::new(cleanup_journal, storage, MAX_METAINFO_BYTES);
+    let cleanup = IncomingCleanupService::new(cleanup_journal, storage, MAX_METAINFO_BYTES);
 
     Ok(Arc::new(IncomingService::new(
         scan,

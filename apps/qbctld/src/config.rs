@@ -103,8 +103,7 @@ impl Config {
                 archive: storage.archive,
                 working: storage.working,
                 completed: storage.completed,
-                cleanup_exact_duplicates_on_startup: storage
-                    .cleanup_exact_duplicates_on_startup,
+                cleanup_exact_duplicates_on_startup: storage.cleanup_exact_duplicates_on_startup,
             }),
         };
 

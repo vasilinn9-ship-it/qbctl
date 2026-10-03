@@ -47,18 +47,14 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use qb_domain::torrent::{
-        ManifestFile, TorrentIdentity, TorrentManifest, TorrentMetainfo,
-    };
+    use qb_domain::torrent::{ManifestFile, TorrentIdentity, TorrentManifest, TorrentMetainfo};
 
     use crate::{
         cleanup::{
             IncomingCleanupIntent, IncomingCleanupJournal, IncomingCleanupReservation,
             IncomingCleanupState,
         },
-        registry::{
-            RegisterIncoming, RegisterIncomingResult, RegistryRecord, TorrentRegistry,
-        },
+        registry::{RegisterIncoming, RegisterIncomingResult, RegistryRecord, TorrentRegistry},
         storage::{
             FileEvidence, FileIdentity, IncomingDeleteOutcome, IncomingFileSnapshot, ManagedRoot,
             Storage, StorageVolumeStatus,
