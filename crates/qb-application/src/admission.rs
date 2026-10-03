@@ -721,8 +721,16 @@ pub fn plan_capacity(
     let mut decisions = Vec::with_capacity(candidates.len());
 
     for candidate in candidates {
+        let retained = reservations.iter().any(|reservation| {
+            reservation
+                .responsible
+                .strip_prefix("retained:")
+                .is_some_and(|path| path.eq_ignore_ascii_case(&candidate.key))
+                && reservation.bytes == candidate.bytes
+        });
+        let incremental_bytes = if retained { 0 } else { candidate.bytes };
         let required_bytes = reserved_bytes
-            .checked_add(candidate.bytes)
+            .checked_add(incremental_bytes)
             .and_then(|value| value.checked_add(reserve_bytes))
             .ok_or_else(|| {
                 PortError::new(
@@ -752,7 +760,7 @@ pub fn plan_capacity(
             },
         });
 
-        if disposition == CapacityDisposition::Accepted {
+        if disposition == CapacityDisposition::Accepted && !retained {
             reserved_bytes = reserved_bytes.checked_add(candidate.bytes).ok_or_else(|| {
                 PortError::new(
                     "INTERNAL_INVARIANT_VIOLATION",
