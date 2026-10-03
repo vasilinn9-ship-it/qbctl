@@ -275,7 +275,10 @@ fn is_reparse_metadata(metadata: &fs::Metadata) -> bool {
 fn ensure_local_fixed_volume(role: ManagedRootRole, path: &Path) -> Result<(), StorageError> {
     use std::path::Prefix;
 
-    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, DRIVE_FIXED};
+    use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+
+    // GetDriveTypeW: DRIVE_FIXED is the documented value 3.
+    const DRIVE_TYPE_FIXED: u32 = 3;
 
     let prefix = path.components().next();
     let letter = match prefix {
@@ -298,7 +301,7 @@ fn ensure_local_fixed_volume(role: ManagedRootRole, path: &Path) -> Result<(), S
 
     let wide = [u16::from(letter), b':' as u16, b'\\' as u16, 0];
     let drive_type = unsafe { GetDriveTypeW(wide.as_ptr()) };
-    if drive_type != DRIVE_FIXED {
+    if drive_type != DRIVE_TYPE_FIXED {
         return Err(StorageError::RootNotLocalFixedVolume {
             role,
             path: path.to_path_buf(),
