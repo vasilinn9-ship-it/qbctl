@@ -1,9 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use qb_application::{torrent::MetainfoReader, PortError};
-use qb_domain::torrent::{
-    ManifestFile, TorrentIdentity, TorrentManifest, TorrentMetainfo,
-};
+use qb_domain::torrent::{ManifestFile, TorrentIdentity, TorrentManifest, TorrentMetainfo};
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
 use thiserror::Error;
@@ -37,7 +35,9 @@ enum MetainfoError {
 impl MetainfoReader for LocalMetainfoReader {
     fn parse(&self, bytes: &[u8]) -> Result<TorrentMetainfo, PortError> {
         parse_metainfo(bytes).map_err(|error| match error {
-            MetainfoError::Unsupported(_) => PortError::new("METAINFO_UNSUPPORTED", error.to_string()),
+            MetainfoError::Unsupported(_) => {
+                PortError::new("METAINFO_UNSUPPORTED", error.to_string())
+            }
             _ => PortError::new("METAINFO_INVALID", error.to_string()),
         })
     }
@@ -92,11 +92,7 @@ fn parse_inner(bytes: &[u8]) -> Result<TorrentMetainfo, MetainfoError> {
         return Err(invalid("info dictionary is neither v1 nor v2"));
     }
 
-    let v1 = if has_v1 {
-        Some(parse_v1(info)?)
-    } else {
-        None
-    };
+    let v1 = if has_v1 { Some(parse_v1(info)?) } else { None };
     let v2 = if has_v2 {
         Some(parse_v2(&root, info)?)
     } else {
@@ -158,8 +154,7 @@ struct V1LayoutEntry {
 
 fn parse_v1(info: &Value<'_>) -> Result<V1Parsed, MetainfoError> {
     let piece_length = positive_u64(info, b"piece length")?;
-    let name = required_utf8(info, b"name.utf-8")
-        .or_else(|_| required_utf8(info, b"name"))?;
+    let name = required_utf8(info, b"name.utf-8").or_else(|_| required_utf8(info, b"name"))?;
     validate_component(&name)?;
 
     let pieces = required_bytes(info, b"pieces")?;
@@ -631,8 +626,7 @@ fn nonnegative_u64(value: &Value<'_>, key: &[u8]) -> Result<u64, MetainfoError> 
         .get(key)
         .and_then(Value::as_int)
         .ok_or_else(|| invalid(format!("{} must be an integer", display_key(key))))?;
-    u64::try_from(number)
-        .map_err(|_| invalid(format!("{} must be non-negative", display_key(key))))
+    u64::try_from(number).map_err(|_| invalid(format!("{} must be non-negative", display_key(key))))
 }
 
 fn optional_int(value: &Value<'_>, key: &[u8]) -> Result<Option<i64>, MetainfoError> {
