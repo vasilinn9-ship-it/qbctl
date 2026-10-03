@@ -12,7 +12,7 @@ use qb_proto::{
     v1::{
         request, response, CapabilitiesResponse, DoctorCheck, DoctorResponse, MutationCertainty,
         MutationResultResponse, NextAction, Problem, ProblemCategory, QueueTargetResponse, Request,
-        Response, RetryGuidance, Status, TorrentGetResponse,
+        Response, RetryGuidance, Status, TorrentDiagnoseResponse, TorrentGetResponse,
     },
     PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
@@ -94,6 +94,46 @@ pub async fn dispatch(
                 ),
                 Err(error) => port_error(sequence, request_id, error),
             }
+        }
+        Some(request::Command::TorrentDiagnose(command)) => {
+            let Some(service) = torrents else {
+                return qbit_unavailable(sequence, request_id, qbit_startup_problem);
+            };
+            let id = match TorrentId::new(&command.torrent_id) {
+                Ok(id) => id,
+                Err(error) => {
+                    return invalid_request(sequence, request_id, &error.to_string());
+                }
+            };
+
+            let torrent = match service.get(&id).await {
+                Ok(Some(value)) => value,
+                Ok(None) => {
+                    return state_problem(
+                        sequence,
+                        request_id,
+                        "TORRENT_NOT_FOUND",
+                        "torrent was not found",
+                    );
+                }
+                Err(error) => return port_error(sequence, request_id, error),
+            };
+            let trackers = match service.trackers(&id).await {
+                Ok(values) => values,
+                Err(error) => return port_error(sequence, request_id, error),
+            };
+
+            success(
+                sequence,
+                request_id,
+                response::Payload::TorrentDiagnose(TorrentDiagnoseResponse {
+                    torrent: Some(super::encode::torrent_summary(torrent)),
+                    trackers: trackers
+                        .into_iter()
+                        .map(super::encode::tracker_evidence)
+                        .collect(),
+                }),
+            )
         }
         Some(request::Command::QueueGet(_)) => {
             let Some(service) = torrents else {
