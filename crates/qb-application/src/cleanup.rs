@@ -44,7 +44,8 @@ impl IncomingCleanupIntent {
 }
 
 fn update_text(digest: &mut Sha256, value: &str) {
-    digest.update(value.len().to_be_bytes());
+    let length = u64::try_from(value.len()).expect("managed path length fits u64");
+    digest.update(length.to_be_bytes());
     digest.update(value.as_bytes());
 }
 
