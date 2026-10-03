@@ -746,7 +746,9 @@ fn optional_u64_to_i64(value: Option<u64>) -> Result<Option<i64>, JournalError> 
     value
         .map(|value| {
             i64::try_from(value).map_err(|_| {
-                JournalError::InvalidState("mutation numeric value exceeds SQLite integer range".into())
+                JournalError::InvalidState(
+                    "mutation numeric value exceeds SQLite integer range".into(),
+                )
             })
         })
         .transpose()
@@ -767,7 +769,11 @@ fn decode_command(
                 torrent_id.ok_or_else(|| "torrent control is missing torrent_id".to_string())?,
             )
             .map_err(|error| error.to_string())?;
-            let expected_action = if kind == "torrent.stop" { "stop" } else { "start" };
+            let expected_action = if kind == "torrent.stop" {
+                "stop"
+            } else {
+                "start"
+            };
             if control_action.as_deref() != Some(expected_action) {
                 return Err(format!(
                     "torrent control action does not match command kind {kind}"
@@ -795,10 +801,7 @@ fn decode_command(
             )?,
         }),
         "transfer.download_limit.set" => Ok(MutationCommand::SetDownloadLimit {
-            bytes_per_sec: required_nonnegative_u64(
-                download_limit_bps,
-                "download_limit_bps",
-            )?,
+            bytes_per_sec: required_nonnegative_u64(download_limit_bps, "download_limit_bps")?,
         }),
         "transfer.upload_limit.set" => Ok(MutationCommand::SetUploadLimit {
             bytes_per_sec: required_nonnegative_u64(upload_limit_bps, "upload_limit_bps")?,
@@ -963,10 +966,7 @@ mod tests {
         }
 
         let conflict = journal
-            .reserve_request_inner(
-                &request,
-                &torrent_command(TorrentControlAction::Start),
-            )
+            .reserve_request_inner(&request, &torrent_command(TorrentControlAction::Start))
             .expect("conflict");
         assert_eq!(
             conflict,
@@ -1012,10 +1012,7 @@ mod tests {
         let request = request_id("resume-1");
 
         let reservation = journal
-            .reserve_request_inner(
-                &request,
-                &torrent_command(TorrentControlAction::Start),
-            )
+            .reserve_request_inner(&request, &torrent_command(TorrentControlAction::Start))
             .expect("reserve");
         let operation_id = match reservation {
             RequestReservation::New(record) => record.operation_id,
@@ -1046,10 +1043,7 @@ mod tests {
         let request = request_id("pause-unknown");
 
         let reservation = journal
-            .reserve_request_inner(
-                &request,
-                &torrent_command(TorrentControlAction::Stop),
-            )
+            .reserve_request_inner(&request, &torrent_command(TorrentControlAction::Stop))
             .expect("reserve");
         let operation_id = match reservation {
             RequestReservation::New(record) => record.operation_id,
