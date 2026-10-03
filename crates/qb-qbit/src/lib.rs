@@ -356,12 +356,13 @@ impl QbitClient {
             return Err(QbitError::Authentication);
         }
 
+        let webui_port = self.base_url.port_or_known_default().unwrap_or(80);
         let session_cookie = response
             .headers()
             .get_all(SET_COOKIE)
             .iter()
             .filter_map(|value| value.to_str().ok())
-            .find_map(extract_session_cookie)
+            .find_map(|value| extract_session_cookie(value, webui_port))
             .ok_or(QbitError::Authentication)?;
 
         let body = read_bounded_body(response).await?;
@@ -509,13 +510,11 @@ async fn read_bounded_body(mut response: Response) -> Result<Vec<u8>, QbitError>
     Ok(body)
 }
 
-fn extract_session_cookie(header: &str) -> Option<String> {
+fn extract_session_cookie(header: &str, webui_port: u16) -> Option<String> {
     let cookie = header.split(';').next()?.trim();
     let (name, value) = cookie.split_once('=')?;
-    let modern_name = name
-        .strip_prefix("QBT_SID_")
-        .is_some_and(|port| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()));
-    if (name != "SID" && !modern_name) || value.is_empty() {
+    let modern_name = format!("QBT_SID_{webui_port}");
+    if (name != "SID" && name != modern_name) || value.is_empty() {
         return None;
     }
     Some(format!("{name}={value}"))
@@ -809,16 +808,17 @@ mod tests {
     #[test]
     fn session_cookie_names_are_fail_closed() {
         assert_eq!(
-            extract_session_cookie("SID=legacy; HttpOnly").as_deref(),
+            extract_session_cookie("SID=legacy; HttpOnly", 8080).as_deref(),
             Some("SID=legacy")
         );
         assert_eq!(
-            extract_session_cookie("QBT_SID_8080=modern; HttpOnly").as_deref(),
+            extract_session_cookie("QBT_SID_8080=modern; HttpOnly", 8080).as_deref(),
             Some("QBT_SID_8080=modern")
         );
-        assert!(extract_session_cookie("QBT_SID=missing-port").is_none());
-        assert!(extract_session_cookie("QBT_SID_http=bad-port").is_none());
-        assert!(extract_session_cookie("OTHER=value").is_none());
+        assert!(extract_session_cookie("QBT_SID_8081=wrong-port", 8080).is_none());
+        assert!(extract_session_cookie("QBT_SID=missing-port", 8080).is_none());
+        assert!(extract_session_cookie("QBT_SID_http=bad-port", 8080).is_none());
+        assert!(extract_session_cookie("OTHER=value", 8080).is_none());
     }
 
     #[test]
