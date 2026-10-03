@@ -34,9 +34,9 @@ pub fn read_generic(target: &str) -> Result<StoredCredential, CredentialError> {
         if code == ERROR_NOT_FOUND {
             return Err(CredentialError::NotFound(target.to_string()));
         }
-        return Err(CredentialError::Platform(std::io::Error::from_raw_os_error(
-            code as i32,
-        )));
+        return Err(CredentialError::Platform(
+            std::io::Error::from_raw_os_error(code as i32),
+        ));
     }
 
     if raw.is_null() {
@@ -63,8 +63,7 @@ pub fn read_generic(target: &str) -> Result<StoredCredential, CredentialError> {
         CredFree(raw.cast());
     }
 
-    let username =
-        username.ok_or_else(|| CredentialError::InvalidText(target.to_string()))?;
+    let username = username.ok_or_else(|| CredentialError::InvalidText(target.to_string()))?;
     let secret =
         decode_secret(&blob).ok_or_else(|| CredentialError::InvalidText(target.to_string()))?;
 
