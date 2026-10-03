@@ -1884,10 +1884,7 @@ impl CompletionJournal for Journal {
         Ok(records)
     }
 
-    fn mark_stop_pending(
-        &self,
-        operation_id: &OperationId,
-    ) -> Result<CompletionRecord, PortError> {
+    fn mark_stop_pending(&self, operation_id: &OperationId) -> Result<CompletionRecord, PortError> {
         transition_completion(
             self,
             operation_id,
