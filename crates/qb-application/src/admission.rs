@@ -61,6 +61,7 @@ pub struct AdmissionRecord {
     pub working_volume_id: u64,
     pub reserved_bytes: u64,
     pub working_save_path: String,
+    pub reservation_active: bool,
     pub checkpoint: String,
     pub disposition: MutationDisposition,
     pub pending_effect_kind: Option<String>,
@@ -92,6 +93,44 @@ pub trait AdmissionJournal: Send + Sync {
         &self,
         working_volume_id: u64,
     ) -> Result<Vec<CapacityReservation>, PortError>;
+
+    fn mark_admission_effect_pending(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<AdmissionRecord, PortError>;
+
+    fn mark_admission_not_submitted(
+        &self,
+        operation_id: &OperationId,
+        problem_code: &str,
+    ) -> Result<AdmissionRecord, PortError>;
+
+    fn mark_admission_retry_ready(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<AdmissionRecord, PortError>;
+
+    fn mark_admission_unknown(
+        &self,
+        operation_id: &OperationId,
+        problem_code: &str,
+    ) -> Result<AdmissionRecord, PortError>;
+
+    fn mark_admission_observed_applied(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<AdmissionRecord, PortError>;
+
+    fn finish_admission(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<AdmissionRecord, PortError>;
+
+    fn mark_admission_failed(
+        &self,
+        operation_id: &OperationId,
+        problem_code: &str,
+    ) -> Result<AdmissionRecord, PortError>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
