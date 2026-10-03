@@ -238,10 +238,7 @@ async fn execute(cli: Cli) -> Result<Response, CliError> {
 
 fn command_request(command: Command) -> (request::Command, Option<String>) {
     match command {
-        Command::Capabilities => (
-            request::Command::Capabilities(CapabilitiesRequest {}),
-            None,
-        ),
+        Command::Capabilities => (request::Command::Capabilities(CapabilitiesRequest {}), None),
         Command::Status
         | Command::Daemon {
             command: DaemonCommand::Status,
@@ -599,10 +596,7 @@ fn render_fields(response: &Response) -> Result<(), CliError> {
             "problem.{index}.mutation_certainty={}",
             problem.mutation_certainty
         );
-        println!(
-            "problem.{index}.retry_guidance={}",
-            problem.retry_guidance
-        );
+        println!("problem.{index}.retry_guidance={}", problem.retry_guidance);
     }
 
     Ok(())
