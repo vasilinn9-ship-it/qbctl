@@ -2,8 +2,9 @@ use std::{net::IpAddr, str::FromStr, time::Duration};
 
 use qb_application::{
     torrent::{
-        ConnectionStatus, EffectAttempt, EffectFuture, NetworkPreferences, PortFuture, QbitProbe,
-        QueueSettings, TorrentClient, TorrentView, TrackerEvidence, TrackerStatus, TransferInfo,
+        ConnectionStatus, EffectAttempt, EffectFuture, FileObservation, NetworkPreferences,
+        PortFuture, QbitProbe, QueueSettings, TorrentClient, TorrentView, TrackerEvidence,
+        TrackerStatus, TransferInfo,
     },
     PortError,
 };
@@ -163,6 +164,12 @@ impl QbitClient {
             max_connections: value.max_connec,
             max_connections_per_torrent: value.max_connec_per_torrent,
         })
+    }
+
+    async fn files_inner(&self, id: &TorrentId) -> Result<Vec<FileObservation>, QbitError> {
+        let query = [("hash", id.as_str().to_string())];
+        let rows: Vec<FileDto> = self.get_json("torrents/files", &query).await?;
+        rows.into_iter().map(map_file).collect()
     }
 
     async fn trackers_inner(&self, id: &TorrentId) -> Result<Vec<TrackerEvidence>, QbitError> {
@@ -414,6 +421,10 @@ impl TorrentClient for QbitClient {
         Box::pin(async move { self.trackers_inner(id).await.map_err(map_port_error) })
     }
 
+    fn files<'a>(&'a self, id: &'a TorrentId) -> PortFuture<'a, Vec<FileObservation>> {
+        Box::pin(async move { self.files_inner(id).await.map_err(map_files_error) })
+    }
+
     fn stop<'a>(&'a self, id: &'a TorrentId) -> EffectFuture<'a> {
         Box::pin(async move { self.stop_inner(id).await })
     }
@@ -547,6 +558,35 @@ fn map_torrent(row: TorrentDto) -> Result<TorrentView, QbitError> {
     })
 }
 
+fn map_file(row: FileDto) -> Result<FileObservation, QbitError> {
+    let index = u32::try_from(row.index)
+        .map_err(|_| QbitError::InvalidResponse("file index is outside u32 range".into()))?;
+    if row.name.is_empty() || row.name.chars().any(char::is_control) {
+        return Err(QbitError::InvalidResponse(
+            "file name is empty or contains control characters".into(),
+        ));
+    }
+    let progress = if row.progress.is_finite() {
+        row.progress.clamp(0.0, 1.0)
+    } else {
+        return Err(QbitError::InvalidResponse(
+            "file progress is not finite".into(),
+        ));
+    };
+
+    Ok(FileObservation {
+        index,
+        path: row.name,
+        size: nonnegative(row.size),
+        progress_ppm: (progress * 1_000_000.0).round() as u32,
+        selected: row.priority != 0,
+        is_seed: row.is_seed,
+        availability: row
+            .availability
+            .filter(|value| value.is_finite() && *value >= 0.0),
+    })
+}
+
 fn map_state(value: &str) -> TorrentState {
     match value {
         "downloading" | "forcedDL" | "metaDL" | "allocating" | "moving" => {
@@ -589,6 +629,15 @@ fn nonnegative(value: i64) -> u64 {
     u64::try_from(value).unwrap_or(0)
 }
 
+fn map_files_error(error: QbitError) -> PortError {
+    match error {
+        QbitError::HttpStatus(404) => {
+            PortError::new("TORRENT_NOT_FOUND", "torrent was not found")
+        }
+        other => map_port_error(other),
+    }
+}
+
 fn map_port_error(error: QbitError) -> PortError {
     match error {
         QbitError::Authentication => PortError::new("QBIT_AUTH_FAILED", error.to_string()),
@@ -629,6 +678,19 @@ struct TorrentDto {
     seeds: i64,
     #[serde(default)]
     seeds_total: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct FileDto {
+    index: i64,
+    name: String,
+    size: i64,
+    progress: f64,
+    priority: i64,
+    #[serde(default)]
+    is_seed: bool,
+    #[serde(default)]
+    availability: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
