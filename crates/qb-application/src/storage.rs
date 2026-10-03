@@ -144,7 +144,7 @@ impl IncomingScanService {
         rejected.extend(duplicate_rejections);
 
         let mut fresh = Vec::new();
-        let mut already_processed = Vec::new();
+        let mut processed = Vec::new();
         let mut allowed_canonical_paths = BTreeMap::new();
 
         for candidate in eligible {
@@ -153,7 +153,7 @@ impl IncomingScanService {
                     if record.source_metainfo_digest == candidate.source_sha256 =>
                 {
                     allowed_canonical_paths.insert(candidate.relative_path.clone(), ());
-                    already_processed.push(already_processed(candidate, record));
+                    processed.push(classify_already_processed(candidate, record));
                 }
                 Ok(Some(_)) => {
                     rejected.push(IncomingRejection {
@@ -180,14 +180,12 @@ impl IncomingScanService {
 
         redundant_identical
             .retain(|copy| allowed_canonical_paths.contains_key(&copy.canonical_path));
-        already_processed.sort_by(|left, right| {
-            path_order(&left.relative_path, &right.relative_path)
-        });
+        processed.sort_by(|left, right| path_order(&left.relative_path, &right.relative_path));
         rejected.sort_by(|left, right| path_order(&left.relative_path, &right.relative_path));
 
         Ok(IncomingScan {
             eligible: fresh,
-            already_processed,
+            already_processed: processed,
             redundant_identical,
             rejected,
         })
@@ -321,7 +319,7 @@ impl IncomingScanService {
     }
 }
 
-fn already_processed(
+fn classify_already_processed(
     candidate: IncomingCandidate,
     record: RegistryRecord,
 ) -> IncomingAlreadyProcessed {
@@ -616,8 +614,7 @@ mod tests {
             }],
             conflict_identity: None,
         });
-        let service =
-            IncomingScanService::new(storage, Arc::new(FakeMetainfoReader), registry);
+        let service = IncomingScanService::new(storage, Arc::new(FakeMetainfoReader), registry);
 
         let scan = service.scan(1024).expect("scan");
 
@@ -652,8 +649,7 @@ mod tests {
             }],
             conflict_identity: None,
         });
-        let service =
-            IncomingScanService::new(storage, Arc::new(FakeMetainfoReader), registry);
+        let service = IncomingScanService::new(storage, Arc::new(FakeMetainfoReader), registry);
 
         let scan = service.scan(1024).expect("scan");
 
@@ -675,8 +671,7 @@ mod tests {
                 TorrentIdentity::new(Some([0x11; 20]), None).expect("identity"),
             ),
         });
-        let service =
-            IncomingScanService::new(storage, Arc::new(FakeMetainfoReader), registry);
+        let service = IncomingScanService::new(storage, Arc::new(FakeMetainfoReader), registry);
 
         let scan = service.scan(1024).expect("scan");
 
