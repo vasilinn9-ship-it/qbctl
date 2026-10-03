@@ -291,6 +291,21 @@ enum StopObservation {
     Running,
 }
 
+enum HandoffProgress {
+    Continue(CompletionRecord),
+    Halt {
+        status: CompletionExecutionStatus,
+        record: CompletionRecord,
+        problem: Option<PortError>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SameVolumeObservation {
+    SourceReady,
+    Applied(FileEvidence),
+}
+
 pub struct CompletionPreflightService {
     registry: Arc<dyn TorrentRegistry>,
     storage: Arc<dyn Storage>,
@@ -714,23 +729,17 @@ impl CompletionService {
             | CompletionState::RemoveRecordPending
             | CompletionState::UnknownRemoveRecord
             | CompletionState::Finished => {
-                return Ok(completion_execution(
-                    CompletionExecutionStatus::Stopped,
-                    record,
-                    None,
-                    replayed,
-                ));
+                return self
+                    .advance_handoff(record, replayed, explicit_request)
+                    .await;
             }
             CompletionState::StopPending | CompletionState::UnknownStop => {
                 match self.observe_stop_bounded(&record).await {
                     Ok(StopObservation::Stopped) => {
                         let stopped = self.journal.mark_stopped(&record.operation_id)?;
-                        return Ok(completion_execution(
-                            CompletionExecutionStatus::Stopped,
-                            stopped,
-                            None,
-                            replayed,
-                        ));
+                        return self
+                            .advance_handoff(stopped, replayed, explicit_request)
+                            .await;
                     }
                     Ok(StopObservation::Running) if !explicit_request => {
                         let unknown = if record.state == CompletionState::UnknownStop {
@@ -787,12 +796,9 @@ impl CompletionService {
         match self.observe_stop_once(&pending).await {
             Ok(StopObservation::Stopped) => {
                 let stopped = self.journal.mark_stopped(&pending.operation_id)?;
-                return Ok(completion_execution(
-                    CompletionExecutionStatus::Stopped,
-                    stopped,
-                    None,
-                    replayed,
-                ));
+                return self
+                    .advance_handoff(stopped, replayed, explicit_request)
+                    .await;
             }
             Ok(StopObservation::Running) => {}
             Err(problem) => {
@@ -843,12 +849,8 @@ impl CompletionService {
             EffectAttempt::Accepted => match self.observe_stop_bounded(&pending).await {
                 Ok(StopObservation::Stopped) => {
                     let stopped = self.journal.mark_stopped(&pending.operation_id)?;
-                    Ok(completion_execution(
-                        CompletionExecutionStatus::Stopped,
-                        stopped,
-                        None,
-                        replayed,
-                    ))
+                    self.advance_handoff(stopped, replayed, explicit_request)
+                        .await
                 }
                 Ok(StopObservation::Running) => {
                     let unknown = self.journal.mark_unknown_stop(
