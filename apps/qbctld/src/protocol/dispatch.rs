@@ -738,7 +738,9 @@ mod tests {
         system::{DaemonPhase, RuntimeHealthPort, RuntimeSnapshot, SystemService},
         JournalHealthPort, PortError,
     };
-    use qb_proto::v1::{request, response, Request, Status, StatusRequest};
+    use qb_proto::v1::{
+        request, response, PauseTorrentRequest, Request, Status, StatusRequest,
+    };
 
     use super::dispatch;
 
@@ -800,6 +802,31 @@ mod tests {
             }
             other => panic!("unexpected payload: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn qbit_mutation_is_blocked_when_runtime_is_not_ready() {
+        let response = dispatch(
+            Request {
+                sequence: 8,
+                request_id: Some("blocked-while-recovering".into()),
+                command: Some(request::Command::TorrentPause(PauseTorrentRequest {
+                    torrent_id: "abcdef0123456789abcdef0123456789abcdef01".into(),
+                })),
+            },
+            &system(),
+            None,
+            None,
+            false,
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status, Status::Blocked as i32);
+        assert_eq!(response.problems.len(), 1);
+        assert_eq!(response.problems[0].code, "MUTATION_ADMISSION_DISABLED");
+        assert!(response.operation_id.is_none());
+        assert!(response.payload.is_none());
     }
 
     #[tokio::test]
