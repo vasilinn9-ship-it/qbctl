@@ -6,6 +6,11 @@ $daemonExe = Join-Path $repoRoot "target\debug\qbctld.exe"
 $cliExe = Join-Path $repoRoot "target\debug\qbctl.exe"
 $testId = [guid]::NewGuid().ToString("N")
 $runtimeRoot = Join-Path ([System.IO.Path]::GetTempPath()) "qbctl-control-plane-$testId"
+$storageRoot = Join-Path ([System.IO.Path]::GetTempPath()) "qbctl-storage-$testId"
+$incomingRoot = Join-Path $storageRoot "Incoming"
+$archiveRoot = Join-Path $storageRoot "Archive"
+$workingRoot = Join-Path $storageRoot "Working"
+$completedRoot = Join-Path $storageRoot "Completed"
 $pipeLeaf = "qbctl-acceptance-$testId"
 $pipePath = "\\.\pipe\$pipeLeaf"
 
@@ -188,6 +193,39 @@ function Invoke-FakeServerScenario {
 }
 
 New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
+foreach ($root in @($incomingRoot, $archiveRoot, $workingRoot, $completedRoot)) {
+    New-Item -ItemType Directory -Path $root -Force | Out-Null
+}
+
+function ConvertTo-TomlBasicString {
+    param([string]$Value)
+    return $Value.Replace("\\", "\\\\").Replace('"', '\"')
+}
+
+$config = @"
+revision = 1
+
+[storage]
+incoming = "$(ConvertTo-TomlBasicString $incomingRoot)"
+archive = "$(ConvertTo-TomlBasicString $archiveRoot)"
+working = "$(ConvertTo-TomlBasicString $workingRoot)"
+completed = "$(ConvertTo-TomlBasicString $completedRoot)"
+cleanup_exact_duplicates_on_startup = true
+"@
+[System.IO.File]::WriteAllText(
+    (Join-Path $runtimeRoot "config.toml"),
+    $config,
+    [System.Text.UTF8Encoding]::new($false)
+)
+
+$metainfo = [System.Text.Encoding]::ASCII.GetBytes(
+    "d4:infod6:lengthi4e4:name8:file.bin12:piece lengthi4e6:pieces20:01234567890123456789ee"
+)
+$canonicalIncoming = Join-Path $incomingRoot "a.torrent"
+$redundantIncoming = Join-Path $incomingRoot "b.torrent"
+[System.IO.File]::WriteAllBytes($canonicalIncoming, $metainfo)
+[System.IO.File]::WriteAllBytes($redundantIncoming, $metainfo)
+
 $daemon = $null
 
 try {
@@ -199,6 +237,17 @@ try {
 
     $daemon = Start-Daemon
     Wait-DaemonReady
+
+    if (-not (Test-Path $canonicalIncoming)) {
+        throw "Incoming cleanup removed the deterministic canonical torrent"
+    }
+    if (Test-Path $redundantIncoming) {
+        throw "Incoming cleanup did not remove the exact redundant torrent"
+    }
+    $canonicalBytes = [System.IO.File]::ReadAllBytes($canonicalIncoming)
+    if (-not [System.Linq.Enumerable]::SequenceEqual[byte]($canonicalBytes, $metainfo)) {
+        throw "Incoming cleanup changed canonical metainfo bytes"
+    }
 
     Assert-Exit 0 (Invoke-CliText @("status")) "status"
     Assert-Exit 0 (Invoke-CliText @("capabilities")) "capabilities"
@@ -344,6 +393,9 @@ try {
     $daemon = Start-Daemon
     Wait-DaemonReady
     Assert-Exit 0 (Invoke-CliText @("doctor")) "doctor after restart"
+    if (-not (Test-Path $canonicalIncoming) -or (Test-Path $redundantIncoming)) {
+        throw "Incoming cleanup state was not stable across daemon restart"
+    }
 
     $targetAfterRestart = Invoke-CliText @("--output", "fields", "queue", "target", "get")
     Assert-Exit 0 $targetAfterRestart "queue target after restart"
@@ -370,4 +422,5 @@ try {
 finally {
     Stop-ProcessSafe $daemon
     Remove-Item -Path $runtimeRoot -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path $storageRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
