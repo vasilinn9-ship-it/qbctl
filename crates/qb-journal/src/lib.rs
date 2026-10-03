@@ -3871,7 +3871,7 @@ fn transition_completion(
                 completion_state_name(next),
                 problem_code,
                 revision,
-                i64::from(terminal),
+                if terminal { 1_i64 } else { 0_i64 },
                 operation_id.as_str(),
                 current.revision,
                 completion_state_name(current.state),
@@ -5792,6 +5792,59 @@ mod tests {
             .expect("recoverable completions");
         assert_eq!(recoverable.len(), 1);
         assert_eq!(recoverable[0].operation_id, operation_id);
+    }
+
+    #[test]
+    fn completion_stop_transitions_are_durable_and_observation_driven() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.sqlite");
+        let admission = {
+            let journal = Journal::open(&path).expect("journal");
+            finished_admission(&journal, "completion-stop-admission")
+        };
+        let preflight = completion_preflight(&admission, "completion-stop-request");
+
+        let operation_id = {
+            let journal = Journal::open(&path).expect("reopen");
+            match journal
+                .reserve_completion(&preflight)
+                .expect("reserve completion")
+            {
+                CompletionReservation::New(record) => record.operation_id,
+                other => panic!("unexpected completion reservation: {other:?}"),
+            }
+        };
+
+        let journal = Journal::open(&path).expect("reopen transitions");
+        let pending = journal
+            .mark_stop_pending(&operation_id)
+            .expect("stop pending");
+        assert_eq!(pending.state, CompletionState::StopPending);
+
+        let unknown = journal
+            .mark_unknown_stop(&operation_id, "QBIT_STOP_UNCERTAIN")
+            .expect("unknown stop");
+        assert_eq!(unknown.state, CompletionState::UnknownStop);
+        assert_eq!(unknown.problem_code.as_deref(), Some("QBIT_STOP_UNCERTAIN"));
+
+        let retry = journal.retry_stop(&operation_id).expect("retry stop");
+        assert_eq!(retry.state, CompletionState::Prepared);
+        assert!(retry.problem_code.is_none());
+
+        journal
+            .mark_stop_pending(&operation_id)
+            .expect("stop pending again");
+        let stopped = journal.mark_stopped(&operation_id).expect("stopped");
+        assert_eq!(stopped.state, CompletionState::Stopped);
+
+        drop(journal);
+        let reopened = Journal::open(&path).expect("reopen stopped");
+        let recovered = reopened
+            .get_completion(&operation_id)
+            .expect("get completion")
+            .expect("completion");
+        assert_eq!(recovered.state, CompletionState::Stopped);
+        assert_eq!(recovered.files.len(), 2);
     }
 
     #[test]
