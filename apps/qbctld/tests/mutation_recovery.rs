@@ -281,7 +281,6 @@ async fn blocked_preflight_is_not_automatic_restart_work() {
     assert_eq!(client.stop_calls.load(Ordering::SeqCst), 1);
 }
 
-
 #[tokio::test]
 async fn restart_recovers_uncertain_without_duplicate_stop() {
     let dir = tempfile::tempdir().expect("tempdir");
