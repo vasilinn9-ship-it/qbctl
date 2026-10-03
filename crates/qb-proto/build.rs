@@ -4,11 +4,16 @@ fn main() {
 
     prost_build::Config::new()
         .compile_protos(
-            &["../../proto/common.proto", "../../proto/system.proto"],
+            &[
+                "../../proto/common.proto",
+                "../../proto/torrent.proto",
+                "../../proto/system.proto",
+            ],
             &["../../proto"],
         )
         .expect("protobuf schemas compile");
 
     println!("cargo:rerun-if-changed=../../proto/common.proto");
+    println!("cargo:rerun-if-changed=../../proto/torrent.proto");
     println!("cargo:rerun-if-changed=../../proto/system.proto");
 }
