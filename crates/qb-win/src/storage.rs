@@ -126,10 +126,7 @@ impl ValidatedManagedRootLayout {
         }
     }
 
-    pub fn observe_volume(
-        &self,
-        role: ManagedRootRole,
-    ) -> Result<VolumeObservation, StorageError> {
+    pub fn observe_volume(&self, role: ManagedRootRole) -> Result<VolumeObservation, StorageError> {
         observe_volume(role, self.path(role))
     }
 }
@@ -355,10 +352,7 @@ fn ensure_local_fixed_volume(_role: ManagedRootRole, _path: &Path) -> Result<(),
 }
 
 #[cfg(windows)]
-fn observe_volume(
-    role: ManagedRootRole,
-    path: &Path,
-) -> Result<VolumeObservation, StorageError> {
+fn observe_volume(role: ManagedRootRole, path: &Path) -> Result<VolumeObservation, StorageError> {
     use std::ptr;
 
     use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationW;
@@ -406,10 +400,7 @@ fn observe_volume(
 }
 
 #[cfg(not(windows))]
-fn observe_volume(
-    _role: ManagedRootRole,
-    _path: &Path,
-) -> Result<VolumeObservation, StorageError> {
+fn observe_volume(_role: ManagedRootRole, _path: &Path) -> Result<VolumeObservation, StorageError> {
     Err(StorageError::VolumeObservationUnsupported)
 }
 
