@@ -428,9 +428,9 @@ impl MutationJournal for Journal {
             .ok_or_else(|| PortError::new("OPERATION_NOT_FOUND", operation_id.to_string()))?;
         let effect = current.pending_effect_kind.clone();
         let expected = match current.disposition {
-            MutationDisposition::EffectPending | MutationDisposition::Unknown => {
-                current.disposition
-            }
+            MutationDisposition::EffectPending
+            | MutationDisposition::Unknown
+            | MutationDisposition::Blocked => current.disposition,
             other => {
                 return Err(PortError::new(
                     "OPERATION_TRANSITION_INVALID",
@@ -478,12 +478,18 @@ impl MutationJournal for Journal {
             }
         };
 
+        let checkpoint = if expected == MutationDisposition::Blocked {
+            "retry_ready"
+        } else {
+            "observed_not_applied"
+        };
+
         self.transition(
             operation_id,
             TransitionSpec {
                 expected,
                 next: MutationDisposition::Prepared,
-                checkpoint: "observed_not_applied",
+                checkpoint,
                 event_kind: "retry_ready",
                 pending_effect_kind: None,
                 problem_code: None,
@@ -527,6 +533,26 @@ impl MutationJournal for Journal {
                 checkpoint: "unknown",
                 event_kind: "unknown",
                 pending_effect_kind: effect.as_deref(),
+                problem_code: Some(problem_code),
+                finished: false,
+            },
+        )
+        .map_err(map_port_error)
+    }
+
+    fn mark_blocked(
+        &self,
+        operation_id: &OperationId,
+        problem_code: &str,
+    ) -> Result<MutationRecord, PortError> {
+        self.transition(
+            operation_id,
+            TransitionSpec {
+                expected: MutationDisposition::Prepared,
+                next: MutationDisposition::Blocked,
+                checkpoint: "blocked",
+                event_kind: "blocked",
+                pending_effect_kind: None,
                 problem_code: Some(problem_code),
                 finished: false,
             },
