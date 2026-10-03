@@ -95,14 +95,23 @@ function Read-Exact {
 }
 
 function Write-Frame {
-    param([System.IO.Stream]$Stream, [byte[]]$Payload)
+    param(
+        [System.IO.Stream]$Stream,
+        [byte[]]$Payload,
+        [string]$Context = "frame"
+    )
 
-    $length = [System.BitConverter]::GetBytes([uint32]$Payload.Length)
-    $Stream.Write($length, 0, $length.Length)
-    if ($Payload.Length -gt 0) {
-        $Stream.Write($Payload, 0, $Payload.Length)
+    try {
+        $length = [System.BitConverter]::GetBytes([uint32]$Payload.Length)
+        $Stream.Write($length, 0, $length.Length)
+        if ($Payload.Length -gt 0) {
+            $Stream.Write($Payload, 0, $Payload.Length)
+        }
+        $Stream.Flush()
     }
-    $Stream.Flush()
+    catch {
+        throw "$Context write failed: $($_.Exception.Message)"
+    }
 }
 
 function Read-Frame {
@@ -158,11 +167,11 @@ function Invoke-FakeServerScenario {
 
         $server.EndWaitForConnection($wait)
         [void](Read-Frame -Stream $server)
-        Write-Frame -Stream $server -Payload $ServerHello
+        Write-Frame -Stream $server -Payload $ServerHello -Context "fake server hello"
 
         if ($null -ne $Response) {
             [void](Read-Frame -Stream $server)
-            Write-Frame -Stream $server -Payload $Response
+            Write-Frame -Stream $server -Payload $Response -Context "fake server response"
         }
 
         $stderr = $process.StandardError.ReadToEnd()
@@ -225,9 +234,9 @@ try {
 
     $raw = Connect-RawClient
     try {
-        Write-Frame $raw ([byte[]](0x08, 0x01, 0x10, 0xFF, 0x01))
+        Write-Frame $raw ([byte[]](0x08, 0x01, 0x10, 0xFF, 0x01)) -Context "minor-version client hello"
         [void](Read-Frame $raw)
-        Write-Frame $raw ([byte[]](0x08, 0x01, 0x5A, 0x00))
+        Write-Frame $raw ([byte[]](0x08, 0x01, 0x5A, 0x00)) -Context "minor-version status request"
         $response = Read-Frame $raw
         if ($response.Length -lt 4 -or $response[0] -ne 0x08 -or $response[1] -ne 0x01) {
             throw "minor-version client did not receive a valid response"
@@ -239,7 +248,7 @@ try {
 
     $raw = Connect-RawClient
     try {
-        Write-Frame $raw ([byte[]](0xFF))
+        Write-Frame $raw ([byte[]](0xFF)) -Context "malformed protobuf hello"
     }
     finally {
         $raw.Dispose()
