@@ -85,6 +85,7 @@ message QueueTargetGetRequest {}
 
 message QueueTargetResponse {
   optional uint32 target_client_count = 1;
+  uint64 revision = 2;
 }
 
 message SetQueueTargetRequest {
