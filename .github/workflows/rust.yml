@@ -42,13 +42,16 @@ jobs:
         run: |
           set -euo pipefail
           image="qbittorrentofficial/qbittorrent-nox:5.2.3-1@sha256:9ebb534fe30bab98622cb84a8c3acecfd88319b2d540f52ecdec7b9f866374d7"
+          mkdir -p "$GITHUB_WORKSPACE/target/real-qbit-downloads"
+          chmod 0777 "$GITHUB_WORKSPACE/target/real-qbit-downloads"
+
           docker run -d \
             --name qbctl-real-qbit \
             --network host \
             --read-only \
             --tmpfs /tmp \
             --tmpfs /config:rw,uid=1000,gid=1000,mode=1770 \
-            --tmpfs /downloads:rw,uid=1000,gid=1000,mode=1770 \
+            --mount "type=bind,src=$GITHUB_WORKSPACE/target/real-qbit-downloads,dst=/downloads" \
             --stop-timeout 1800 \
             -e QBT_LEGAL_NOTICE=confirm \
             -e QBT_WEBUI_PORT=18080 \
@@ -100,6 +103,7 @@ jobs:
           QBCTL_REAL_QBIT: "1"
           QBCTL_QBIT_URL: http://127.0.0.1:18080
           QBCTL_QBIT_USERNAME: admin
+          QBCTL_QBIT_DOWNLOADS_HOST: ${{ github.workspace }}/target/real-qbit-downloads
         run: cargo test -p qb-qbit --test real_qbit --locked -- --nocapture
       - name: Dump qBittorrent logs on failure
         if: failure()
