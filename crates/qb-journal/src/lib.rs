@@ -311,12 +311,13 @@ impl Journal {
         let mut connection = self.connection.lock().expect("journal mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let current = load_admission_record(&transaction, operation_id.as_str())?.ok_or_else(|| {
-            JournalError::InvalidState(format!(
-                "admission operation {} does not exist",
-                operation_id
-            ))
-        })?;
+        let current =
+            load_admission_record(&transaction, operation_id.as_str())?.ok_or_else(|| {
+                JournalError::InvalidState(format!(
+                    "admission operation {} does not exist",
+                    operation_id
+                ))
+            })?;
 
         if current.disposition == spec.next
             && current.checkpoint == spec.checkpoint
@@ -440,9 +441,10 @@ impl Journal {
             },
         )?;
 
-        let record = load_admission_record(&transaction, operation_id.as_str())?.ok_or_else(|| {
-            JournalError::InvalidState("updated admission operation disappeared".into())
-        })?;
+        let record =
+            load_admission_record(&transaction, operation_id.as_str())?.ok_or_else(|| {
+                JournalError::InvalidState("updated admission operation disappeared".into())
+            })?;
         transaction.commit()?;
         Ok(record)
     }
@@ -1172,10 +1174,7 @@ impl AdmissionJournal for Journal {
         .map_err(map_port_error)
     }
 
-    fn finish_admission(
-        &self,
-        operation_id: &OperationId,
-    ) -> Result<AdmissionRecord, PortError> {
+    fn finish_admission(&self, operation_id: &OperationId) -> Result<AdmissionRecord, PortError> {
         self.transition_admission(
             operation_id,
             TransitionSpec {
@@ -2826,7 +2825,10 @@ mod tests {
         let finished = journal.finish_admission(&operation_id).expect("finish");
         assert_eq!(finished.disposition, MutationDisposition::Finished);
         assert!(finished.reservation_active);
-        assert_eq!(journal.capacity_reservations(42).expect("capacity").len(), 1);
+        assert_eq!(
+            journal.capacity_reservations(42).expect("capacity").len(),
+            1
+        );
     }
 
     #[test]
@@ -2876,7 +2878,10 @@ mod tests {
             .expect("failed");
         assert_eq!(failed.disposition, MutationDisposition::Failed);
         assert!(!failed.reservation_active);
-        assert!(journal.capacity_reservations(42).expect("capacity").is_empty());
+        assert!(journal
+            .capacity_reservations(42)
+            .expect("capacity")
+            .is_empty());
 
         let registry = journal
             .find_by_identity(&request.identity)

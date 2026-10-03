@@ -121,10 +121,7 @@ pub trait AdmissionJournal: Send + Sync {
         operation_id: &OperationId,
     ) -> Result<AdmissionRecord, PortError>;
 
-    fn finish_admission(
-        &self,
-        operation_id: &OperationId,
-    ) -> Result<AdmissionRecord, PortError>;
+    fn finish_admission(&self, operation_id: &OperationId) -> Result<AdmissionRecord, PortError>;
 
     fn mark_admission_failed(
         &self,
