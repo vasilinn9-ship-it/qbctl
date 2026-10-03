@@ -229,7 +229,6 @@ mod tests {
             source_sha256: [0x77; 32],
         };
         let mut changed = base.clone();
-        changed.redundant_evidence.file_id_for_test();
         changed.redundant_evidence.identity.file_id += 1;
         assert_ne!(base.fingerprint(), changed.fingerprint());
 
