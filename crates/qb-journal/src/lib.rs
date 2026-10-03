@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     sync::Mutex,
@@ -10,14 +11,20 @@ use qb_application::{
         MutationCommand, MutationDisposition, MutationJournal, MutationRecord, QueueTargetPolicy,
         RequestReservation, TorrentControlAction, FINGERPRINT_VERSION,
     },
+    registry::{
+        RegisterIncoming, RegisterIncomingResult, RegistryRecord, RegistryState, TorrentRegistry,
+    },
     JournalHealthPort, PortError,
 };
-use qb_domain::{torrent::TorrentId, OperationId, RequestId};
+use qb_domain::{
+    torrent::{TorrentId, TorrentIdentity},
+    OperationId, RequestId,
+};
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Error)]
 pub enum JournalError {
@@ -35,6 +42,8 @@ pub enum JournalError {
     InvalidState(String),
     #[error("operation transition is invalid: {0}")]
     InvalidTransition(String),
+    #[error("torrent identity conflict: {0}")]
+    IdentityConflict(String),
 }
 
 pub struct Journal {
@@ -383,6 +392,113 @@ impl JournalHealthPort for Journal {
     }
 }
 
+impl TorrentRegistry for Journal {
+    fn find_by_identity(
+        &self,
+        identity: &TorrentIdentity,
+    ) -> Result<Option<RegistryRecord>, PortError> {
+        let connection = self.connection.lock().expect("journal mutex poisoned");
+        let ids = matching_registry_ids(&connection, identity).map_err(map_port_error)?;
+        match ids.as_slice() {
+            [] => Ok(None),
+            [registry_id] => load_registry_record(&connection, registry_id)
+                .map_err(map_port_error),
+            _ => Err(PortError::new(
+                "IDENTITY_CONFLICT",
+                "torrent identity aliases resolve to multiple registry records",
+            )),
+        }
+    }
+
+    fn register_incoming(
+        &self,
+        candidate: &RegisterIncoming,
+    ) -> Result<RegisterIncomingResult, PortError> {
+        if candidate.source_relative.is_empty() {
+            return Err(PortError::new(
+                "PATH_POLICY_VIOLATION",
+                "registry source path must not be empty",
+            ));
+        }
+
+        let mut connection = self.connection.lock().expect("journal mutex poisoned");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        let ids = matching_registry_ids(&transaction, &candidate.identity)
+            .map_err(map_port_error)?;
+
+        let result = match ids.as_slice() {
+            [] => {
+                let registry_id = Uuid::new_v4().to_string();
+                transaction
+                    .execute(
+                        "INSERT INTO torrent_registry(
+                            registry_id,
+                            canonical_identity,
+                            state,
+                            source_relative,
+                            source_metainfo_digest,
+                            operation_id,
+                            archive_ref,
+                            handoff_file_count,
+                            handoff_receipt_count,
+                            updated_at
+                         ) VALUES (
+                            ?1, ?2, 'incoming', ?3, ?4, NULL, NULL, 0, 0,
+                            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                         )",
+                        params![
+                            registry_id,
+                            canonical_identity(&candidate.identity),
+                            candidate.source_relative,
+                            candidate.source_metainfo_digest.as_slice(),
+                        ],
+                    )
+                    .map_err(JournalError::from)
+                    .map_err(map_port_error)?;
+                insert_identity_aliases(&transaction, &registry_id, &candidate.identity)
+                    .map_err(map_port_error)?;
+                let record = load_registry_record(&transaction, &registry_id)
+                    .map_err(map_port_error)?
+                    .ok_or_else(|| {
+                        PortError::new(
+                            "JOURNAL_STATE_INVALID",
+                            "new registry record disappeared before commit",
+                        )
+                    })?;
+                RegisterIncomingResult::Registered(record)
+            }
+            [registry_id] => {
+                insert_identity_aliases(&transaction, registry_id, &candidate.identity)
+                    .map_err(map_port_error)?;
+                let record = load_registry_record(&transaction, registry_id)
+                    .map_err(map_port_error)?
+                    .ok_or_else(|| {
+                        PortError::new(
+                            "JOURNAL_STATE_INVALID",
+                            "registry alias references a missing record",
+                        )
+                    })?;
+                RegisterIncomingResult::AlreadyPresent(record)
+            }
+            _ => {
+                return Err(PortError::new(
+                    "IDENTITY_CONFLICT",
+                    "torrent identity aliases resolve to multiple registry records",
+                ));
+            }
+        };
+
+        transaction
+            .commit()
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        Ok(result)
+    }
+}
+
 impl MutationJournal for Journal {
     fn reserve_request(
         &self,
@@ -703,6 +819,11 @@ fn migrate(connection: &mut Connection) -> Result<(), JournalError> {
         version = 2;
     }
 
+    if version == 2 {
+        migrate_v2_to_v3(connection)?;
+        version = 3;
+    }
+
     if version != SCHEMA_VERSION {
         return Err(JournalError::InvalidState(format!(
             "migration stopped at schema {version}"
@@ -802,6 +923,50 @@ fn migrate_v1_to_v2(connection: &mut Connection) -> Result<(), JournalError> {
     Ok(())
 }
 
+fn migrate_v2_to_v3(connection: &mut Connection) -> Result<(), JournalError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE torrent_registry (
+            registry_id TEXT PRIMARY KEY,
+            canonical_identity TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('incoming','processing','finished')),
+            source_relative TEXT NOT NULL,
+            source_metainfo_digest BLOB NOT NULL CHECK(length(source_metainfo_digest) = 32),
+            operation_id TEXT REFERENCES operations(operation_id),
+            archive_ref TEXT,
+            handoff_file_count INTEGER NOT NULL DEFAULT 0 CHECK(handoff_file_count >= 0),
+            handoff_receipt_count INTEGER NOT NULL DEFAULT 0 CHECK(handoff_receipt_count >= 0),
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE torrent_aliases (
+            alias_kind TEXT NOT NULL CHECK(alias_kind IN ('v1','v2')),
+            alias_hash BLOB NOT NULL,
+            registry_id TEXT NOT NULL REFERENCES torrent_registry(registry_id),
+            PRIMARY KEY(alias_kind, alias_hash),
+            CHECK(
+                (alias_kind = 'v1' AND length(alias_hash) = 20)
+                OR (alias_kind = 'v2' AND length(alias_hash) = 32)
+            )
+        );
+
+        CREATE INDEX torrent_aliases_registry_id_idx
+        ON torrent_aliases(registry_id);
+
+        UPDATE schema_meta
+        SET schema_version = 3,
+            application_min_version = '0.1.0',
+            migrated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE singleton = 1;
+
+        PRAGMA user_version = 3;
+        "#,
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn has_user_tables(connection: &Connection) -> Result<bool, JournalError> {
     let table: Option<String> = connection
         .query_row(
@@ -811,6 +976,231 @@ fn has_user_tables(connection: &Connection) -> Result<bool, JournalError> {
         )
         .optional()?;
     Ok(table.is_some())
+}
+
+fn identity_aliases(identity: &TorrentIdentity) -> Vec<(&'static str, Vec<u8>)> {
+    let mut aliases = Vec::with_capacity(2);
+    if let Some(v1) = identity.v1 {
+        aliases.push(("v1", v1.to_vec()));
+    }
+    if let Some(v2) = identity.v2 {
+        aliases.push(("v2", v2.to_vec()));
+    }
+    aliases
+}
+
+fn canonical_identity(identity: &TorrentIdentity) -> String {
+    if let Some(v2) = identity.v2 {
+        format!("v2:{}", hex_bytes(&v2))
+    } else if let Some(v1) = identity.v1 {
+        format!("v1:{}", hex_bytes(&v1))
+    } else {
+        unreachable!("TorrentIdentity is non-empty by construction")
+    }
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
+fn matching_registry_ids(
+    connection: &Connection,
+    identity: &TorrentIdentity,
+) -> Result<Vec<String>, JournalError> {
+    let mut ids = BTreeSet::new();
+    for (kind, hash) in identity_aliases(identity) {
+        let registry_id: Option<String> = connection
+            .query_row(
+                "SELECT registry_id FROM torrent_aliases
+                 WHERE alias_kind = ?1 AND alias_hash = ?2",
+                params![kind, hash],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(registry_id) = registry_id {
+            ids.insert(registry_id);
+        }
+    }
+    Ok(ids.into_iter().collect())
+}
+
+fn insert_identity_aliases(
+    connection: &Connection,
+    registry_id: &str,
+    identity: &TorrentIdentity,
+) -> Result<(), JournalError> {
+    for (kind, hash) in identity_aliases(identity) {
+        let existing: Option<String> = connection
+            .query_row(
+                "SELECT registry_id FROM torrent_aliases
+                 WHERE alias_kind = ?1 AND alias_hash = ?2",
+                params![kind, hash],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match existing {
+            Some(existing) if existing != registry_id => {
+                return Err(JournalError::IdentityConflict(format!(
+                    "{kind} alias is already owned by another registry record"
+                )));
+            }
+            Some(_) => {}
+            None => {
+                connection.execute(
+                    "INSERT INTO torrent_aliases(alias_kind, alias_hash, registry_id)
+                     VALUES (?1, ?2, ?3)",
+                    params![kind, hash, registry_id],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn load_registry_record(
+    connection: &Connection,
+    registry_id: &str,
+) -> Result<Option<RegistryRecord>, JournalError> {
+    let row: Option<(String, String, String, Vec<u8>, Option<String>, Option<String>, i64, i64)> =
+        connection
+            .query_row(
+                "SELECT registry_id,
+                        state,
+                        source_relative,
+                        source_metainfo_digest,
+                        operation_id,
+                        archive_ref,
+                        handoff_file_count,
+                        handoff_receipt_count
+                 FROM torrent_registry
+                 WHERE registry_id = ?1",
+                [registry_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+    let Some((
+        registry_id,
+        state,
+        source_relative,
+        digest,
+        operation_id,
+        archive_ref,
+        handoff_file_count,
+        handoff_receipt_count,
+    )) = row
+    else {
+        return Ok(None);
+    };
+
+    let source_metainfo_digest: [u8; 32] = digest.try_into().map_err(|value: Vec<u8>| {
+        JournalError::InvalidState(format!(
+            "registry source digest has {} bytes instead of 32",
+            value.len()
+        ))
+    })?;
+    let handoff_file_count = u32::try_from(handoff_file_count)
+        .map_err(|_| JournalError::InvalidState("negative registry file count".into()))?;
+    let handoff_receipt_count = u32::try_from(handoff_receipt_count)
+        .map_err(|_| JournalError::InvalidState("negative registry receipt count".into()))?;
+
+    let mut v1 = None;
+    let mut v2 = None;
+    let mut statement = connection.prepare(
+        "SELECT alias_kind, alias_hash
+         FROM torrent_aliases
+         WHERE registry_id = ?1
+         ORDER BY alias_kind",
+    )?;
+    let rows = statement.query_map([registry_id.as_str()], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+    })?;
+    for row in rows {
+        let (kind, bytes) = row?;
+        match kind.as_str() {
+            "v1" => {
+                let hash: [u8; 20] = bytes.try_into().map_err(|value: Vec<u8>| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        value.len(),
+                        rusqlite::types::Type::Blob,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "v1 registry alias must contain 20 bytes",
+                        )),
+                    )
+                })?;
+                if v1.replace(hash).is_some() {
+                    return Err(JournalError::InvalidState(
+                        "registry contains multiple v1 aliases".into(),
+                    ));
+                }
+            }
+            "v2" => {
+                let hash: [u8; 32] = bytes.try_into().map_err(|value: Vec<u8>| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        value.len(),
+                        rusqlite::types::Type::Blob,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "v2 registry alias must contain 32 bytes",
+                        )),
+                    )
+                })?;
+                if v2.replace(hash).is_some() {
+                    return Err(JournalError::InvalidState(
+                        "registry contains multiple v2 aliases".into(),
+                    ));
+                }
+            }
+            other => {
+                return Err(JournalError::InvalidState(format!(
+                    "unknown registry alias kind '{other}'"
+                )));
+            }
+        }
+    }
+
+    let identity = TorrentIdentity::new(v1, v2)
+        .ok_or_else(|| JournalError::InvalidState("registry has no identity aliases".into()))?;
+    let state = match state.as_str() {
+        "incoming" => RegistryState::Incoming,
+        "processing" => RegistryState::Processing,
+        "finished" => RegistryState::Finished,
+        other => {
+            return Err(JournalError::InvalidState(format!(
+                "unknown registry state '{other}'"
+            )));
+        }
+    };
+
+    Ok(Some(RegistryRecord {
+        registry_id,
+        identity,
+        state,
+        source_relative,
+        source_metainfo_digest,
+        operation_id,
+        archive_ref,
+        handoff_file_count,
+        handoff_receipt_count,
+    }))
 }
 
 struct StoredRequest {
@@ -1152,6 +1542,7 @@ fn map_port_error(error: JournalError) -> PortError {
     let code = match &error {
         JournalError::InvalidTransition(_) => "OPERATION_TRANSITION_INVALID",
         JournalError::InvalidState(_) => "JOURNAL_STATE_INVALID",
+        JournalError::IdentityConflict(_) => "IDENTITY_CONFLICT",
         _ => "JOURNAL_UNAVAILABLE",
     };
     PortError::new(code, error.to_string())
@@ -1174,7 +1565,7 @@ mod tests {
     }
 
     #[test]
-    fn creates_schema_v2_and_reopens() {
+    fn creates_current_schema_and_reopens() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("state.sqlite");
 
@@ -1188,7 +1579,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v1_to_v2_additively() {
+    fn migrates_v1_through_current_schema_additively() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("state.sqlite");
         let mut connection = Connection::open(&path).expect("sqlite");
@@ -1197,18 +1588,123 @@ mod tests {
         drop(connection);
 
         let journal = Journal::open(&path).expect("migrate");
-        assert_eq!(journal.schema_version().expect("version"), 2);
+        assert_eq!(
+            journal.schema_version().expect("version"),
+            SCHEMA_VERSION
+        );
 
         let connection = journal.connection.lock().expect("journal mutex");
         let table_count: u32 = connection
             .query_row(
                 "SELECT count(*) FROM sqlite_master
-                 WHERE type='table' AND name IN ('requests','operations','operation_events','controller_policy')",
+                 WHERE type='table' AND name IN (
+                    'requests',
+                    'operations',
+                    'operation_events',
+                    'controller_policy',
+                    'torrent_registry',
+                    'torrent_aliases'
+                 )",
                 [],
                 |row| row.get(0),
             )
             .expect("table count");
-        assert_eq!(table_count, 4);
+        assert_eq!(table_count, 6);
+    }
+
+    #[test]
+    fn registry_aliases_persist_and_hybrid_extends_existing_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.sqlite");
+        let v1 = [0x11; 20];
+        let v2 = [0x22; 32];
+
+        let registry_id = {
+            let journal = Journal::open(&path).expect("journal");
+            let registered = journal
+                .register_incoming(&RegisterIncoming {
+                    identity: TorrentIdentity::new(Some(v1), None).expect("v1"),
+                    source_relative: "a.torrent".into(),
+                    source_metainfo_digest: [0x31; 32],
+                })
+                .expect("register v1");
+            let record = match registered {
+                RegisterIncomingResult::Registered(record) => record,
+                other => panic!("unexpected registration: {other:?}"),
+            };
+
+            let extended = journal
+                .register_incoming(&RegisterIncoming {
+                    identity: TorrentIdentity::new(Some(v1), Some(v2)).expect("hybrid"),
+                    source_relative: "b.torrent".into(),
+                    source_metainfo_digest: [0x32; 32],
+                })
+                .expect("extend aliases");
+            match extended {
+                RegisterIncomingResult::AlreadyPresent(existing) => {
+                    assert_eq!(existing.registry_id, record.registry_id);
+                    assert_eq!(
+                        existing.identity,
+                        TorrentIdentity::new(Some(v1), Some(v2)).expect("hybrid")
+                    );
+                    assert_eq!(existing.source_relative, "a.torrent");
+                }
+                other => panic!("unexpected extension: {other:?}"),
+            }
+            record.registry_id
+        };
+
+        let reopened = Journal::open(&path).expect("reopen");
+        let found = reopened
+            .find_by_identity(&TorrentIdentity::new(None, Some(v2)).expect("v2"))
+            .expect("lookup")
+            .expect("record");
+        assert_eq!(found.registry_id, registry_id);
+        assert_eq!(
+            found.identity,
+            TorrentIdentity::new(Some(v1), Some(v2)).expect("hybrid")
+        );
+    }
+
+    #[test]
+    fn registry_rejects_hybrid_bridge_between_two_existing_records() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path().join("state.sqlite")).expect("journal");
+        let v1 = [0x41; 20];
+        let v2 = [0x52; 32];
+
+        journal
+            .register_incoming(&RegisterIncoming {
+                identity: TorrentIdentity::new(Some(v1), None).expect("v1"),
+                source_relative: "v1.torrent".into(),
+                source_metainfo_digest: [0x61; 32],
+            })
+            .expect("register v1");
+        journal
+            .register_incoming(&RegisterIncoming {
+                identity: TorrentIdentity::new(None, Some(v2)).expect("v2"),
+                source_relative: "v2.torrent".into(),
+                source_metainfo_digest: [0x62; 32],
+            })
+            .expect("register v2");
+
+        let error = journal
+            .register_incoming(&RegisterIncoming {
+                identity: TorrentIdentity::new(Some(v1), Some(v2)).expect("hybrid"),
+                source_relative: "hybrid.torrent".into(),
+                source_metainfo_digest: [0x63; 32],
+            })
+            .expect_err("bridge must conflict");
+
+        assert_eq!(error.code, "IDENTITY_CONFLICT");
+        assert!(journal
+            .find_by_identity(&TorrentIdentity::new(Some(v1), None).expect("v1"))
+            .expect("find v1")
+            .is_some());
+        assert!(journal
+            .find_by_identity(&TorrentIdentity::new(None, Some(v2)).expect("v2"))
+            .expect("find v2")
+            .is_some());
     }
 
     #[test]
