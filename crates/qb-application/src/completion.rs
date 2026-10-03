@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     registry::{RegistryState, TorrentRegistry},
-    storage::{FileEvidence, ManagedRoot, Storage},
+    storage::{FileEvidence, ManagedRoot, SameVolumeMoveOutcome, Storage},
     torrent::{EffectAttempt, FileObservation, MetainfoReader, TorrentClient, TorrentView},
     PortError,
 };
@@ -199,6 +199,11 @@ pub trait CompletionJournal: Send + Sync {
         file_index: u32,
         problem_code: &str,
     ) -> Result<CompletionRecord, PortError>;
+
+    fn mark_payload_handed_off(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<CompletionRecord, PortError>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -254,8 +259,13 @@ impl CompletionPreflight {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompletionExecutionStatus {
     Stopped,
+    ArchivePending,
+    PayloadPending,
+    RemoveRecordPending,
     Blocked,
     UnknownStop,
+    UnknownArchive,
+    UnknownMove,
     Failed,
 }
 
@@ -586,6 +596,7 @@ fn normalize_qbit_path(value: &str) -> Result<String, PortError> {
 pub struct CompletionService {
     preflight: CompletionPreflightService,
     journal: Arc<dyn CompletionJournal>,
+    storage: Arc<dyn Storage>,
     client: Arc<dyn TorrentClient>,
     observation_attempts: usize,
     observation_delay: Duration,
@@ -604,12 +615,13 @@ impl CompletionService {
         Self {
             preflight: CompletionPreflightService::new(
                 registry,
-                storage,
+                storage.clone(),
                 metainfo,
                 client.clone(),
                 max_metainfo_bytes,
             ),
             journal,
+            storage,
             client,
             observation_attempts: 30,
             observation_delay: Duration::from_millis(100),
@@ -1603,6 +1615,35 @@ mod tests {
             _problem_code: &str,
         ) -> Result<CompletionRecord, PortError> {
             Err(unused())
+        }
+
+        fn mark_payload_handed_off(
+            &self,
+            operation_id: &OperationId,
+        ) -> Result<CompletionRecord, PortError> {
+            let state = self.record.lock().expect("completion journal mutex");
+            let record = state
+                .as_ref()
+                .ok_or_else(|| PortError::new("COMPLETION_NOT_FOUND", operation_id.to_string()))?;
+            if &record.operation_id != operation_id
+                || record.state != CompletionState::PayloadPending
+                || record
+                    .files
+                    .iter()
+                    .any(|file| file.state != CompletionFileState::HandedOff)
+            {
+                return Err(PortError::new(
+                    "OPERATION_TRANSITION_INVALID",
+                    "payload is not fully handed off",
+                ));
+            }
+            drop(state);
+            self.transition(
+                operation_id,
+                &[CompletionState::PayloadPending],
+                CompletionState::RemoveRecordPending,
+                None,
+            )
         }
     }
 
