@@ -418,12 +418,61 @@ fn union(parent: &mut [usize], left: usize, right: usize) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use qb_domain::torrent::{ManifestFile, TorrentIdentity, TorrentManifest, TorrentMetainfo};
 
     use super::*;
 
     struct FakeStorage {
         files: Vec<IncomingFileSnapshot>,
+    }
+
+    struct ChangingStorage {
+        files: Vec<IncomingFileSnapshot>,
+        changed_path: String,
+        changed_reads: AtomicUsize,
+    }
+
+    impl Storage for ChangingStorage {
+        fn volume_status(&self, root: ManagedRoot) -> Result<StorageVolumeStatus, PortError> {
+            Ok(StorageVolumeStatus {
+                root,
+                volume_id: 7,
+                free_bytes: 1_000_000,
+                total_bytes: 2_000_000,
+            })
+        }
+
+        fn list_incoming(&self) -> Result<Vec<String>, PortError> {
+            Ok(self
+                .files
+                .iter()
+                .map(|file| file.relative_path.clone())
+                .collect())
+        }
+
+        fn read_incoming(
+            &self,
+            relative_path: &str,
+            _max_bytes: usize,
+        ) -> Result<IncomingFileSnapshot, PortError> {
+            let mut snapshot = self
+                .files
+                .iter()
+                .find(|file| file.relative_path == relative_path)
+                .cloned()
+                .ok_or_else(|| PortError::new("STORAGE_NOT_FOUND", relative_path))?;
+
+            if relative_path == self.changed_path
+                && self.changed_reads.fetch_add(1, Ordering::SeqCst) > 0
+            {
+                snapshot.evidence.modified_marker =
+                    snapshot.evidence.modified_marker.saturating_add(1);
+                snapshot.bytes.push(b'!');
+            }
+            Ok(snapshot)
+        }
     }
 
     impl Storage for FakeStorage {
@@ -563,6 +612,34 @@ mod tests {
         assert_eq!(scan.redundant_identical[0].canonical_path, "A.torrent");
         assert_eq!(scan.redundant_identical[0].redundant_path, "z.torrent");
         assert!(scan.rejected.is_empty());
+    }
+
+    #[test]
+    fn incoming_scan_marks_duplicate_group_ambiguous_if_source_changes_on_reread() {
+        let storage = Arc::new(ChangingStorage {
+            files: vec![
+                snapshot("a.torrent", b"same", 1),
+                snapshot("b.torrent", b"same", 2),
+            ],
+            changed_path: "b.torrent".into(),
+            changed_reads: AtomicUsize::new(0),
+        });
+        let service = IncomingScanService::new(
+            storage,
+            Arc::new(FakeMetainfoReader),
+            Arc::new(FakeRegistry::default()),
+        );
+
+        let scan = service.scan(1024).expect("scan");
+
+        assert!(scan.eligible.is_empty());
+        assert!(scan.already_processed.is_empty());
+        assert!(scan.redundant_identical.is_empty());
+        assert_eq!(scan.rejected.len(), 2);
+        assert!(scan
+            .rejected
+            .iter()
+            .all(|entry| entry.problem_code == "SOURCE_AMBIGUOUS"));
     }
 
     #[test]

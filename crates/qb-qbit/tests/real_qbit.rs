@@ -72,8 +72,8 @@ async fn disposable_qbittorrent_authenticates_and_probes() {
         EffectAttempt::Accepted
     ));
 
-    let id = TorrentId::new("9a3b4b94ae398193bcc849dd8b2024f607c5c27a")
-        .expect("fixture torrent id");
+    let id =
+        TorrentId::new("9a3b4b94ae398193bcc849dd8b2024f607c5c27a").expect("fixture torrent id");
     let mut observed = None;
     for _ in 0..30 {
         if let Some(torrent) = client.get(&id).await.expect("observe added torrent") {

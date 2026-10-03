@@ -4,8 +4,7 @@ use qb_application::{
     torrent::{
         AddTorrentRequest, ConnectionStatus, EffectAttempt, EffectFuture, FileObservation,
         NetworkPreferences, PortFuture, QbitProbe, QueueSettings, TorrentClient, TorrentView,
-        TrackerEvidence,
-        TrackerStatus, TransferInfo,
+        TrackerEvidence, TrackerStatus, TransferInfo,
     },
     PortError,
 };
@@ -684,10 +683,10 @@ fn map_torrent(row: TorrentDto) -> Result<TorrentView, QbitError> {
         availability: row
             .availability
             .filter(|value| value.is_finite() && *value >= 0.0),
-        peers_connected: nonnegative(row.peers),
-        peers_known: nonnegative(row.peers_total),
-        seeds_connected: nonnegative(row.seeds),
-        seeds_known: nonnegative(row.seeds_total),
+        peers_connected: nonnegative(row.num_leechs),
+        peers_known: nonnegative(row.num_incomplete),
+        seeds_connected: nonnegative(row.num_seeds),
+        seeds_known: nonnegative(row.num_complete),
     })
 }
 
@@ -858,10 +857,10 @@ struct TorrentDto {
     upspeed: i64,
     progress: f64,
     availability: Option<f64>,
-    peers: i64,
-    peers_total: i64,
-    seeds: i64,
-    seeds_total: i64,
+    num_leechs: i64,
+    num_incomplete: i64,
+    num_seeds: i64,
+    num_complete: i64,
 }
 
 #[derive(Debug, Deserialize)]
