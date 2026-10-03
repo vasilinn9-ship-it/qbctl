@@ -1,4 +1,4 @@
-use std::{env, time::Duration};
+use std::{env, fs, path::PathBuf, time::Duration};
 
 use qb_application::torrent::{AddTorrentRequest, EffectAttempt, TorrentClient};
 use qb_domain::torrent::{TorrentId, TorrentState};
@@ -98,5 +98,41 @@ async fn disposable_qbittorrent_authenticates_and_probes() {
         observed.save_path.trim_end_matches('/'),
         "/downloads",
         "added torrent did not settle on the managed save path"
+    );
+
+    let downloads = PathBuf::from(
+        env::var("QBCTL_QBIT_DOWNLOADS_HOST").expect("QBCTL_QBIT_DOWNLOADS_HOST"),
+    );
+    let payload = downloads.join("file.bin");
+    let partial_bytes = b"partial-payload-retained-by-release";
+    fs::write(&payload, partial_bytes).expect("write partial payload fixture");
+    assert_eq!(
+        fs::read(&payload).expect("read partial payload before release"),
+        partial_bytes
+    );
+
+    assert!(matches!(
+        client.remove_keep_files(&id).await,
+        EffectAttempt::Accepted
+    ));
+
+    let mut removed = false;
+    for _ in 0..50 {
+        if client
+            .get(&id)
+            .await
+            .expect("observe removed torrent")
+            .is_none()
+        {
+            removed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(removed, "released qBittorrent record remained observable");
+    assert_eq!(
+        fs::read(&payload).expect("partial payload must survive qBittorrent record removal"),
+        partial_bytes,
+        "deleteFiles=false must preserve partial payload bytes"
     );
 }
