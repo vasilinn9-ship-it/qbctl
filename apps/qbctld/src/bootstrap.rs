@@ -10,6 +10,7 @@ use qb_application::{
     incoming::IncomingService,
     mutation::{MutationJournal, MutationService},
     registry::TorrentRegistry,
+    release::{ReleaseJournal, ReleaseService},
     storage::{IncomingScanService, Storage},
     system::{RuntimeHealthPort, SystemService},
     torrent::{MetainfoReader, TorrentClient, TorrentService},
@@ -37,6 +38,7 @@ pub struct Bootstrap {
     pub torrents: Option<Arc<TorrentService>>,
     pub mutations: Arc<MutationService>,
     pub incoming: Option<Arc<IncomingService>>,
+    pub release: Option<Arc<ReleaseService>>,
     pub qbit_startup_problem: Option<String>,
     _instance_guard: InstanceGuard,
 }
@@ -58,6 +60,7 @@ pub fn build(runtime_override: Option<PathBuf>) -> Result<Bootstrap> {
     let mutation_journal: Arc<dyn MutationJournal> = journal.clone();
     let registry: Arc<dyn TorrentRegistry> = journal.clone();
     let cleanup_journal: Arc<dyn IncomingCleanupJournal> = journal.clone();
+    let release_journal: Arc<dyn ReleaseJournal> = journal.clone();
 
     let runtime = Arc::new(RuntimeContext::new(
         Uuid::new_v4().to_string(),
@@ -66,39 +69,51 @@ pub fn build(runtime_override: Option<PathBuf>) -> Result<Bootstrap> {
     let runtime_port: Arc<dyn RuntimeHealthPort> = runtime.clone();
     let system = Arc::new(SystemService::new(journal_health, runtime_port));
 
-    let incoming = config
+    let storage = config
         .storage
         .as_ref()
-        .map(|storage| {
-            build_incoming_service(
-                storage,
-                runtime_root.path(),
-                registry.clone(),
-                cleanup_journal.clone(),
-            )
-        })
+        .map(|storage| build_managed_storage(storage, runtime_root.path()))
         .transpose()?;
+    let incoming = storage.as_ref().map(|storage| {
+        build_incoming_service(
+            storage.clone(),
+            registry.clone(),
+            cleanup_journal.clone(),
+        )
+    });
 
-    let (torrents, mutation_client, qbit_startup_problem) = match config.qbittorrent.as_ref() {
+    let (torrents, mutation_client, release_client, qbit_startup_problem) =
+        match config.qbittorrent.as_ref() {
         Some(qbit) => match build_qbit_client(qbit) {
             Ok(client) => {
                 let torrent_port: Arc<dyn TorrentClient> = client.clone();
                 let mutation_port: Arc<dyn TorrentClient> = client;
+                let release_port: Arc<dyn TorrentClient> = client;
                 (
                     Some(Arc::new(TorrentService::new(torrent_port))),
                     Some(mutation_port),
+                    Some(release_port),
                     None,
                 )
             }
-            Err(error) => (None, None, Some(error.to_string())),
+            Err(error) => (None, None, None, Some(error.to_string())),
         },
         None => (
+            None,
             None,
             None,
             Some("qBittorrent is not configured for the Rust daemon".into()),
         ),
     };
     let mutations = Arc::new(MutationService::new(mutation_journal, mutation_client));
+    let release = storage.as_ref().zip(release_client).map(|(storage, client)| {
+        Arc::new(ReleaseService::new(
+            release_journal,
+            storage.clone(),
+            client,
+            MAX_METAINFO_BYTES,
+        ))
+    });
 
     Ok(Bootstrap {
         config,
@@ -107,17 +122,16 @@ pub fn build(runtime_override: Option<PathBuf>) -> Result<Bootstrap> {
         torrents,
         mutations,
         incoming,
+        release,
         qbit_startup_problem,
         _instance_guard: instance_guard,
     })
 }
 
-fn build_incoming_service(
+fn build_managed_storage(
     config: &StorageConfig,
     runtime_root: &Path,
-    registry: Arc<dyn TorrentRegistry>,
-    cleanup_journal: Arc<dyn IncomingCleanupJournal>,
-) -> Result<Arc<IncomingService>> {
+) -> Result<Arc<dyn Storage>> {
     let roots = ManagedRootLayout {
         incoming: config.incoming.clone(),
         archive: config.archive.clone(),
@@ -128,16 +142,19 @@ fn build_incoming_service(
     .validate()
     .context("validate managed storage roots")?;
 
-    let storage: Arc<dyn Storage> = Arc::new(ManagedStorage::new(roots));
+    Ok(Arc::new(ManagedStorage::new(roots)))
+}
+
+fn build_incoming_service(
+    storage: Arc<dyn Storage>,
+    registry: Arc<dyn TorrentRegistry>,
+    cleanup_journal: Arc<dyn IncomingCleanupJournal>,
+) -> Arc<IncomingService> {
     let metainfo: Arc<dyn MetainfoReader> = Arc::new(LocalMetainfoReader);
     let scan = IncomingScanService::new(storage.clone(), metainfo, registry);
     let cleanup = IncomingCleanupService::new(cleanup_journal, storage, MAX_METAINFO_BYTES);
 
-    Ok(Arc::new(IncomingService::new(
-        scan,
-        cleanup,
-        MAX_METAINFO_BYTES,
-    )))
+    Arc::new(IncomingService::new(scan, cleanup, MAX_METAINFO_BYTES))
 }
 
 fn build_qbit_client(config: &QbitConfig) -> Result<Arc<QbitClient>> {
