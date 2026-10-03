@@ -714,7 +714,6 @@ impl TorrentRegistry for Journal {
         }
         Ok(records)
     }
-
 }
 
 impl IncomingCleanupJournal for Journal {
