@@ -1536,6 +1536,44 @@ impl AdmissionJournal for Journal {
 }
 
 impl CompletionJournal for Journal {
+    fn lookup_completion_request(
+        &self,
+        request: &qb_application::completion::CompletionRequest,
+    ) -> Result<Option<CompletionReservation>, PortError> {
+        let fingerprint = request.fingerprint();
+        let connection = self.connection.lock().expect("journal mutex poisoned");
+        let existing: Option<(String, u32, Vec<u8>)> = connection
+            .query_row(
+                "SELECT operation_id, fingerprint_version, completion_fingerprint
+                 FROM completion_operations
+                 WHERE request_id = ?1",
+                [request.request_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        let Some((operation_id, fingerprint_version, stored_fingerprint)) = existing else {
+            return Ok(None);
+        };
+        let operation_id = OperationId::new(operation_id)
+            .map_err(|error| PortError::new("JOURNAL_STATE_INVALID", error.to_string()))?;
+        if fingerprint_version != COMPLETION_FINGERPRINT_VERSION
+            || stored_fingerprint.as_slice() != fingerprint
+        {
+            return Ok(Some(CompletionReservation::Conflict { operation_id }));
+        }
+        let record = load_completion_record(&connection, operation_id.as_str())
+            .map_err(map_port_error)?
+            .ok_or_else(|| {
+                PortError::new(
+                    "JOURNAL_STATE_INVALID",
+                    "completion request references a missing operation",
+                )
+            })?;
+        Ok(Some(CompletionReservation::Replay(record)))
+    }
+
     fn reserve_completion(
         &self,
         preflight: &CompletionPreflight,
@@ -1844,6 +1882,86 @@ impl CompletionJournal for Journal {
             records.push(record);
         }
         Ok(records)
+    }
+
+    fn mark_stop_pending(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<CompletionRecord, PortError> {
+        transition_completion(
+            self,
+            operation_id,
+            &[CompletionState::Prepared],
+            CompletionState::StopPending,
+            None,
+        )
+    }
+
+    fn mark_unknown_stop(
+        &self,
+        operation_id: &OperationId,
+        problem_code: &str,
+    ) -> Result<CompletionRecord, PortError> {
+        transition_completion(
+            self,
+            operation_id,
+            &[CompletionState::StopPending],
+            CompletionState::UnknownStop,
+            Some(problem_code),
+        )
+    }
+
+    fn retry_stop(&self, operation_id: &OperationId) -> Result<CompletionRecord, PortError> {
+        transition_completion(
+            self,
+            operation_id,
+            &[CompletionState::UnknownStop, CompletionState::StopPending],
+            CompletionState::Prepared,
+            None,
+        )
+    }
+
+    fn mark_stopped(&self, operation_id: &OperationId) -> Result<CompletionRecord, PortError> {
+        transition_completion(
+            self,
+            operation_id,
+            &[CompletionState::StopPending, CompletionState::UnknownStop],
+            CompletionState::Stopped,
+            None,
+        )
+    }
+
+    fn mark_completion_blocked(
+        &self,
+        operation_id: &OperationId,
+        problem_code: &str,
+    ) -> Result<CompletionRecord, PortError> {
+        transition_completion(
+            self,
+            operation_id,
+            &[
+                CompletionState::Prepared,
+                CompletionState::StopPending,
+                CompletionState::UnknownStop,
+                CompletionState::Stopped,
+            ],
+            CompletionState::Blocked,
+            Some(problem_code),
+        )
+    }
+
+    fn mark_completion_failed(
+        &self,
+        operation_id: &OperationId,
+        problem_code: &str,
+    ) -> Result<CompletionRecord, PortError> {
+        transition_completion(
+            self,
+            operation_id,
+            &[CompletionState::StopPending],
+            CompletionState::Failed,
+            Some(problem_code),
+        )
     }
 }
 
@@ -3690,6 +3808,105 @@ fn insert_completion_event(
         params![operation_id, revision, state, problem_code],
     )?;
     Ok(())
+}
+
+fn transition_completion(
+    journal: &Journal,
+    operation_id: &OperationId,
+    expected: &[CompletionState],
+    next: CompletionState,
+    problem_code: Option<&str>,
+) -> Result<CompletionRecord, PortError> {
+    let mut connection = journal.connection.lock().expect("journal mutex poisoned");
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    let current = load_completion_record(&transaction, operation_id.as_str())
+        .map_err(map_port_error)?
+        .ok_or_else(|| PortError::new("COMPLETION_NOT_FOUND", operation_id.to_string()))?;
+
+    if current.state == next && current.problem_code.as_deref() == problem_code {
+        transaction
+            .commit()
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        return Ok(current);
+    }
+    if !expected.contains(&current.state) {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            format!(
+                "completion {} cannot move from {} to {}",
+                operation_id,
+                completion_state_name(current.state),
+                completion_state_name(next)
+            ),
+        ));
+    }
+
+    let revision = current
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| PortError::new("JOURNAL_STATE_INVALID", "completion revision overflow"))?;
+    let terminal = matches!(
+        next,
+        CompletionState::Finished | CompletionState::Blocked | CompletionState::Failed
+    );
+    let changed = transaction
+        .execute(
+            "UPDATE completion_operations
+             SET state = ?1,
+                 problem_code = ?2,
+                 revision = ?3,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 finished_at = CASE
+                     WHEN ?4 != 0 THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     ELSE NULL
+                 END
+             WHERE operation_id = ?5
+               AND revision = ?6
+               AND state = ?7",
+            params![
+                completion_state_name(next),
+                problem_code,
+                revision,
+                i64::from(terminal),
+                operation_id.as_str(),
+                current.revision,
+                completion_state_name(current.state),
+            ],
+        )
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    if changed != 1 {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            "completion operation changed concurrently",
+        ));
+    }
+
+    insert_completion_event(
+        &transaction,
+        operation_id.as_str(),
+        revision,
+        completion_state_name(next),
+        problem_code,
+    )
+    .map_err(map_port_error)?;
+    let record = load_completion_record(&transaction, operation_id.as_str())
+        .map_err(map_port_error)?
+        .ok_or_else(|| {
+            PortError::new(
+                "JOURNAL_STATE_INVALID",
+                "completion operation disappeared after transition",
+            )
+        })?;
+    transaction
+        .commit()
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    Ok(record)
 }
 
 struct StoredCleanupRow {
