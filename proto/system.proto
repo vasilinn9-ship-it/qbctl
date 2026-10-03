@@ -4,7 +4,6 @@ package qbctl.v1;
 
 import "common.proto";
 import "torrent.proto";
-import "storage.proto";
 
 enum DaemonState {
   DAEMON_STATE_UNSPECIFIED = 0;
@@ -110,8 +109,6 @@ message Request {
     SetActiveDownloadsRequest queue_downloads_set = 34;
     SetDownloadLimitRequest transfer_download_limit_set = 35;
     SetUploadLimitRequest transfer_upload_limit_set = 36;
-    StorageStatusRequest storage_status = 40;
-    StorageListRequest storage_list = 41;
     StorageListRequest storage_list = 37;
     StorageStatusRequest storage_status = 38;
   }
@@ -138,8 +135,6 @@ message Response {
     QueueTargetResponse queue_target = 28;
     MutationResultResponse mutation_result = 29;
     TorrentDiagnoseResponse torrent_diagnose = 30;
-    StorageStatusResponse storage_status = 31;
-    StorageListResponse storage_list = 32;
     StorageListResponse storage_list = 31;
     StorageStatusResponse storage_status = 32;
   }
