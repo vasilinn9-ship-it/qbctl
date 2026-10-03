@@ -8,10 +8,7 @@ use qb_application::{
 };
 use qb_journal::Journal;
 use qb_qbit::{QbitClient, QbitCredentials};
-use qb_win::{
-    credentials::read_generic,
-    InstanceGuard, RuntimeMode, RuntimeRoot,
-};
+use qb_win::{credentials::read_generic, InstanceGuard, RuntimeMode, RuntimeRoot};
 use uuid::Uuid;
 
 use crate::{
@@ -73,9 +70,11 @@ pub fn build(runtime_override: Option<PathBuf>) -> Result<Bootstrap> {
 fn build_torrent_service(config: &QbitConfig) -> Result<Arc<TorrentService>> {
     let secret = match std::env::var("QBCTL_QBIT_PASSWORD") {
         Ok(secret) => secret,
-        Err(_) => read_generic(&config.credential)
-            .with_context(|| format!("read credential '{}'", config.credential))?
-            .secret,
+        Err(_) => {
+            read_generic(&config.credential)
+                .with_context(|| format!("read credential '{}'", config.credential))?
+                .secret
+        }
     };
 
     let client = QbitClient::new(
