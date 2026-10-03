@@ -597,14 +597,25 @@ impl MutationJournal for Journal {
         let connection = self.connection.lock().expect("journal mutex poisoned");
         let mut statement = connection
             .prepare(
-                "SELECT request_id, operations.operation_id, command_kind, fingerprint_version,
-                        command_fingerprint,
-                        torrent_id, control_action, target_client_count, max_active_downloads,
-                        download_limit_bps, upload_limit_bps,
-                        checkpoint, disposition, pending_effect_kind, problem_code, revision
+                "SELECT operations.request_id,
+                        operations.operation_id,
+                        operations.command_kind,
+                        requests.fingerprint_version,
+                        requests.command_fingerprint,
+                        operations.torrent_id,
+                        operations.control_action,
+                        operations.target_client_count,
+                        operations.max_active_downloads,
+                        operations.download_limit_bps,
+                        operations.upload_limit_bps,
+                        operations.checkpoint,
+                        operations.disposition,
+                        operations.pending_effect_kind,
+                        operations.problem_code,
+                        operations.revision
                  FROM operations
-                 JOIN requests USING(request_id)
-                 WHERE disposition IN ('prepared','effect_pending','observed_applied','unknown')
+                 JOIN requests ON requests.request_id = operations.request_id
+                 WHERE operations.disposition IN ('prepared','effect_pending','observed_applied','unknown')
                  ORDER BY operations.created_at, operations.operation_id",
             )
             .map_err(JournalError::from)
