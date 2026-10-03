@@ -1849,7 +1849,6 @@ mod tests {
             &self,
             operation_id: &OperationId,
             file_index: u32,
-            expected: &[CompletionFileState],
             next: CompletionFileState,
             destination: Option<&FileEvidence>,
             destination_sha256: Option<[u8; 32]>,
@@ -1874,7 +1873,25 @@ mod tests {
                 .ok_or_else(|| {
                     PortError::new("COMPLETION_FILE_NOT_FOUND", file_index.to_string())
                 })?;
-            if !expected.contains(&file.state) {
+            let allowed = match next {
+                CompletionFileState::MovePending => matches!(
+                    file.state,
+                    CompletionFileState::Prepared | CompletionFileState::UnknownMove
+                ),
+                CompletionFileState::UnknownMove => file.state == CompletionFileState::MovePending,
+                CompletionFileState::HandedOff => matches!(
+                    file.state,
+                    CompletionFileState::MovePending | CompletionFileState::UnknownMove
+                ),
+                CompletionFileState::Blocked => matches!(
+                    file.state,
+                    CompletionFileState::Prepared
+                        | CompletionFileState::MovePending
+                        | CompletionFileState::UnknownMove
+                ),
+                _ => false,
+            };
+            if !allowed {
                 return Err(PortError::new(
                     "OPERATION_TRANSITION_INVALID",
                     "invalid fake completion file transition",
@@ -2163,10 +2180,6 @@ mod tests {
             self.transition_file(
                 operation_id,
                 file_index,
-                &[
-                    CompletionFileState::Prepared,
-                    CompletionFileState::UnknownMove,
-                ],
                 CompletionFileState::MovePending,
                 None,
                 None,
@@ -2183,7 +2196,6 @@ mod tests {
             self.transition_file(
                 operation_id,
                 file_index,
-                &[CompletionFileState::MovePending],
                 CompletionFileState::UnknownMove,
                 None,
                 None,
@@ -2201,10 +2213,6 @@ mod tests {
             self.transition_file(
                 operation_id,
                 file_index,
-                &[
-                    CompletionFileState::MovePending,
-                    CompletionFileState::UnknownMove,
-                ],
                 CompletionFileState::HandedOff,
                 Some(destination),
                 destination_sha256,
@@ -2221,11 +2229,6 @@ mod tests {
             self.transition_file(
                 operation_id,
                 file_index,
-                &[
-                    CompletionFileState::Prepared,
-                    CompletionFileState::MovePending,
-                    CompletionFileState::UnknownMove,
-                ],
                 CompletionFileState::Blocked,
                 None,
                 None,
