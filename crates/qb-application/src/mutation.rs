@@ -70,8 +70,7 @@ impl MutationCommand {
             Self::SetActiveDownloads {
                 max_active_downloads,
             } => digest.update(max_active_downloads.to_be_bytes()),
-            Self::SetDownloadLimit { bytes_per_sec }
-            | Self::SetUploadLimit { bytes_per_sec } => {
+            Self::SetDownloadLimit { bytes_per_sec } | Self::SetUploadLimit { bytes_per_sec } => {
                 digest.update(bytes_per_sec.to_be_bytes());
             }
         }
