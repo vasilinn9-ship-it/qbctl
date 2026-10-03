@@ -31,7 +31,7 @@ use qb_application::{
         ReleaseJournal, ReleaseRecord, ReleaseRequest, ReleaseReservation, ReleaseResolution,
         ReleaseState, RELEASE_FINGERPRINT_VERSION,
     },
-    JournalHealthPort, PortError,
+    JournalHealthPort, PortError, RecoveryBlocker,
 };
 use qb_domain::{
     torrent::{TorrentId, TorrentIdentity},
@@ -556,6 +556,11 @@ impl JournalHealthPort for Journal {
 
     fn quick_check(&self) -> Result<(), PortError> {
         Journal::quick_check(self).map_err(map_port_error)
+    }
+
+    fn recovery_blockers(&self) -> Result<Vec<RecoveryBlocker>, PortError> {
+        let connection = self.connection.lock().expect("journal mutex poisoned");
+        load_recovery_blockers(&connection).map_err(map_port_error)
     }
 }
 
@@ -3030,6 +3035,84 @@ impl MutationJournal for Journal {
         self.apply_queue_target_inner(operation_id, target_client_count)
             .map_err(map_port_error)
     }
+}
+
+fn load_recovery_blockers(
+    connection: &Connection,
+) -> Result<Vec<RecoveryBlocker>, JournalError> {
+    let mut statement = connection.prepare(
+        "SELECT kind, state, problem_code, COUNT(*)
+         FROM (
+             SELECT 'mutation:' || command_kind AS kind,
+                    disposition AS state,
+                    problem_code
+             FROM operations
+             WHERE disposition IN ('unknown','blocked')
+
+             UNION ALL
+
+             SELECT 'incoming_cleanup' AS kind,
+                    state,
+                    problem_code
+             FROM incoming_cleanup_intents
+             WHERE state = 'blocked'
+
+             UNION ALL
+
+             SELECT 'release' AS kind,
+                    state,
+                    problem_code
+             FROM release_operations
+             WHERE state IN ('unknown_stop','unknown_delete','blocked')
+
+             UNION ALL
+
+             SELECT 'completion' AS kind,
+                    state,
+                    problem_code
+             FROM completion_operations
+             WHERE state IN (
+                 'unknown_stop',
+                 'unknown_archive',
+                 'unknown_archive_source_delete',
+                 'unknown_remove_record',
+                 'blocked'
+             )
+
+             UNION ALL
+
+             SELECT 'completion_file' AS kind,
+                    state,
+                    problem_code
+             FROM operation_files
+             WHERE state IN ('unknown_move','unknown_source_delete','blocked')
+         )
+         GROUP BY kind, state, problem_code
+         ORDER BY kind, state, COALESCE(problem_code, '')",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    })?;
+
+    let mut blockers = Vec::new();
+    for row in rows {
+        let (kind, state, problem_code, count) = row?;
+        let count = u64::try_from(count).map_err(|_| {
+            JournalError::InvalidState("negative recovery blocker count".into())
+        })?;
+        blockers.push(RecoveryBlocker {
+            kind,
+            state,
+            problem_code,
+            count,
+        });
+    }
+    Ok(blockers)
 }
 
 fn configure(connection: &Connection) -> Result<(), JournalError> {
