@@ -85,13 +85,8 @@ pub fn build(runtime_override: Option<PathBuf>) -> Result<Bootstrap> {
         .as_ref()
         .map(|storage| build_storage_status_service(storage.clone(), registry.clone()));
 
-    let (
-        torrents,
-        mutation_client,
-        release_client,
-        completion_client,
-        qbit_startup_problem,
-    ) = match config.qbittorrent.as_ref() {
+    let (torrents, mutation_client, release_client, completion_client, qbit_startup_problem) =
+        match config.qbittorrent.as_ref() {
             Some(qbit) => match build_qbit_client(qbit) {
                 Ok(client) => {
                     let torrent_port: Arc<dyn TorrentClient> = client.clone();
