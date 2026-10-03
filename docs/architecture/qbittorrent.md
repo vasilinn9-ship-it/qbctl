@@ -80,3 +80,45 @@ For file manifests:
 - no generic cache.
 
 Any combined/batch file optimization must be independently capability-tested and optional.
+
+
+## Durable direct mutations
+
+Slice 2 uses one independently observable effect per RequestId.
+
+Supported direct effects:
+- stop one exact torrent;
+- start one exact torrent;
+- set qBittorrent max active downloads;
+- set global download limit;
+- set global upload limit;
+- set qbctl target client count locally.
+
+The durable lifecycle is:
+
+```text
+Prepared
+-> EffectPending
+-> ObservedApplied
+-> Finished
+```
+
+Exceptional states are `Blocked`, `Unknown` and `Failed`.
+
+After restart, `EffectPending` and `Unknown` are observed before any retry. If the desired state is already present, the existing OperationId is completed without sending the effect again. If a fresh observation proves the effect did not happen, the same operation may become retry-ready.
+
+A blocked preflight is not automatic restart work. Repeating the same RequestId explicitly revalidates it.
+
+## Queue policy
+
+`target_client_count` is qbctl-owned policy, not a qBittorrent preference. It is stored atomically in SQLite with a monotonically increasing policy revision.
+
+qBittorrent `max_active_downloads` remains a separate setting. If qBittorrent queueing is disabled, changing the active-download count blocks instead of silently enabling queueing.
+
+## Transfer-limit units and quantization
+
+Application and protocol units are bytes/s.
+
+The canonical mutation/readback path is the transfer API, whose rate-limit values are bytes/s. qBittorrent preferences/UI represent global limits as whole KiB/s; preferences are diagnostic evidence only.
+
+Postcondition matching therefore keeps requested and effective values distinct and accepts a non-zero effective value when its difference from the requested value is less than 1024 bytes/s. Zero remains exact because it represents unlimited. This prevents whole-KiB/s persistence from being misreported as configuration drift while still rejecting larger mismatches.
