@@ -638,6 +638,7 @@ fn completion_execution_response(
         | CompletionExecutionStatus::RemoveRecordPending
         | CompletionExecutionStatus::UnknownStop
         | CompletionExecutionStatus::UnknownArchive
+        | CompletionExecutionStatus::UnknownArchiveSourceDelete
         | CompletionExecutionStatus::UnknownMove
         | CompletionExecutionStatus::UnknownSourceDelete
         | CompletionExecutionStatus::UnknownRemoveRecord => mutation_problem(
