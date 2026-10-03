@@ -544,17 +544,13 @@ impl MutationService {
     }
 
     async fn observe_desired(&self, command: &MutationCommand) -> Result<bool, PortError> {
-        let client = match command {
-            MutationCommand::SetQueueTarget { .. } => None,
-            _ => Some(self.qbit_client()?),
-        };
+        let client = self.qbit_client()?;
 
         match command {
             MutationCommand::TorrentControl { torrent_id, action } => {
-                let torrent =
-                    client.get(torrent_id).await?.ok_or_else(|| {
-                        PortError::new("TORRENT_NOT_FOUND", "torrent was not found")
-                    })?;
+                let torrent = client.get(torrent_id).await?.ok_or_else(|| {
+                    PortError::new("TORRENT_NOT_FOUND", "torrent was not found")
+                })?;
                 if torrent.state == qb_domain::torrent::TorrentState::Unknown {
                     return Err(PortError::new(
                         "TORRENT_STATE_UNKNOWN",
@@ -603,11 +599,7 @@ impl MutationService {
             },
             MutationCommand::SetActiveDownloads {
                 max_active_downloads,
-            } => {
-                self.client
-                    .set_active_downloads(*max_active_downloads)
-                    .await
-            }
+            } => client.set_active_downloads(*max_active_downloads).await,
             MutationCommand::SetDownloadLimit { bytes_per_sec } => {
                 client.set_download_limit(*bytes_per_sec).await
             }
