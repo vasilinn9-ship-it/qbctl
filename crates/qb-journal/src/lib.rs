@@ -269,6 +269,90 @@ impl Journal {
         transaction.commit()?;
         Ok(record)
     }
+    fn apply_queue_target_inner(
+        &self,
+        operation_id: &OperationId,
+        target_client_count: u32,
+    ) -> Result<MutationRecord, JournalError> {
+        let mut connection = self.connection.lock().expect("journal mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = load_operation(&transaction, operation_id.as_str())?.ok_or_else(|| {
+            JournalError::InvalidState(format!("operation {} does not exist", operation_id))
+        })?;
+
+        if current.disposition == MutationDisposition::Finished {
+            return Ok(current);
+        }
+
+        match &current.command {
+            MutationCommand::SetQueueTarget {
+                target_client_count: expected,
+            } if *expected == target_client_count => {}
+            _ => {
+                return Err(JournalError::InvalidTransition(format!(
+                    "{} is not the matching queue-target operation",
+                    operation_id
+                )));
+            }
+        }
+
+        if current.disposition != MutationDisposition::Prepared {
+            return Err(JournalError::InvalidTransition(format!(
+                "{} cannot apply queue target from {}",
+                operation_id,
+                disposition_name(current.disposition)
+            )));
+        }
+
+        transaction.execute(
+            "UPDATE controller_policy
+             SET target_client_count = ?1,
+                 revision = revision + 1,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE singleton = 1",
+            [i64::from(target_client_count)],
+        )?;
+
+        let next_revision = current
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| JournalError::InvalidState("operation revision overflow".into()))?;
+        let changed = transaction.execute(
+            "UPDATE operations
+             SET checkpoint = 'finished',
+                 disposition = 'finished',
+                 pending_effect_kind = NULL,
+                 problem_code = NULL,
+                 revision = ?1,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE operation_id = ?2 AND revision = ?3 AND disposition = 'prepared'",
+            params![next_revision, operation_id.as_str(), current.revision],
+        )?;
+        if changed != 1 {
+            return Err(JournalError::InvalidTransition(format!(
+                "{} changed while queue target was being committed",
+                operation_id
+            )));
+        }
+
+        insert_event(
+            &transaction,
+            operation_id.as_str(),
+            next_revision,
+            "finished",
+            "finished",
+            MutationDisposition::Finished,
+            None,
+            None,
+        )?;
+
+        let record = load_operation(&transaction, operation_id.as_str())?
+            .ok_or_else(|| JournalError::InvalidState("updated operation disappeared".into()))?;
+        transaction.commit()?;
+        Ok(record)
+    }
+
 }
 
 impl JournalHealthPort for Journal {
@@ -323,14 +407,65 @@ impl MutationJournal for Journal {
             .get_operation(operation_id)?
             .ok_or_else(|| PortError::new("OPERATION_NOT_FOUND", operation_id.to_string()))?;
         let effect = current.pending_effect_kind.clone();
+        let expected = match current.disposition {
+            MutationDisposition::EffectPending | MutationDisposition::Unknown => {
+                current.disposition
+            }
+            other => {
+                return Err(PortError::new(
+                    "OPERATION_TRANSITION_INVALID",
+                    format!(
+                        "{} cannot mark observed applied from {}",
+                        operation_id,
+                        disposition_name(other)
+                    ),
+                ));
+            }
+        };
 
         self.transition(
             operation_id,
-            MutationDisposition::EffectPending,
+            expected,
             MutationDisposition::ObservedApplied,
             "observed_applied",
             "observed_applied",
             effect.as_deref(),
+            None,
+            false,
+        )
+        .map_err(map_port_error)
+    }
+
+    fn mark_retry_ready(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<MutationRecord, PortError> {
+        let current = self
+            .get_operation(operation_id)?
+            .ok_or_else(|| PortError::new("OPERATION_NOT_FOUND", operation_id.to_string()))?;
+        let expected = match current.disposition {
+            MutationDisposition::EffectPending | MutationDisposition::Unknown => {
+                current.disposition
+            }
+            other => {
+                return Err(PortError::new(
+                    "OPERATION_TRANSITION_INVALID",
+                    format!(
+                        "{} cannot become retry-ready from {}",
+                        operation_id,
+                        disposition_name(other)
+                    ),
+                ));
+            }
+        };
+
+        self.transition(
+            operation_id,
+            expected,
+            MutationDisposition::Prepared,
+            "observed_not_applied",
+            "retry_ready",
+            None,
             None,
             false,
         )
@@ -403,6 +538,65 @@ impl MutationJournal for Journal {
     ) -> Result<Option<MutationRecord>, PortError> {
         let connection = self.connection.lock().expect("journal mutex poisoned");
         load_operation(&connection, operation_id.as_str()).map_err(map_port_error)
+    }
+
+    fn list_recoverable(&self) -> Result<Vec<MutationRecord>, PortError> {
+        let connection = self.connection.lock().expect("journal mutex poisoned");
+        let mut statement = connection
+            .prepare(
+                "SELECT request_id, operation_id, command_kind, fingerprint_version,
+                        command_fingerprint,
+                        torrent_id, control_action, target_client_count, max_active_downloads,
+                        download_limit_bps, upload_limit_bps,
+                        checkpoint, disposition, pending_effect_kind, problem_code, revision
+                 FROM operations
+                 JOIN requests USING(request_id)
+                 WHERE disposition IN ('prepared','effect_pending','observed_applied','unknown')
+                 ORDER BY created_at, operation_id",
+            )
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        let rows = statement
+            .query_map([], map_operation_row)
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.map_err(JournalError::from).map_err(map_port_error)?);
+        }
+        Ok(records)
+    }
+
+    fn queue_target(&self) -> Result<Option<u32>, PortError> {
+        let connection = self.connection.lock().expect("journal mutex poisoned");
+        let value: Option<i64> = connection
+            .query_row(
+                "SELECT target_client_count FROM controller_policy WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        value
+            .map(|value| {
+                u32::try_from(value).map_err(|_| {
+                    PortError::new(
+                        "JOURNAL_STATE_INVALID",
+                        "target_client_count is outside u32 range",
+                    )
+                })
+            })
+            .transpose()
+    }
+
+    fn apply_queue_target(
+        &self,
+        operation_id: &OperationId,
+        target_client_count: u32,
+    ) -> Result<MutationRecord, PortError> {
+        self.apply_queue_target_inner(operation_id, target_client_count)
+            .map_err(map_port_error)
     }
 }
 
