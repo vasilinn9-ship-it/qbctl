@@ -627,7 +627,7 @@ impl CompletionService {
                 return Ok(completion_execution(
                     CompletionExecutionStatus::Blocked,
                     record,
-                    completion_problem("COMPLETION_BLOCKED", "completion is blocked"),
+                    Some(PortError::new("COMPLETION_BLOCKED", "completion is blocked")),
                     replayed,
                 ));
             }
@@ -635,7 +635,7 @@ impl CompletionService {
                 return Ok(completion_execution(
                     CompletionExecutionStatus::Failed,
                     record,
-                    completion_problem("COMPLETION_FAILED", "completion failed"),
+                    Some(PortError::new("COMPLETION_FAILED", "completion failed")),
                     replayed,
                 ));
             }
@@ -905,13 +905,6 @@ impl CompletionService {
         }
         Ok(StopObservation::Running)
     }
-}
-
-fn completion_problem(
-    fallback_code: &'static str,
-    fallback_message: &'static str,
-) -> Option<PortError> {
-    Some(PortError::new(fallback_code, fallback_message))
 }
 
 fn completion_execution(
