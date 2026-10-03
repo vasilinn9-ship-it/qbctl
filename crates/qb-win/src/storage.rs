@@ -7,7 +7,7 @@ use std::{
 use qb_application::{
     storage::{
         FileEvidence, FileIdentity, IncomingDeleteOutcome, IncomingFileSnapshot, ManagedRoot,
-        Storage, StorageVolumeStatus,
+        SameVolumeMoveOutcome, Storage, StorageVolumeStatus,
     },
     PortError,
 };
@@ -215,6 +215,22 @@ impl Storage for ManagedStorage {
         observe_managed_file(&self.roots, managed_root_role(root), relative_path)
     }
 
+    fn move_same_volume_no_replace(
+        &self,
+        source_root: ManagedRoot,
+        destination_root: ManagedRoot,
+        relative_path: &str,
+        expected_source: &FileEvidence,
+    ) -> Result<SameVolumeMoveOutcome, PortError> {
+        move_same_volume_no_replace(
+            &self.roots,
+            managed_root_role(source_root),
+            managed_root_role(destination_root),
+            relative_path,
+            expected_source,
+        )
+    }
+
     fn list_incoming(&self) -> Result<Vec<String>, PortError> {
         self.revalidate_root(ManagedRootRole::Incoming)?;
 
@@ -388,6 +404,200 @@ fn observe_managed_file(
         Err(error) => return Err(PortError::new("STORAGE_IO", error.to_string())),
     };
     file_evidence(&file, relative_path).map(Some)
+}
+
+#[cfg(windows)]
+fn move_same_volume_no_replace(
+    roots: &ValidatedManagedRootLayout,
+    source_role: ManagedRootRole,
+    destination_role: ManagedRootRole,
+    relative_path: &str,
+    expected_source: &FileEvidence,
+) -> Result<SameVolumeMoveOutcome, PortError> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::{
+        Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS},
+        Storage::FileSystem::MoveFileW,
+    };
+
+    let refreshed_source =
+        validate_root(source_role, roots.path(source_role)).map_err(map_storage_port_error)?;
+    if !paths_equal(&refreshed_source, roots.path(source_role)) {
+        return Err(PortError::new(
+            "STORAGE_ROOT_CHANGED",
+            format!("{source_role:?} root identity changed before managed move"),
+        ));
+    }
+    let refreshed_destination =
+        validate_root(destination_role, roots.path(destination_role)).map_err(map_storage_port_error)?;
+    if !paths_equal(&refreshed_destination, roots.path(destination_role)) {
+        return Err(PortError::new(
+            "STORAGE_ROOT_CHANGED",
+            format!("{destination_role:?} root identity changed before managed move"),
+        ));
+    }
+
+    let source_volume = roots
+        .observe_volume(source_role)
+        .map_err(map_storage_port_error)?;
+    let destination_volume = roots
+        .observe_volume(destination_role)
+        .map_err(map_storage_port_error)?;
+    if source_volume.serial_number != destination_volume.serial_number {
+        return Err(PortError::new(
+            "STORAGE_VOLUME_MISMATCH",
+            "same-volume move requires source and destination on the same volume",
+        ));
+    }
+
+    let managed = ManagedRelativePath::parse(relative_path).map_err(map_storage_port_error)?;
+    let source_path = roots.path(source_role).join(managed.as_path());
+    let destination_path = roots.path(destination_role).join(managed.as_path());
+
+    match observe_managed_file(roots, source_role, relative_path)? {
+        None => return Ok(SameVolumeMoveOutcome::SourceMissing),
+        Some(observed) if &observed != expected_source => {
+            return Ok(SameVolumeMoveOutcome::SourceChanged { observed });
+        }
+        Some(_) => {}
+    }
+    if let Some(observed) = observe_managed_file(roots, destination_role, relative_path)? {
+        return Ok(SameVolumeMoveOutcome::DestinationExists { observed });
+    }
+
+    ensure_managed_parent_directories(roots, destination_role, managed.as_path())?;
+
+    match observe_managed_file(roots, source_role, relative_path)? {
+        None => return Ok(SameVolumeMoveOutcome::SourceMissing),
+        Some(observed) if &observed != expected_source => {
+            return Ok(SameVolumeMoveOutcome::SourceChanged { observed });
+        }
+        Some(_) => {}
+    }
+    if let Some(observed) = observe_managed_file(roots, destination_role, relative_path)? {
+        return Ok(SameVolumeMoveOutcome::DestinationExists { observed });
+    }
+
+    let source_wide = source_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination_wide = destination_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+
+    let moved = unsafe { MoveFileW(source_wide.as_ptr(), destination_wide.as_ptr()) };
+    if moved == 0 {
+        let error = io::Error::last_os_error();
+        if matches!(
+            error.raw_os_error().map(|value| value as u32),
+            Some(ERROR_ALREADY_EXISTS | ERROR_FILE_EXISTS)
+        ) {
+            if let Some(observed) =
+                observe_managed_file(roots, destination_role, relative_path)?
+            {
+                return Ok(SameVolumeMoveOutcome::DestinationExists { observed });
+            }
+        }
+        return Err(PortError::new("STORAGE_MOVE_UNCERTAIN", error.to_string()));
+    }
+
+    if observe_managed_file(roots, source_role, relative_path)?.is_some() {
+        return Err(PortError::new(
+            "STORAGE_MOVE_POSTCONDITION",
+            "source still exists after same-volume move",
+        ));
+    }
+    let destination = observe_managed_file(roots, destination_role, relative_path)?.ok_or_else(|| {
+        PortError::new(
+            "STORAGE_MOVE_POSTCONDITION",
+            "destination is missing after same-volume move",
+        )
+    })?;
+    if destination != *expected_source {
+        return Err(PortError::new(
+            "STORAGE_MOVE_POSTCONDITION",
+            "destination evidence does not match the expected source after same-volume move",
+        ));
+    }
+
+    Ok(SameVolumeMoveOutcome::Moved { destination })
+}
+
+#[cfg(not(windows))]
+fn move_same_volume_no_replace(
+    _roots: &ValidatedManagedRootLayout,
+    _source_role: ManagedRootRole,
+    _destination_role: ManagedRootRole,
+    _relative_path: &str,
+    _expected_source: &FileEvidence,
+) -> Result<SameVolumeMoveOutcome, PortError> {
+    Err(PortError::new(
+        "STORAGE_MOVE_UNSUPPORTED",
+        "safe same-volume move requires the Windows storage adapter",
+    ))
+}
+
+fn ensure_managed_parent_directories(
+    roots: &ValidatedManagedRootLayout,
+    role: ManagedRootRole,
+    relative_path: &Path,
+) -> Result<(), PortError> {
+    let parent = relative_path.parent().ok_or_else(|| {
+        PortError::new(
+            "STORAGE_PATH_INVALID",
+            "managed move target has no relative parent",
+        )
+    })?;
+    let mut current = roots.path(role).to_path_buf();
+    for component in parent.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if is_reparse_metadata(&metadata) {
+                    return Err(PortError::new(
+                        "STORAGE_REPARSE_POINT",
+                        format!("managed destination parent is a reparse point: {}", current.display()),
+                    ));
+                }
+                if !metadata.is_dir() {
+                    return Err(PortError::new(
+                        "STORAGE_PATH_INVALID",
+                        format!(
+                            "managed destination parent is not a directory: {}",
+                            current.display()
+                        ),
+                    ));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match fs::create_dir(&current) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => {
+                        return Err(PortError::new("STORAGE_IO", error.to_string()));
+                    }
+                }
+                let metadata =
+                    fs::symlink_metadata(&current).map_err(|error| PortError::new("STORAGE_IO", error.to_string()))?;
+                if is_reparse_metadata(&metadata) || !metadata.is_dir() {
+                    return Err(PortError::new(
+                        "STORAGE_PATH_INVALID",
+                        format!(
+                            "managed destination parent became unsafe: {}",
+                            current.display()
+                        ),
+                    ));
+                }
+            }
+            Err(error) => return Err(PortError::new("STORAGE_IO", error.to_string())),
+        }
+    }
+    Ok(())
 }
 
 fn validate_incoming_delete_path(
