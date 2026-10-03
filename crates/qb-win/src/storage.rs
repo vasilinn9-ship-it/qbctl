@@ -6,8 +6,7 @@ use std::{
 
 use qb_application::{
     storage::{
-        FileEvidence, FileIdentity, IncomingFileSnapshot, ManagedRoot, Storage,
-        StorageVolumeStatus,
+        FileEvidence, FileIdentity, IncomingFileSnapshot, ManagedRoot, Storage, StorageVolumeStatus,
     },
     PortError,
 };
