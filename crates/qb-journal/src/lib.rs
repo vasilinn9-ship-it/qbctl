@@ -1639,28 +1639,30 @@ fn load_registry_record(
     }))
 }
 
+struct StoredAdmissionRow {
+    request_id: String,
+    operation_id: String,
+    registry_id: String,
+    source_relative: String,
+    source_volume_id: Vec<u8>,
+    source_file_id: Vec<u8>,
+    source_size: Vec<u8>,
+    source_modified_marker: Vec<u8>,
+    source_metainfo_digest: Vec<u8>,
+    working_volume_id: Vec<u8>,
+    working_save_path: String,
+    reserved_bytes: Vec<u8>,
+    checkpoint: String,
+    pending_effect_kind: Option<String>,
+    problem_code: Option<String>,
+    revision: u64,
+}
+
 fn load_admission_record(
     connection: &Connection,
     operation_id: &str,
 ) -> Result<Option<AdmissionRecord>, JournalError> {
-    let row: Option<(
-        String,
-        String,
-        String,
-        String,
-        Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
-        String,
-        Vec<u8>,
-        String,
-        Option<String>,
-        Option<String>,
-        u64,
-    )> = connection
+    let row: Option<StoredAdmissionRow> = connection
         .query_row(
             "SELECT requests.request_id,
                     operations.operation_id,
@@ -1687,29 +1689,33 @@ fn load_admission_record(
                AND operations.command_kind = 'admission.add'",
             [operation_id],
             |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
-                    row.get(9)?,
-                    row.get(10)?,
-                    row.get(11)?,
-                    row.get(12)?,
-                    row.get(13)?,
-                    row.get(14)?,
-                    row.get(15)?,
-                ))
+                Ok(StoredAdmissionRow {
+                    request_id: row.get(0)?,
+                    operation_id: row.get(1)?,
+                    registry_id: row.get(2)?,
+                    source_relative: row.get(3)?,
+                    source_volume_id: row.get(4)?,
+                    source_file_id: row.get(5)?,
+                    source_size: row.get(6)?,
+                    source_modified_marker: row.get(7)?,
+                    source_metainfo_digest: row.get(8)?,
+                    working_volume_id: row.get(9)?,
+                    working_save_path: row.get(10)?,
+                    reserved_bytes: row.get(11)?,
+                    checkpoint: row.get(12)?,
+                    pending_effect_kind: row.get(13)?,
+                    problem_code: row.get(14)?,
+                    revision: row.get(15)?,
+                })
             },
         )
         .optional()?;
 
-    let Some((
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let StoredAdmissionRow {
         request_id,
         operation_id,
         registry_id,
@@ -1726,10 +1732,7 @@ fn load_admission_record(
         pending_effect_kind,
         problem_code,
         revision,
-    )) = row
-    else {
-        return Ok(None);
-    };
+    } = row;
 
     let request_id = RequestId::new(request_id)
         .map_err(|error| JournalError::InvalidState(error.to_string()))?;
