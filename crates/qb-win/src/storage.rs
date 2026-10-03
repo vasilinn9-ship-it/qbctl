@@ -152,13 +152,13 @@ impl ManagedStorage {
         &self.roots
     }
 
-    fn revalidate_incoming_root(&self) -> Result<(), PortError> {
-        let refreshed = validate_root(ManagedRootRole::Incoming, &self.roots.incoming)
-            .map_err(map_storage_port_error)?;
-        if !paths_equal(&refreshed, &self.roots.incoming) {
+    fn revalidate_root(&self, role: ManagedRootRole) -> Result<(), PortError> {
+        let configured = self.roots.path(role);
+        let refreshed = validate_root(role, configured).map_err(map_storage_port_error)?;
+        if !paths_equal(&refreshed, configured) {
             return Err(PortError::new(
                 "STORAGE_ROOT_CHANGED",
-                "Incoming root identity changed after validation",
+                format!("{role:?} root identity changed after validation"),
             ));
         }
         Ok(())
@@ -174,6 +174,7 @@ impl Storage for ManagedStorage {
             ManagedRoot::Completed => ManagedRootRole::Completed,
             ManagedRoot::Runtime => ManagedRootRole::Runtime,
         };
+        self.revalidate_root(role)?;
         let volume = self
             .roots
             .observe_volume(role)
@@ -187,7 +188,7 @@ impl Storage for ManagedStorage {
     }
 
     fn list_incoming(&self) -> Result<Vec<String>, PortError> {
-        self.revalidate_incoming_root()?;
+        self.revalidate_root(ManagedRootRole::Incoming)?;
 
         let entries = fs::read_dir(&self.roots.incoming)
             .map_err(|error| PortError::new("STORAGE_IO", error.to_string()))?;
@@ -233,7 +234,7 @@ impl Storage for ManagedStorage {
             ));
         }
 
-        self.revalidate_incoming_root()?;
+        self.revalidate_root(ManagedRootRole::Incoming)?;
 
         let managed = ManagedRelativePath::parse(relative_path).map_err(|_| {
             PortError::new(
