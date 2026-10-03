@@ -4695,10 +4695,13 @@ fn begin_completion_archive_source_delete(
             .map_err(map_port_error)?;
         return Ok(current);
     }
-    if current.state != CompletionState::ArchivePending {
+    if !matches!(
+        current.state,
+        CompletionState::ArchivePending | CompletionState::UnknownArchive
+    ) {
         return Err(PortError::new(
             "OPERATION_TRANSITION_INVALID",
-            "Archive source-delete intent requires ArchivePending state",
+            "Archive source-delete intent requires ArchivePending or evidence-resolved UnknownArchive",
         ));
     }
     if current.archive_destination_evidence.is_none() || current.archive_sha256.is_none() {
@@ -4721,7 +4724,7 @@ fn begin_completion_archive_source_delete(
                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE operation_id = ?2
                AND revision = ?3
-               AND state = 'archive_pending'
+               AND state IN ('archive_pending','unknown_archive')
                AND archive_destination_file_id IS NOT NULL
                AND archive_destination_sha256 IS NOT NULL",
             params![revision, operation_id.as_str(), current.revision],
