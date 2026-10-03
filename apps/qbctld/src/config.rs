@@ -95,7 +95,8 @@ impl Config {
             if qbit.username.trim().is_empty() {
                 bail!("qBittorrent username must not be empty");
             }
-            if qbit.credential.trim().is_empty() && std::env::var_os("QBCTL_QBIT_PASSWORD").is_none()
+            if qbit.credential.trim().is_empty()
+                && std::env::var_os("QBCTL_QBIT_PASSWORD").is_none()
             {
                 bail!("qBittorrent credential reference must not be empty");
             }
