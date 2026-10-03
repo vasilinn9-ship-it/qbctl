@@ -470,9 +470,7 @@ impl TorrentRegistry for Journal {
                 RegisterIncomingResult::Registered(record)
             }
             [registry_id] => {
-                insert_identity_aliases(&transaction, registry_id, &candidate.identity)
-                    .map_err(map_port_error)?;
-                let record = load_registry_record(&transaction, registry_id)
+                let existing = load_registry_record(&transaction, registry_id)
                     .map_err(map_port_error)?
                     .ok_or_else(|| {
                         PortError::new(
@@ -480,6 +478,33 @@ impl TorrentRegistry for Journal {
                             "registry alias references a missing record",
                         )
                     })?;
+                if existing.source_metainfo_digest != candidate.source_metainfo_digest {
+                    return Err(PortError::new(
+                        "IDENTITY_CONFLICT",
+                        "same torrent identity is represented by different metainfo bytes",
+                    ));
+                }
+
+                insert_identity_aliases(&transaction, registry_id, &candidate.identity)
+                    .map_err(map_port_error)?;
+                let record = load_registry_record(&transaction, registry_id)
+                    .map_err(map_port_error)?
+                    .ok_or_else(|| {
+                        PortError::new(
+                            "JOURNAL_STATE_INVALID",
+                            "registry record disappeared after alias update",
+                        )
+                    })?;
+                transaction
+                    .execute(
+                        "UPDATE torrent_registry
+                         SET canonical_identity = ?1,
+                             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                         WHERE registry_id = ?2",
+                        params![canonical_identity(&record.identity), registry_id],
+                    )
+                    .map_err(JournalError::from)
+                    .map_err(map_port_error)?;
                 RegisterIncomingResult::AlreadyPresent(record)
             }
             _ => {
@@ -1641,7 +1666,7 @@ mod tests {
                 .register_incoming(&RegisterIncoming {
                     identity: TorrentIdentity::new(Some(v1), Some(v2)).expect("hybrid"),
                     source_relative: "b.torrent".into(),
-                    source_metainfo_digest: [0x32; 32],
+                    source_metainfo_digest: [0x31; 32],
                 })
                 .expect("extend aliases");
             match extended {
@@ -1668,6 +1693,31 @@ mod tests {
             found.identity,
             TorrentIdentity::new(Some(v1), Some(v2)).expect("hybrid")
         );
+    }
+
+    #[test]
+    fn registry_rejects_same_identity_with_different_metainfo_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path().join("state.sqlite")).expect("journal");
+        let identity = TorrentIdentity::new(Some([0x71; 20]), None).expect("identity");
+
+        journal
+            .register_incoming(&RegisterIncoming {
+                identity: identity.clone(),
+                source_relative: "a.torrent".into(),
+                source_metainfo_digest: [0x81; 32],
+            })
+            .expect("first registration");
+
+        let error = journal
+            .register_incoming(&RegisterIncoming {
+                identity,
+                source_relative: "b.torrent".into(),
+                source_metainfo_digest: [0x82; 32],
+            })
+            .expect_err("different bytes must conflict");
+
+        assert_eq!(error.code, "IDENTITY_CONFLICT");
     }
 
     #[test]
