@@ -3,7 +3,9 @@ use qb_application::{
         DaemonPhase, DoctorReport as ApplicationDoctorReport,
         SystemStatus as ApplicationSystemStatus,
     },
-    torrent::{QbitProbe, QueueSettings, TorrentView, TrackerEvidence, TrackerStatus, TransferInfo},
+    torrent::{
+        QbitProbe, QueueSettings, TorrentView, TrackerEvidence, TrackerStatus, TransferInfo,
+    },
 };
 use qb_domain::torrent::TorrentState;
 use qb_proto::v1::{
@@ -112,7 +114,6 @@ fn torrent_state(value: TorrentState) -> TorrentStateView {
         TorrentState::Unknown => TorrentStateView::Unknown,
     }
 }
-
 
 pub fn tracker_evidence(value: TrackerEvidence) -> TrackerEvidenceView {
     TrackerEvidenceView {
