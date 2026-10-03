@@ -1852,6 +1852,37 @@ impl CompletionJournal for Journal {
         load_completion_record(&connection, operation_id.as_str()).map_err(map_port_error)
     }
 
+    fn list_completions(&self) -> Result<Vec<CompletionRecord>, PortError> {
+        let connection = self.connection.lock().expect("journal mutex poisoned");
+        let mut statement = connection
+            .prepare(
+                "SELECT operation_id
+                 FROM completion_operations
+                 ORDER BY created_at, operation_id",
+            )
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            let operation_id = row.map_err(JournalError::from).map_err(map_port_error)?;
+            let record = load_completion_record(&connection, &operation_id)
+                .map_err(map_port_error)?
+                .ok_or_else(|| {
+                    PortError::new(
+                        "JOURNAL_STATE_INVALID",
+                        "completion disappeared during operation enumeration",
+                    )
+                })?;
+            records.push(record);
+        }
+        Ok(records)
+    }
+
     fn list_recoverable_completions(&self) -> Result<Vec<CompletionRecord>, PortError> {
         let connection = self.connection.lock().expect("journal mutex poisoned");
         let mut statement = connection
