@@ -337,8 +337,8 @@ impl TorrentClient for QbitClient {
 }
 
 fn validate_base_url(value: &str) -> Result<Url, QbitBuildError> {
-    let mut url = Url::parse(value)
-        .map_err(|error| QbitBuildError::InvalidUrl(error.to_string()))?;
+    let mut url =
+        Url::parse(value).map_err(|error| QbitBuildError::InvalidUrl(error.to_string()))?;
 
     if url.scheme() != "http"
         || url.username() != ""
@@ -421,8 +421,8 @@ fn is_supported_mutation_version(application: &str, webapi: &str) -> bool {
 }
 
 fn map_torrent(row: TorrentDto) -> Result<TorrentView, QbitError> {
-    let id = TorrentId::new(&row.hash)
-        .map_err(|error| QbitError::InvalidResponse(error.to_string()))?;
+    let id =
+        TorrentId::new(&row.hash).map_err(|error| QbitError::InvalidResponse(error.to_string()))?;
     let progress = if row.progress.is_finite() {
         row.progress.clamp(0.0, 1.0)
     } else {
@@ -438,7 +438,9 @@ fn map_torrent(row: TorrentDto) -> Result<TorrentView, QbitError> {
         download_rate_bps: nonnegative(row.dlspeed),
         upload_rate_bps: nonnegative(row.upspeed),
         progress_ppm: (progress * 1_000_000.0).round() as u32,
-        availability: row.availability.filter(|value| value.is_finite() && *value >= 0.0),
+        availability: row
+            .availability
+            .filter(|value| value.is_finite() && *value >= 0.0),
         peers_connected: nonnegative(row.peers),
         peers_known: nonnegative(row.peers_total),
         seeds_connected: nonnegative(row.seeds),
