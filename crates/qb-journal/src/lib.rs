@@ -6800,8 +6800,7 @@ mod tests {
 
             CompletionJournal::mark_stop_pending(&journal, &record.operation_id)
                 .expect("stop pending");
-            CompletionJournal::mark_stopped(&journal, &record.operation_id)
-                .expect("stopped");
+            CompletionJournal::mark_stopped(&journal, &record.operation_id).expect("stopped");
             CompletionJournal::mark_archive_pending(&journal, &record.operation_id)
                 .expect("archive pending");
             CompletionJournal::mark_archive_receipted(
@@ -6831,10 +6830,7 @@ mod tests {
             let remove_pending =
                 CompletionJournal::mark_payload_handed_off(&journal, &record.operation_id)
                     .expect("payload handed off");
-            assert_eq!(
-                remove_pending.state,
-                CompletionState::RemoveRecordPending
-            );
+            assert_eq!(remove_pending.state, CompletionState::RemoveRecordPending);
 
             let finished = CompletionJournal::finish_completion(&journal, &record.operation_id)
                 .expect("finish completion");
@@ -6854,7 +6850,10 @@ mod tests {
             .expect("registry record");
         assert_eq!(registry.state, RegistryState::Finished);
         assert!(registry.operation_id.is_none());
-        assert_eq!(registry.archive_ref.as_deref(), Some(admission.source_relative.as_str()));
+        assert_eq!(
+            registry.archive_ref.as_deref(),
+            Some(admission.source_relative.as_str())
+        );
         assert_eq!(registry.handoff_file_count, 2);
         assert_eq!(registry.handoff_receipt_count, 2);
 
