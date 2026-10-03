@@ -10,9 +10,9 @@ use qb_application::{
 use qb_domain::{torrent::TorrentId, RequestId};
 use qb_proto::{
     v1::{
-        request, response, CapabilitiesResponse, MutationCertainty, MutationResultResponse,
-        NextAction, Problem, ProblemCategory, QueueTargetResponse, Request, Response,
-        RetryGuidance, Status, TorrentGetResponse,
+        request, response, CapabilitiesResponse, DoctorCheck, DoctorResponse, MutationCertainty,
+        MutationResultResponse, NextAction, Problem, ProblemCategory, QueueTargetResponse, Request,
+        Response, RetryGuidance, Status, TorrentGetResponse,
     },
     PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
@@ -50,7 +50,9 @@ pub async fn dispatch(
         Some(request::Command::Doctor(_)) => success(
             sequence,
             request_id,
-            response::Payload::Doctor(super::encode::doctor(system.doctor())),
+            response::Payload::Doctor(
+                doctor_response(system, torrents, qbit_startup_problem).await,
+            ),
         ),
         Some(request::Command::TorrentList(_)) => {
             let Some(service) = torrents else {
@@ -234,6 +236,133 @@ pub async fn dispatch(
             .await
         }
         None => invalid_request(sequence, request_id, "command is required"),
+    }
+}
+
+async fn doctor_response(
+    system: &SystemService,
+    torrents: Option<&TorrentService>,
+    qbit_startup_problem: Option<&str>,
+) -> DoctorResponse {
+    let mut report = super::encode::doctor(system.doctor());
+
+    let Some(torrents) = torrents else {
+        report.checks.push(DoctorCheck {
+            name: "qbit".into(),
+            ok: false,
+            message: qbit_startup_problem
+                .unwrap_or("qBittorrent is unavailable")
+                .into(),
+        });
+        return report;
+    };
+
+    match torrents.probe().await {
+        Ok(probe) => report.checks.push(DoctorCheck {
+            name: "qbit.api".into(),
+            ok: probe.mutation_ready,
+            message: format!(
+                "application={} webapi={} mutation_ready={}",
+                probe.application_version, probe.webapi_version, probe.mutation_ready
+            ),
+        }),
+        Err(error) => {
+            report.checks.push(DoctorCheck {
+                name: "qbit.api".into(),
+                ok: false,
+                message: format!("{}: {}", error.code, error.message),
+            });
+            return report;
+        }
+    }
+
+    match torrents.transfer_info().await {
+        Ok(info) => report.checks.push(DoctorCheck {
+            name: "qbit.transfer".into(),
+            ok: true,
+            message: format!(
+                "connection={} dht_nodes={} download_rate_bps={} upload_rate_bps={} download_limit_bps={} upload_limit_bps={}",
+                connection_status_name(info.connection_status),
+                info.dht_nodes,
+                info.download_rate_bps,
+                info.upload_rate_bps,
+                info.download_limit_bps,
+                info.upload_limit_bps
+            ),
+        }),
+        Err(error) => report.checks.push(DoctorCheck {
+            name: "qbit.transfer".into(),
+            ok: false,
+            message: format!("{}: {}", error.code, error.message),
+        }),
+    }
+
+    match torrents.network_preferences().await {
+        Ok(network) => report.checks.push(DoctorCheck {
+            name: "qbit.network".into(),
+            ok: true,
+            message: format!(
+                "listen_port={} upnp={} dht={} pex={} lsd={} interface={} address={} max_connections={} max_connections_per_torrent={}",
+                network.listen_port,
+                network.upnp,
+                network.dht,
+                network.pex,
+                network.lsd,
+                compact_evidence(&network.current_network_interface),
+                compact_evidence(&network.current_interface_address),
+                network.max_connections,
+                network.max_connections_per_torrent
+            ),
+        }),
+        Err(error) => report.checks.push(DoctorCheck {
+            name: "qbit.network".into(),
+            ok: false,
+            message: format!("{}: {}", error.code, error.message),
+        }),
+    }
+
+    match torrents.queue_settings().await {
+        Ok(queue) => report.checks.push(DoctorCheck {
+            name: "qbit.queue".into(),
+            ok: true,
+            message: format!(
+                "enabled={} max_active_downloads={} max_active_torrents={} dont_count_slow_torrents={}",
+                queue.queueing_enabled,
+                queue.max_active_downloads,
+                queue.max_active_torrents,
+                queue.dont_count_slow_torrents
+            ),
+        }),
+        Err(error) => report.checks.push(DoctorCheck {
+            name: "qbit.queue".into(),
+            ok: false,
+            message: format!("{}: {}", error.code, error.message),
+        }),
+    }
+
+    report
+}
+
+fn connection_status_name(value: qb_application::torrent::ConnectionStatus) -> &'static str {
+    use qb_application::torrent::ConnectionStatus;
+    match value {
+        ConnectionStatus::Connected => "connected",
+        ConnectionStatus::Firewalled => "firewalled",
+        ConnectionStatus::Disconnected => "disconnected",
+        ConnectionStatus::Unknown => "unknown",
+    }
+}
+
+fn compact_evidence(value: &str) -> String {
+    let value: String = value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(128)
+        .collect();
+    if value.is_empty() {
+        "<unspecified>".into()
+    } else {
+        value
     }
 }
 
