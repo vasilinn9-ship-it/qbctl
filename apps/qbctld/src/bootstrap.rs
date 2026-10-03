@@ -176,11 +176,7 @@ fn build_storage_status_service(
 ) -> Arc<StorageStatusService> {
     let metainfo: Arc<dyn MetainfoReader> = Arc::new(LocalMetainfoReader);
     let scan = IncomingScanService::new(storage.clone(), metainfo, registry);
-    Arc::new(StorageStatusService::new(
-        storage,
-        scan,
-        MAX_METAINFO_BYTES,
-    ))
+    Arc::new(StorageStatusService::new(storage, scan, MAX_METAINFO_BYTES))
 }
 
 fn build_qbit_client(config: &QbitConfig) -> Result<Arc<QbitClient>> {
