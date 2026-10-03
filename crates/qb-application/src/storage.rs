@@ -53,6 +53,58 @@ pub enum IncomingDeleteOutcome {
     Changed,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedRootStatus {
+    pub root: ManagedRoot,
+    pub path: String,
+    pub volume_id: u64,
+    pub free_bytes: u64,
+    pub total_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageStatus {
+    pub roots: Vec<ManagedRootStatus>,
+}
+
+pub struct StorageStatusService {
+    storage: Arc<dyn Storage>,
+}
+
+impl StorageStatusService {
+    pub fn new(storage: Arc<dyn Storage>) -> Self {
+        Self { storage }
+    }
+
+    pub fn status(&self) -> Result<StorageStatus, PortError> {
+        let mut roots = Vec::with_capacity(5);
+        for root in [
+            ManagedRoot::Incoming,
+            ManagedRoot::Archive,
+            ManagedRoot::Working,
+            ManagedRoot::Completed,
+            ManagedRoot::Runtime,
+        ] {
+            let path = self.storage.root_path(root)?;
+            let volume = self.storage.volume_status(root)?;
+            if volume.root != root {
+                return Err(PortError::new(
+                    "INTERNAL_INVARIANT_VIOLATION",
+                    "storage adapter returned volume status for the wrong managed root",
+                ));
+            }
+            roots.push(ManagedRootStatus {
+                root,
+                path,
+                volume_id: volume.volume_id,
+                free_bytes: volume.free_bytes,
+                total_bytes: volume.total_bytes,
+            });
+        }
+        Ok(StorageStatus { roots })
+    }
+}
+
 pub trait Storage: Send + Sync {
     fn volume_status(&self, root: ManagedRoot) -> Result<StorageVolumeStatus, PortError>;
 
