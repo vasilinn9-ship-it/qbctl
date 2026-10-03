@@ -111,13 +111,13 @@ pub trait MetainfoReader: Send + Sync {
 pub trait TorrentClient: Send + Sync {
     fn probe(&self) -> PortFuture<'_, QbitProbe>;
     fn list(&self) -> PortFuture<'_, Vec<TorrentView>>;
-    fn get(&self, id: &TorrentId) -> PortFuture<'_, Option<TorrentView>>;
+    fn get<'a>(&'a self, id: &'a TorrentId) -> PortFuture<'a, Option<TorrentView>>;
     fn transfer_info(&self) -> PortFuture<'_, TransferInfo>;
     fn queue_settings(&self) -> PortFuture<'_, QueueSettings>;
     fn network_preferences(&self) -> PortFuture<'_, NetworkPreferences>;
-    fn trackers(&self, id: &TorrentId) -> PortFuture<'_, Vec<TrackerEvidence>>;
-    fn stop(&self, id: &TorrentId) -> EffectFuture<'_>;
-    fn start(&self, id: &TorrentId) -> EffectFuture<'_>;
+    fn trackers<'a>(&'a self, id: &'a TorrentId) -> PortFuture<'a, Vec<TrackerEvidence>>;
+    fn stop<'a>(&'a self, id: &'a TorrentId) -> EffectFuture<'a>;
+    fn start<'a>(&'a self, id: &'a TorrentId) -> EffectFuture<'a>;
     fn set_active_downloads(&self, value: u32) -> EffectFuture<'_>;
     fn set_download_limit(&self, bytes_per_sec: u64) -> EffectFuture<'_>;
     fn set_upload_limit(&self, bytes_per_sec: u64) -> EffectFuture<'_>;
