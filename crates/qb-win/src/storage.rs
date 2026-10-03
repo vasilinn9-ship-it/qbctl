@@ -449,7 +449,7 @@ fn delete_incoming_exact(
         return Ok(IncomingDeleteOutcome::Changed);
     }
 
-    let disposition = FILE_DISPOSITION_INFO { DeleteFileA: 1 };
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: 1 };
     let ok = unsafe {
         SetFileInformationByHandle(
             file.as_raw_handle() as _,
