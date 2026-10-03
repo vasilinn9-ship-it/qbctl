@@ -1535,6 +1535,315 @@ impl AdmissionJournal for Journal {
     }
 }
 
+impl CompletionJournal for Journal {
+    fn reserve_completion(
+        &self,
+        preflight: &CompletionPreflight,
+    ) -> Result<CompletionReservation, PortError> {
+        if preflight.registry_id.trim().is_empty()
+            || preflight.source_relative.trim().is_empty()
+            || preflight.working_save_path.trim().is_empty()
+            || preflight.files.is_empty()
+        {
+            return Err(PortError::new(
+                "COMPLETION_REQUEST_INVALID",
+                "completion preflight must include registry, source, Working path and files",
+            ));
+        }
+
+        let fingerprint = preflight.fingerprint();
+        let mut connection = self.connection.lock().expect("journal mutex poisoned");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+
+        let existing: Option<(String, u32, Vec<u8>)> = transaction
+            .query_row(
+                "SELECT operation_id, fingerprint_version, completion_fingerprint
+                 FROM completion_operations
+                 WHERE request_id = ?1",
+                [preflight.request_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        if let Some((operation_id, fingerprint_version, stored_fingerprint)) = existing {
+            let operation_id = OperationId::new(operation_id)
+                .map_err(|error| PortError::new("JOURNAL_STATE_INVALID", error.to_string()))?;
+            if fingerprint_version != COMPLETION_FINGERPRINT_VERSION
+                || stored_fingerprint.as_slice() != fingerprint
+            {
+                return Ok(CompletionReservation::Conflict { operation_id });
+            }
+            let record = load_completion_record(&transaction, operation_id.as_str())
+                .map_err(map_port_error)?
+                .ok_or_else(|| {
+                    PortError::new(
+                        "JOURNAL_STATE_INVALID",
+                        "completion request references a missing operation",
+                    )
+                })?;
+            transaction
+                .commit()
+                .map_err(JournalError::from)
+                .map_err(map_port_error)?;
+            return Ok(CompletionReservation::Replay(record));
+        }
+
+        let registry = load_registry_record(&transaction, &preflight.registry_id)
+            .map_err(map_port_error)?
+            .ok_or_else(|| {
+                PortError::new(
+                    "COMPLETION_TARGET_NOT_FOUND",
+                    "completion registry record does not exist",
+                )
+            })?;
+        if registry.state != RegistryState::Processing {
+            return Err(PortError::new(
+                "COMPLETION_NOT_PROCESSING",
+                "completion requires a Processing registry record",
+            ));
+        }
+        if registry.identity != preflight.identity
+            || registry.source_relative != preflight.source_relative
+            || registry.source_metainfo_digest != preflight.source_metainfo_digest
+        {
+            return Err(PortError::new(
+                "COMPLETION_PREFLIGHT_STALE",
+                "completion preflight no longer matches authoritative registry identity/source",
+            ));
+        }
+        if registry.archive_ref.is_some() || registry.handoff_receipt_count != 0 {
+            return Err(PortError::new(
+                "COMPLETION_ALREADY_STARTED",
+                "registry already contains completion handoff evidence",
+            ));
+        }
+
+        let active: Option<String> = transaction
+            .query_row(
+                "SELECT operation_id
+                 FROM completion_operations
+                 WHERE registry_id = ?1
+                   AND state NOT IN ('finished','blocked','failed')
+                 LIMIT 1",
+                [&preflight.registry_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        if let Some(operation_id) = active {
+            let operation_id = OperationId::new(operation_id)
+                .map_err(|error| PortError::new("JOURNAL_STATE_INVALID", error.to_string()))?;
+            return Ok(CompletionReservation::ActiveConflict { operation_id });
+        }
+
+        let operation_id = OperationId::new(Uuid::new_v4().to_string())
+            .map_err(|error| PortError::new("JOURNAL_STATE_INVALID", error.to_string()))?;
+        let identity_v1 = preflight.identity.v1.map(|value| value.to_vec());
+        let identity_v2 = preflight.identity.v2.map(|value| value.to_vec());
+
+        transaction
+            .execute(
+                "INSERT INTO completion_operations(
+                    operation_id,
+                    request_id,
+                    fingerprint_version,
+                    completion_fingerprint,
+                    registry_id,
+                    torrent_id,
+                    identity_v1,
+                    identity_v2,
+                    source_relative,
+                    source_volume_id,
+                    source_file_id,
+                    source_size,
+                    source_modified_marker,
+                    source_metainfo_digest,
+                    working_volume_id,
+                    completed_volume_id,
+                    archive_volume_id,
+                    working_save_path,
+                    total_bytes,
+                    payload_strategy,
+                    archive_strategy,
+                    state,
+                    problem_code,
+                    revision,
+                    created_at,
+                    updated_at,
+                    finished_at
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                    ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                    ?18, ?19, ?20, ?21, 'prepared', NULL, 1,
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    NULL
+                 )",
+                params![
+                    operation_id.as_str(),
+                    preflight.request_id.as_str(),
+                    COMPLETION_FINGERPRINT_VERSION,
+                    fingerprint.as_slice(),
+                    preflight.registry_id,
+                    preflight.torrent_id.as_str(),
+                    identity_v1,
+                    identity_v2,
+                    preflight.source_relative,
+                    preflight
+                        .source_evidence
+                        .identity
+                        .volume_id
+                        .to_be_bytes()
+                        .as_slice(),
+                    preflight
+                        .source_evidence
+                        .identity
+                        .file_id
+                        .to_be_bytes()
+                        .as_slice(),
+                    preflight.source_evidence.size.to_be_bytes().as_slice(),
+                    preflight
+                        .source_evidence
+                        .modified_marker
+                        .to_be_bytes()
+                        .as_slice(),
+                    preflight.source_metainfo_digest.as_slice(),
+                    preflight.working_volume_id.to_be_bytes().as_slice(),
+                    preflight.completed_volume_id.to_be_bytes().as_slice(),
+                    preflight.archive_volume_id.to_be_bytes().as_slice(),
+                    preflight.working_save_path,
+                    preflight.total_bytes.to_be_bytes().as_slice(),
+                    completion_strategy_name(preflight.payload_strategy()),
+                    completion_strategy_name(preflight.archive_strategy()),
+                ],
+            )
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+
+        for (index, file) in preflight.files.iter().enumerate() {
+            let file_index = u32::try_from(index).map_err(|_| {
+                PortError::new(
+                    "COMPLETION_REQUEST_INVALID",
+                    "completion manifest has more files than supported by the journal",
+                )
+            })?;
+            transaction
+                .execute(
+                    "INSERT INTO operation_files(
+                        operation_id,
+                        file_index,
+                        relative_path,
+                        expected_size,
+                        source_volume_id,
+                        source_file_id,
+                        source_size,
+                        source_modified_marker,
+                        handoff_strategy,
+                        state,
+                        temp_relative,
+                        destination_volume_id,
+                        destination_file_id,
+                        destination_size,
+                        destination_modified_marker,
+                        destination_sha256,
+                        problem_code,
+                        revision,
+                        created_at,
+                        updated_at
+                     ) VALUES (
+                        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                        'prepared', NULL, NULL, NULL, NULL, NULL, NULL, NULL, 1,
+                        strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     )",
+                    params![
+                        operation_id.as_str(),
+                        i64::from(file_index),
+                        file.relative_path,
+                        file.size.to_be_bytes().as_slice(),
+                        file.source_evidence
+                            .identity
+                            .volume_id
+                            .to_be_bytes()
+                            .as_slice(),
+                        file.source_evidence
+                            .identity
+                            .file_id
+                            .to_be_bytes()
+                            .as_slice(),
+                        file.source_evidence.size.to_be_bytes().as_slice(),
+                        file.source_evidence.modified_marker.to_be_bytes().as_slice(),
+                        completion_strategy_name(preflight.payload_strategy()),
+                    ],
+                )
+                .map_err(JournalError::from)
+                .map_err(map_port_error)?;
+        }
+
+        insert_completion_event(&transaction, operation_id.as_str(), 1, "prepared", None)
+            .map_err(map_port_error)?;
+
+        let record = load_completion_record(&transaction, operation_id.as_str())
+            .map_err(map_port_error)?
+            .ok_or_else(|| {
+                PortError::new(
+                    "JOURNAL_STATE_INVALID",
+                    "completion operation disappeared before commit",
+                )
+            })?;
+        transaction
+            .commit()
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        Ok(CompletionReservation::New(record))
+    }
+
+    fn get_completion(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<CompletionRecord>, PortError> {
+        let connection = self.connection.lock().expect("journal mutex poisoned");
+        load_completion_record(&connection, operation_id.as_str()).map_err(map_port_error)
+    }
+
+    fn list_recoverable_completions(&self) -> Result<Vec<CompletionRecord>, PortError> {
+        let connection = self.connection.lock().expect("journal mutex poisoned");
+        let mut statement = connection
+            .prepare(
+                "SELECT operation_id
+                 FROM completion_operations
+                 WHERE state NOT IN ('finished','blocked','failed')
+                 ORDER BY created_at, operation_id",
+            )
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            let operation_id = row.map_err(JournalError::from).map_err(map_port_error)?;
+            let record = load_completion_record(&connection, &operation_id)
+                .map_err(map_port_error)?
+                .ok_or_else(|| {
+                    PortError::new(
+                        "JOURNAL_STATE_INVALID",
+                        "recoverable completion disappeared during enumeration",
+                    )
+                })?;
+            records.push(record);
+        }
+        Ok(records)
+    }
+}
+
 impl ReleaseJournal for Journal {
     fn reserve_release(&self, request: &ReleaseRequest) -> Result<ReleaseReservation, PortError> {
         if request.registry_id.trim().is_empty() {
