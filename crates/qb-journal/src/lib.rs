@@ -774,7 +774,6 @@ impl IncomingCleanupJournal for Journal {
                     redundant_modified_marker,
                     source_sha256,
                     state,
-                    resolution,
                     problem_code,
                     revision,
                     created_at,
@@ -2382,7 +2381,6 @@ fn migrate_v1_to_v2(connection: &mut Connection) -> Result<(), JournalError> {
             checkpoint TEXT NOT NULL,
             disposition TEXT NOT NULL,
             pending_effect_kind TEXT,
-            resolution TEXT CHECK(resolution IS NULL OR resolution IN ('preserved_incomplete', 'became_complete')),
             problem_code TEXT,
             revision INTEGER NOT NULL CHECK(revision > 0),
             created_at TEXT NOT NULL,
@@ -2600,6 +2598,7 @@ fn migrate_v5_to_v6(connection: &mut Connection) -> Result<(), JournalError> {
                 'blocked',
                 'failed'
             )),
+            resolution TEXT CHECK(resolution IS NULL OR resolution IN ('preserved_incomplete', 'became_complete')),
             problem_code TEXT,
             revision INTEGER NOT NULL CHECK(revision > 0),
             created_at TEXT NOT NULL,
@@ -2921,7 +2920,6 @@ struct StoredCleanupRow {
     redundant_modified_marker: Vec<u8>,
     source_sha256: Vec<u8>,
     state: String,
-    resolution: Option<String>,
     problem_code: Option<String>,
     revision: u64,
 }
@@ -3149,6 +3147,7 @@ struct StoredReleaseRow {
     retained_bytes: Vec<u8>,
     working_save_path: String,
     state: String,
+    resolution: Option<String>,
     problem_code: Option<String>,
     revision: u64,
 }
@@ -3175,6 +3174,7 @@ fn load_release_record(
                     retained_bytes,
                     working_save_path,
                     state,
+                    resolution,
                     problem_code,
                     revision
              FROM release_operations
