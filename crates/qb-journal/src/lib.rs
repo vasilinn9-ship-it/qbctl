@@ -401,8 +401,7 @@ impl TorrentRegistry for Journal {
         let ids = matching_registry_ids(&connection, identity).map_err(map_port_error)?;
         match ids.as_slice() {
             [] => Ok(None),
-            [registry_id] => load_registry_record(&connection, registry_id)
-                .map_err(map_port_error),
+            [registry_id] => load_registry_record(&connection, registry_id).map_err(map_port_error),
             _ => Err(PortError::new(
                 "IDENTITY_CONFLICT",
                 "torrent identity aliases resolve to multiple registry records",
@@ -426,8 +425,8 @@ impl TorrentRegistry for Journal {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(JournalError::from)
             .map_err(map_port_error)?;
-        let ids = matching_registry_ids(&transaction, &candidate.identity)
-            .map_err(map_port_error)?;
+        let ids =
+            matching_registry_ids(&transaction, &candidate.identity).map_err(map_port_error)?;
 
         let result = match ids.as_slice() {
             [] => {
@@ -1067,10 +1066,18 @@ fn load_registry_record(
     connection: &Connection,
     registry_id: &str,
 ) -> Result<Option<RegistryRecord>, JournalError> {
-    let row: Option<(String, String, String, Vec<u8>, Option<String>, Option<String>, i64, i64)> =
-        connection
-            .query_row(
-                "SELECT registry_id,
+    let row: Option<(
+        String,
+        String,
+        String,
+        Vec<u8>,
+        Option<String>,
+        Option<String>,
+        i64,
+        i64,
+    )> = connection
+        .query_row(
+            "SELECT registry_id,
                         state,
                         source_relative,
                         source_metainfo_digest,
@@ -1080,21 +1087,21 @@ fn load_registry_record(
                         handoff_receipt_count
                  FROM torrent_registry
                  WHERE registry_id = ?1",
-                [registry_id],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                    ))
-                },
-            )
-            .optional()?;
+            [registry_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .optional()?;
 
     let Some((
         registry_id,
@@ -1588,10 +1595,7 @@ mod tests {
         drop(connection);
 
         let journal = Journal::open(&path).expect("migrate");
-        assert_eq!(
-            journal.schema_version().expect("version"),
-            SCHEMA_VERSION
-        );
+        assert_eq!(journal.schema_version().expect("version"), SCHEMA_VERSION);
 
         let connection = journal.connection.lock().expect("journal mutex");
         let table_count: u32 = connection
