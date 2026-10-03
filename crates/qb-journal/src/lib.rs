@@ -703,27 +703,41 @@ fn command_columns(command: &MutationCommand) -> Result<CommandColumns<'_>, Jour
             download_limit_bps: None,
             upload_limit_bps: None,
         }),
-        MutationCommand::QueueSet {
+        MutationCommand::SetQueueTarget {
             target_client_count,
+        } => Ok(CommandColumns {
+            torrent_id: None,
+            control_action: None,
+            target_client_count: Some(i64::from(*target_client_count)),
+            max_active_downloads: None,
+            download_limit_bps: None,
+            upload_limit_bps: None,
+        }),
+        MutationCommand::SetActiveDownloads {
             max_active_downloads,
         } => Ok(CommandColumns {
             torrent_id: None,
             control_action: None,
-            target_client_count: target_client_count.map(i64::from),
-            max_active_downloads: max_active_downloads.map(i64::from),
+            target_client_count: None,
+            max_active_downloads: Some(i64::from(*max_active_downloads)),
             download_limit_bps: None,
             upload_limit_bps: None,
         }),
-        MutationCommand::TransferLimitsSet {
-            download_limit_bps,
-            upload_limit_bps,
-        } => Ok(CommandColumns {
+        MutationCommand::SetDownloadLimit { bytes_per_sec } => Ok(CommandColumns {
             torrent_id: None,
             control_action: None,
             target_client_count: None,
             max_active_downloads: None,
-            download_limit_bps: optional_u64_to_i64(*download_limit_bps)?,
-            upload_limit_bps: optional_u64_to_i64(*upload_limit_bps)?,
+            download_limit_bps: optional_u64_to_i64(Some(*bytes_per_sec))?,
+            upload_limit_bps: None,
+        }),
+        MutationCommand::SetUploadLimit { bytes_per_sec } => Ok(CommandColumns {
+            torrent_id: None,
+            control_action: None,
+            target_client_count: None,
+            max_active_downloads: None,
+            download_limit_bps: None,
+            upload_limit_bps: optional_u64_to_i64(Some(*bytes_per_sec))?,
         }),
     }
 }
@@ -768,35 +782,39 @@ fn decode_command(
                 },
             })
         }
-        "queue.set" => Ok(MutationCommand::QueueSet {
-            target_client_count: optional_nonnegative_u32(target_client_count, "target_client_count")?,
-            max_active_downloads: optional_nonnegative_u32(
+        "queue.target.set" => Ok(MutationCommand::SetQueueTarget {
+            target_client_count: required_nonnegative_u32(
+                target_client_count,
+                "target_client_count",
+            )?,
+        }),
+        "queue.downloads.set" => Ok(MutationCommand::SetActiveDownloads {
+            max_active_downloads: required_nonnegative_u32(
                 max_active_downloads,
                 "max_active_downloads",
             )?,
         }),
-        "transfer.limits.set" => Ok(MutationCommand::TransferLimitsSet {
-            download_limit_bps: optional_nonnegative_u64(download_limit_bps, "download_limit_bps")?,
-            upload_limit_bps: optional_nonnegative_u64(upload_limit_bps, "upload_limit_bps")?,
+        "transfer.download_limit.set" => Ok(MutationCommand::SetDownloadLimit {
+            bytes_per_sec: required_nonnegative_u64(
+                download_limit_bps,
+                "download_limit_bps",
+            )?,
+        }),
+        "transfer.upload_limit.set" => Ok(MutationCommand::SetUploadLimit {
+            bytes_per_sec: required_nonnegative_u64(upload_limit_bps, "upload_limit_bps")?,
         }),
         other => Err(format!("unknown mutation command kind '{other}'")),
     }
 }
 
-fn optional_nonnegative_u32(value: Option<i64>, field: &str) -> Result<Option<u32>, String> {
-    value
-        .map(|value| {
-            u32::try_from(value).map_err(|_| format!("{field} is outside u32 range"))
-        })
-        .transpose()
+fn required_nonnegative_u32(value: Option<i64>, field: &str) -> Result<u32, String> {
+    let value = value.ok_or_else(|| format!("{field} is missing"))?;
+    u32::try_from(value).map_err(|_| format!("{field} is outside u32 range"))
 }
 
-fn optional_nonnegative_u64(value: Option<i64>, field: &str) -> Result<Option<u64>, String> {
-    value
-        .map(|value| {
-            u64::try_from(value).map_err(|_| format!("{field} must be non-negative"))
-        })
-        .transpose()
+fn required_nonnegative_u64(value: Option<i64>, field: &str) -> Result<u64, String> {
+    let value = value.ok_or_else(|| format!("{field} is missing"))?;
+    u64::try_from(value).map_err(|_| format!("{field} must be non-negative"))
 }
 
 fn insert_event(
@@ -963,9 +981,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("state.sqlite");
         let request = request_id("queue-1");
-        let command = MutationCommand::QueueSet {
-            target_client_count: Some(80),
-            max_active_downloads: Some(10),
+        let command = MutationCommand::SetQueueTarget {
+            target_client_count: 80,
         };
 
         let operation_id = {
