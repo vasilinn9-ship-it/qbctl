@@ -132,6 +132,7 @@ fn parse_inner(bytes: &[u8]) -> Result<TorrentMetainfo, MetainfoError> {
 struct V1Parsed {
     name: String,
     piece_length: u64,
+    multi_file: bool,
     content_files: Vec<V1ContentFile>,
     layout: Vec<V1LayoutEntry>,
 }
@@ -244,6 +245,7 @@ fn parse_v1(info: &Value<'_>) -> Result<V1Parsed, MetainfoError> {
     Ok(V1Parsed {
         name,
         piece_length,
+        multi_file: has_files,
         content_files,
         layout,
     })
@@ -523,10 +525,15 @@ fn validate_hybrid(v1: &V1Parsed, v2: &V2Parsed) -> Result<(), MetainfoError> {
         .map(|file| (file.path.clone(), file.size))
         .collect();
 
-    if v2_files
-        .iter()
-        .all(|(path, _)| path.first().is_some_and(|part| part == &v1.name))
-    {
+    if v1.multi_file {
+        if !v2_files
+            .iter()
+            .all(|(path, _)| path.first().is_some_and(|part| part == &v1.name))
+        {
+            return Err(invalid(
+                "hybrid v2 multi-file layout is missing the v1 root name",
+            ));
+        }
         for (path, _) in &mut v2_files {
             path.remove(0);
         }
