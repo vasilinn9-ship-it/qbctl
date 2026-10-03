@@ -114,9 +114,7 @@ impl IncomingScanService {
 
 #[cfg(test)]
 mod tests {
-    use qb_domain::torrent::{
-        ManifestFile, TorrentIdentity, TorrentManifest, TorrentMetainfo,
-    };
+    use qb_domain::torrent::{ManifestFile, TorrentIdentity, TorrentManifest, TorrentMetainfo};
 
     use super::*;
 
@@ -155,8 +153,7 @@ mod tests {
             }
 
             Ok(TorrentMetainfo {
-                identity: TorrentIdentity::new(Some([0x11; 20]), None)
-                    .expect("fixture identity"),
+                identity: TorrentIdentity::new(Some([0x11; 20]), None).expect("fixture identity"),
                 manifest: TorrentManifest::new(vec![ManifestFile {
                     path: "payload.bin".into(),
                     size: 4,
