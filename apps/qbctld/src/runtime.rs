@@ -110,6 +110,7 @@ pub async fn run(runtime_override: Option<PathBuf>) -> Result<()> {
                         let storage = bootstrap.storage_status.as_ref().map(Arc::clone);
                         let torrents = bootstrap.torrents.as_ref().map(Arc::clone);
                         let mutations = Arc::clone(&bootstrap.mutations);
+                        let completion = bootstrap.completion.as_ref().map(Arc::clone);
                         let qbit_startup_problem =
                             bootstrap.qbit_startup_problem.as_deref().map(Arc::<str>::from);
                         tasks.spawn(async move {
@@ -120,6 +121,7 @@ pub async fn run(runtime_override: Option<PathBuf>) -> Result<()> {
                                 storage,
                                 torrents,
                                 mutations,
+                                completion,
                                 qbit_startup_problem,
                             )
                             .await
