@@ -552,7 +552,7 @@ impl MutationJournal for Journal {
                  FROM operations
                  JOIN requests USING(request_id)
                  WHERE disposition IN ('prepared','effect_pending','observed_applied','unknown')
-                 ORDER BY created_at, operation_id",
+                 ORDER BY operations.created_at, operation_id",
             )
             .map_err(JournalError::from)
             .map_err(map_port_error)?;
