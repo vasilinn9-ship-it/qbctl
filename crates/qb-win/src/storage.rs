@@ -6,8 +6,9 @@ use std::{
 
 use qb_application::{
     storage::{
-        FileEvidence, FileIdentity, IncomingDeleteOutcome, IncomingFileSnapshot, ManagedRoot,
-        SameVolumeMoveOutcome, Storage, StorageVolumeStatus,
+        FileEvidence, FileIdentity, IncomingDeleteOutcome, IncomingFileSnapshot,
+        ManagedDeleteOutcome, ManagedRoot, SameVolumeMoveOutcome, Storage, StorageVolumeStatus,
+        VerifiedCopyOutcome,
     },
     PortError,
 };
@@ -218,15 +219,17 @@ impl Storage for ManagedStorage {
     fn move_same_volume_no_replace(
         &self,
         source_root: ManagedRoot,
+        source_relative: &str,
         destination_root: ManagedRoot,
-        relative_path: &str,
+        destination_relative: &str,
         expected_source: &FileEvidence,
     ) -> Result<SameVolumeMoveOutcome, PortError> {
         move_same_volume_no_replace(
             &self.roots,
             managed_root_role(source_root),
+            source_relative,
             managed_root_role(destination_root),
-            relative_path,
+            destination_relative,
             expected_source,
         )
     }
@@ -410,8 +413,9 @@ fn observe_managed_file(
 fn move_same_volume_no_replace(
     roots: &ValidatedManagedRootLayout,
     source_role: ManagedRootRole,
+    source_relative: &str,
     destination_role: ManagedRootRole,
-    relative_path: &str,
+    destination_relative: &str,
     expected_source: &FileEvidence,
 ) -> Result<SameVolumeMoveOutcome, PortError> {
     use std::os::windows::ffi::OsStrExt;
@@ -451,31 +455,34 @@ fn move_same_volume_no_replace(
         ));
     }
 
-    let managed = ManagedRelativePath::parse(relative_path).map_err(map_storage_port_error)?;
-    let source_path = roots.path(source_role).join(managed.as_path());
-    let destination_path = roots.path(destination_role).join(managed.as_path());
+    let source_managed =
+        ManagedRelativePath::parse(source_relative).map_err(map_storage_port_error)?;
+    let destination_managed =
+        ManagedRelativePath::parse(destination_relative).map_err(map_storage_port_error)?;
+    let source_path = roots.path(source_role).join(source_managed.as_path());
+    let destination_path = roots.path(destination_role).join(destination_managed.as_path());
 
-    match observe_managed_file(roots, source_role, relative_path)? {
+    match observe_managed_file(roots, source_role, source_relative)? {
         None => return Ok(SameVolumeMoveOutcome::SourceMissing),
         Some(observed) if &observed != expected_source => {
             return Ok(SameVolumeMoveOutcome::SourceChanged { observed });
         }
         Some(_) => {}
     }
-    if let Some(observed) = observe_managed_file(roots, destination_role, relative_path)? {
+    if let Some(observed) = observe_managed_file(roots, destination_role, destination_relative)? {
         return Ok(SameVolumeMoveOutcome::DestinationExists { observed });
     }
 
-    ensure_managed_parent_directories(roots, destination_role, managed.as_path())?;
+    ensure_managed_parent_directories(roots, destination_role, destination_managed.as_path())?;
 
-    match observe_managed_file(roots, source_role, relative_path)? {
+    match observe_managed_file(roots, source_role, source_relative)? {
         None => return Ok(SameVolumeMoveOutcome::SourceMissing),
         Some(observed) if &observed != expected_source => {
             return Ok(SameVolumeMoveOutcome::SourceChanged { observed });
         }
         Some(_) => {}
     }
-    if let Some(observed) = observe_managed_file(roots, destination_role, relative_path)? {
+    if let Some(observed) = observe_managed_file(roots, destination_role, destination_relative)? {
         return Ok(SameVolumeMoveOutcome::DestinationExists { observed });
     }
 
@@ -498,21 +505,21 @@ fn move_same_volume_no_replace(
             .map(|value| value as u32)
             .is_some_and(|value| value == ERROR_ALREADY_EXISTS || value == ERROR_FILE_EXISTS)
         {
-            if let Some(observed) = observe_managed_file(roots, destination_role, relative_path)? {
+            if let Some(observed) = observe_managed_file(roots, destination_role, destination_relative)? {
                 return Ok(SameVolumeMoveOutcome::DestinationExists { observed });
             }
         }
         return Err(PortError::new("STORAGE_MOVE_UNCERTAIN", error.to_string()));
     }
 
-    if observe_managed_file(roots, source_role, relative_path)?.is_some() {
+    if observe_managed_file(roots, source_role, source_relative)?.is_some() {
         return Err(PortError::new(
             "STORAGE_MOVE_POSTCONDITION",
             "source still exists after same-volume move",
         ));
     }
     let destination =
-        observe_managed_file(roots, destination_role, relative_path)?.ok_or_else(|| {
+        observe_managed_file(roots, destination_role, destination_relative)?.ok_or_else(|| {
             PortError::new(
                 "STORAGE_MOVE_POSTCONDITION",
                 "destination is missing after same-volume move",
@@ -532,8 +539,9 @@ fn move_same_volume_no_replace(
 fn move_same_volume_no_replace(
     _roots: &ValidatedManagedRootLayout,
     _source_role: ManagedRootRole,
+    _source_relative: &str,
     _destination_role: ManagedRootRole,
-    _relative_path: &str,
+    _destination_relative: &str,
     _expected_source: &FileEvidence,
 ) -> Result<SameVolumeMoveOutcome, PortError> {
     Err(PortError::new(
@@ -1377,6 +1385,7 @@ mod tests {
         let outcome = storage
             .move_same_volume_no_replace(
                 ManagedRoot::Working,
+                "dir/payload.bin",
                 ManagedRoot::Completed,
                 "dir/payload.bin",
                 &evidence,
@@ -1420,6 +1429,7 @@ mod tests {
         let outcome = storage
             .move_same_volume_no_replace(
                 ManagedRoot::Working,
+                "dir/payload.bin",
                 ManagedRoot::Completed,
                 "dir/payload.bin",
                 &evidence,
