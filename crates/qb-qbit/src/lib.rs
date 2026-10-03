@@ -631,9 +631,7 @@ fn nonnegative(value: i64) -> u64 {
 
 fn map_files_error(error: QbitError) -> PortError {
     match error {
-        QbitError::HttpStatus(404) => {
-            PortError::new("TORRENT_NOT_FOUND", "torrent was not found")
-        }
+        QbitError::HttpStatus(404) => PortError::new("TORRENT_NOT_FOUND", "torrent was not found"),
         other => map_port_error(other),
     }
 }
