@@ -4382,8 +4382,7 @@ fn transition_completion_file(
         ),
         CompletionFileState::SourceDeletePending => matches!(
             file.state,
-            CompletionFileState::DestinationReceipted
-                | CompletionFileState::UnknownSourceDelete
+            CompletionFileState::DestinationReceipted | CompletionFileState::UnknownSourceDelete
         ),
         CompletionFileState::UnknownSourceDelete => {
             file.state == CompletionFileState::SourceDeletePending
