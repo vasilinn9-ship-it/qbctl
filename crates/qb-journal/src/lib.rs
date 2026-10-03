@@ -42,6 +42,25 @@ pub struct Journal {
     connection: Mutex<Connection>,
 }
 
+struct TransitionSpec<'a> {
+    expected: MutationDisposition,
+    next: MutationDisposition,
+    checkpoint: &'a str,
+    event_kind: &'a str,
+    pending_effect_kind: Option<&'a str>,
+    problem_code: Option<&'a str>,
+    finished: bool,
+}
+
+struct EventSpec<'a> {
+    revision: u64,
+    event_kind: &'a str,
+    checkpoint: &'a str,
+    disposition: MutationDisposition,
+    pending_effect_kind: Option<&'a str>,
+    problem_code: Option<&'a str>,
+}
+
 impl Journal {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, JournalError> {
         let path = path.as_ref().to_path_buf();
@@ -161,12 +180,14 @@ impl Journal {
         insert_event(
             &transaction,
             operation_id.as_str(),
-            1,
-            "prepared",
-            "prepared",
-            MutationDisposition::Prepared,
-            None,
-            None,
+            EventSpec {
+                revision: 1,
+                event_kind: "prepared",
+                checkpoint: "prepared",
+                disposition: MutationDisposition::Prepared,
+                pending_effect_kind: None,
+                problem_code: None,
+            },
         )?;
 
         let record = load_operation(&transaction, operation_id.as_str())?
@@ -178,13 +199,7 @@ impl Journal {
     fn transition(
         &self,
         operation_id: &OperationId,
-        expected: MutationDisposition,
-        next: MutationDisposition,
-        checkpoint: &str,
-        event_kind: &str,
-        pending_effect_kind: Option<&str>,
-        problem_code: Option<&str>,
-        finished: bool,
+        spec: TransitionSpec<'_>,
     ) -> Result<MutationRecord, JournalError> {
         let mut connection = self.connection.lock().expect("journal mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -193,21 +208,21 @@ impl Journal {
             JournalError::InvalidState(format!("operation {} does not exist", operation_id))
         })?;
 
-        if current.disposition == next
-            && current.checkpoint == checkpoint
-            && current.pending_effect_kind.as_deref() == pending_effect_kind
-            && current.problem_code.as_deref() == problem_code
+        if current.disposition == spec.next
+            && current.checkpoint == spec.checkpoint
+            && current.pending_effect_kind.as_deref() == spec.pending_effect_kind
+            && current.problem_code.as_deref() == spec.problem_code
         {
             transaction.commit()?;
             return Ok(current);
         }
 
-        if current.disposition != expected {
+        if current.disposition != spec.expected {
             return Err(JournalError::InvalidTransition(format!(
                 "{} cannot move from {} to {}",
                 operation_id,
                 disposition_name(current.disposition),
-                disposition_name(next)
+                disposition_name(spec.next)
             )));
         }
 
@@ -216,7 +231,7 @@ impl Journal {
             .checked_add(1)
             .ok_or_else(|| JournalError::InvalidState("operation revision overflow".into()))?;
 
-        let finished_sql = if finished {
+        let finished_sql = if spec.finished {
             "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
         } else {
             "NULL"
@@ -235,14 +250,14 @@ impl Journal {
                  WHERE operation_id = ?6 AND revision = ?7 AND disposition = ?8"
             ),
             params![
-                checkpoint,
-                disposition_name(next),
-                pending_effect_kind,
-                problem_code,
+                spec.checkpoint,
+                disposition_name(spec.next),
+                spec.pending_effect_kind,
+                spec.problem_code,
                 next_revision,
                 operation_id.as_str(),
                 current.revision,
-                disposition_name(expected),
+                disposition_name(spec.expected),
             ],
         )?;
 
@@ -256,12 +271,14 @@ impl Journal {
         insert_event(
             &transaction,
             operation_id.as_str(),
-            next_revision,
-            event_kind,
-            checkpoint,
-            next,
-            pending_effect_kind,
-            problem_code,
+            EventSpec {
+                revision: next_revision,
+                event_kind: spec.event_kind,
+                checkpoint: spec.checkpoint,
+                disposition: spec.next,
+                pending_effect_kind: spec.pending_effect_kind,
+                problem_code: spec.problem_code,
+            },
         )?;
 
         let record = load_operation(&transaction, operation_id.as_str())?
@@ -339,12 +356,14 @@ impl Journal {
         insert_event(
             &transaction,
             operation_id.as_str(),
-            next_revision,
-            "finished",
-            "finished",
-            MutationDisposition::Finished,
-            None,
-            None,
+            EventSpec {
+                revision: next_revision,
+                event_kind: "finished",
+                checkpoint: "finished",
+                disposition: MutationDisposition::Finished,
+                pending_effect_kind: None,
+                problem_code: None,
+            },
         )?;
 
         let record = load_operation(&transaction, operation_id.as_str())?
@@ -387,13 +406,15 @@ impl MutationJournal for Journal {
         }
         self.transition(
             operation_id,
-            MutationDisposition::Prepared,
-            MutationDisposition::EffectPending,
-            "effect_pending",
-            "effect_pending",
-            Some(effect_kind),
-            None,
-            false,
+            TransitionSpec {
+                expected: MutationDisposition::Prepared,
+                next: MutationDisposition::EffectPending,
+                checkpoint: "effect_pending",
+                event_kind: "effect_pending",
+                pending_effect_kind: Some(effect_kind),
+                problem_code: None,
+                finished: false,
+            },
         )
         .map_err(map_port_error)
     }
@@ -424,13 +445,15 @@ impl MutationJournal for Journal {
 
         self.transition(
             operation_id,
-            expected,
-            MutationDisposition::ObservedApplied,
-            "observed_applied",
-            "observed_applied",
-            effect.as_deref(),
-            None,
-            false,
+            TransitionSpec {
+                expected,
+                next: MutationDisposition::ObservedApplied,
+                checkpoint: "observed_applied",
+                event_kind: "observed_applied",
+                pending_effect_kind: effect.as_deref(),
+                problem_code: None,
+                finished: false,
+            },
         )
         .map_err(map_port_error)
     }
@@ -457,13 +480,15 @@ impl MutationJournal for Journal {
 
         self.transition(
             operation_id,
-            expected,
-            MutationDisposition::Prepared,
-            "observed_not_applied",
-            "retry_ready",
-            None,
-            None,
-            false,
+            TransitionSpec {
+                expected,
+                next: MutationDisposition::Prepared,
+                checkpoint: "observed_not_applied",
+                event_kind: "retry_ready",
+                pending_effect_kind: None,
+                problem_code: None,
+                finished: false,
+            },
         )
         .map_err(map_port_error)
     }
@@ -471,13 +496,15 @@ impl MutationJournal for Journal {
     fn finish(&self, operation_id: &OperationId) -> Result<MutationRecord, PortError> {
         self.transition(
             operation_id,
-            MutationDisposition::ObservedApplied,
-            MutationDisposition::Finished,
-            "finished",
-            "finished",
-            None,
-            None,
-            true,
+            TransitionSpec {
+                expected: MutationDisposition::ObservedApplied,
+                next: MutationDisposition::Finished,
+                checkpoint: "finished",
+                event_kind: "finished",
+                pending_effect_kind: None,
+                problem_code: None,
+                finished: true,
+            },
         )
         .map_err(map_port_error)
     }
@@ -494,13 +521,15 @@ impl MutationJournal for Journal {
 
         self.transition(
             operation_id,
-            MutationDisposition::EffectPending,
-            MutationDisposition::Unknown,
-            "unknown",
-            "unknown",
-            effect.as_deref(),
-            Some(problem_code),
-            false,
+            TransitionSpec {
+                expected: MutationDisposition::EffectPending,
+                next: MutationDisposition::Unknown,
+                checkpoint: "unknown",
+                event_kind: "unknown",
+                pending_effect_kind: effect.as_deref(),
+                problem_code: Some(problem_code),
+                finished: false,
+            },
         )
         .map_err(map_port_error)
     }
@@ -517,13 +546,15 @@ impl MutationJournal for Journal {
 
         self.transition(
             operation_id,
-            MutationDisposition::EffectPending,
-            MutationDisposition::Failed,
-            "failed",
-            "failed",
-            effect.as_deref(),
-            Some(problem_code),
-            true,
+            TransitionSpec {
+                expected: MutationDisposition::EffectPending,
+                next: MutationDisposition::Failed,
+                checkpoint: "failed",
+                event_kind: "failed",
+                pending_effect_kind: effect.as_deref(),
+                problem_code: Some(problem_code),
+                finished: true,
+            },
         )
         .map_err(map_port_error)
     }
@@ -1013,12 +1044,7 @@ fn required_nonnegative_u64(value: Option<i64>, field: &str) -> Result<u64, Stri
 fn insert_event(
     transaction: &Transaction<'_>,
     operation_id: &str,
-    revision: u64,
-    event_kind: &str,
-    checkpoint: &str,
-    disposition: MutationDisposition,
-    pending_effect_kind: Option<&str>,
-    problem_code: Option<&str>,
+    spec: EventSpec<'_>,
 ) -> Result<(), JournalError> {
     transaction.execute(
         "INSERT INTO operation_events(
@@ -1030,12 +1056,12 @@ fn insert_event(
          )",
         params![
             operation_id,
-            revision,
-            event_kind,
-            checkpoint,
-            disposition_name(disposition),
-            pending_effect_kind,
-            problem_code,
+            spec.revision,
+            spec.event_kind,
+            spec.checkpoint,
+            disposition_name(spec.disposition),
+            spec.pending_effect_kind,
+            spec.problem_code,
         ],
     )?;
     Ok(())
