@@ -57,9 +57,7 @@ pub enum IncomingDeleteOutcome {
 pub enum SameVolumeMoveOutcome {
     Moved { destination: FileEvidence },
     SourceMissing,
-    SourceChanged {
-        observed: FileEvidence,
-    },
+    SourceChanged { observed: FileEvidence },
     DestinationExists { observed: FileEvidence },
 }
 
@@ -71,7 +69,9 @@ pub enum VerifiedCopyOutcome {
         created: bool,
     },
     SourceMissing,
-    SourceChanged { observed: FileEvidence },
+    SourceChanged {
+        observed: FileEvidence,
+    },
     TempConflict {
         observed: FileEvidence,
         sha256: [u8; 32],
