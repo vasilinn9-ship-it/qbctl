@@ -2540,11 +2540,21 @@ mod tests {
         AcceptedAndStop,
     }
 
+    #[derive(Clone, Copy)]
+    enum FakeRemoveEffect {
+        NotSent,
+        Uncertain,
+        AcceptedAndRemove,
+    }
+
     struct FakeClient {
         torrent: Mutex<TorrentView>,
         files: Mutex<Vec<FileObservation>>,
         stop_effects: Mutex<Vec<FakeStopEffect>>,
         stop_calls: AtomicUsize,
+        remove_effects: Mutex<Vec<FakeRemoveEffect>>,
+        remove_calls: AtomicUsize,
+        removed: std::sync::atomic::AtomicBool,
     }
 
     impl FakeClient {
@@ -2588,11 +2598,18 @@ mod tests {
                 ]),
                 stop_effects: Mutex::new(vec![FakeStopEffect::NotSent]),
                 stop_calls: AtomicUsize::new(0),
+                remove_effects: Mutex::new(vec![FakeRemoveEffect::NotSent]),
+                remove_calls: AtomicUsize::new(0),
+                removed: std::sync::atomic::AtomicBool::new(false),
             })
         }
 
         fn with_stop_effects(self: &Arc<Self>, effects: Vec<FakeStopEffect>) {
             *self.stop_effects.lock().expect("stop effects mutex") = effects;
+        }
+
+        fn with_remove_effects(self: &Arc<Self>, effects: Vec<FakeRemoveEffect>) {
+            *self.remove_effects.lock().expect("remove effects mutex") = effects;
         }
 
         fn set_state(&self, state: TorrentState) {
@@ -2611,6 +2628,9 @@ mod tests {
 
         fn get<'a>(&'a self, id: &'a TorrentId) -> PortFuture<'a, Option<TorrentView>> {
             Box::pin(async move {
+                if self.removed.load(Ordering::SeqCst) {
+                    return Ok(None);
+                }
                 let torrent = self.torrent.lock().expect("torrent mutex").clone();
                 Ok((id == &torrent.id).then_some(torrent))
             })
@@ -2679,6 +2699,31 @@ mod tests {
 
         fn start<'a>(&'a self, _id: &'a TorrentId) -> EffectFuture<'a> {
             Box::pin(async { EffectAttempt::NotSent(unused()) })
+        }
+
+        fn remove_keep_files<'a>(&'a self, _id: &'a TorrentId) -> EffectFuture<'a> {
+            Box::pin(async move {
+                self.remove_calls.fetch_add(1, Ordering::SeqCst);
+                let effect = {
+                    let mut effects = self.remove_effects.lock().expect("remove effects mutex");
+                    if effects.is_empty() {
+                        FakeRemoveEffect::NotSent
+                    } else {
+                        effects.remove(0)
+                    }
+                };
+                match effect {
+                    FakeRemoveEffect::NotSent => EffectAttempt::NotSent(unused()),
+                    FakeRemoveEffect::Uncertain => EffectAttempt::Uncertain(PortError::new(
+                        "QBIT_MUTATION_UNCERTAIN",
+                        "simulated record-removal timeout after send",
+                    )),
+                    FakeRemoveEffect::AcceptedAndRemove => {
+                        self.removed.store(true, Ordering::SeqCst);
+                        EffectAttempt::Accepted
+                    }
+                }
+            })
         }
 
         fn set_active_downloads(&self, _value: u32) -> EffectFuture<'_> {
