@@ -123,8 +123,7 @@ pub trait CompletionJournal: Send + Sync {
 
     fn list_recoverable_completions(&self) -> Result<Vec<CompletionRecord>, PortError>;
 
-    fn mark_stop_pending(&self, operation_id: &OperationId)
-        -> Result<CompletionRecord, PortError>;
+    fn mark_stop_pending(&self, operation_id: &OperationId) -> Result<CompletionRecord, PortError>;
 
     fn mark_unknown_stop(
         &self,
@@ -627,7 +626,10 @@ impl CompletionService {
                 return Ok(completion_execution(
                     CompletionExecutionStatus::Blocked,
                     record,
-                    Some(PortError::new("COMPLETION_BLOCKED", "completion is blocked")),
+                    Some(PortError::new(
+                        "COMPLETION_BLOCKED",
+                        "completion is blocked",
+                    )),
                     replayed,
                 ));
             }
@@ -668,10 +670,8 @@ impl CompletionService {
                         let unknown = if record.state == CompletionState::UnknownStop {
                             record
                         } else {
-                            self.journal.mark_unknown_stop(
-                                &record.operation_id,
-                                "QBIT_STOP_UNCERTAIN",
-                            )?
+                            self.journal
+                                .mark_unknown_stop(&record.operation_id, "QBIT_STOP_UNCERTAIN")?
                         };
                         return Ok(completion_execution(
                             CompletionExecutionStatus::UnknownStop,
@@ -690,10 +690,8 @@ impl CompletionService {
                         let unknown = if record.state == CompletionState::UnknownStop {
                             record
                         } else {
-                            self.journal.mark_unknown_stop(
-                                &record.operation_id,
-                                "QBIT_STOP_UNCERTAIN",
-                            )?
+                            self.journal
+                                .mark_unknown_stop(&record.operation_id, "QBIT_STOP_UNCERTAIN")?
                         };
                         return Ok(completion_execution(
                             CompletionExecutionStatus::UnknownStop,
@@ -878,7 +876,10 @@ impl CompletionService {
                 "torrent is no longer complete during completion stop observation",
             ));
         }
-        if !torrent.save_path.eq_ignore_ascii_case(&record.working_save_path) {
+        if !torrent
+            .save_path
+            .eq_ignore_ascii_case(&record.working_save_path)
+        {
             return Err(PortError::new(
                 "WORKING_OWNERSHIP_MISMATCH",
                 "qBittorrent save path changed during completion stop observation",
