@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use qb_domain::{
     torrent::{TorrentId, TorrentIdentity, TorrentMetainfo},
-    RequestId,
+    OperationId, RequestId,
 };
 use sha2::{Digest, Sha256};
 
@@ -17,6 +17,106 @@ use crate::{
 pub struct CompletionRequest {
     pub request_id: RequestId,
     pub registry_id: String,
+}
+
+pub const COMPLETION_FINGERPRINT_VERSION: u32 = 1;
+
+impl CompletionRequest {
+    pub fn fingerprint(&self) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(b"qbctl-completion-fingerprint-v1\0");
+        digest.update(self.registry_id.as_bytes());
+        digest.finalize().into()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompletionHandoffStrategy {
+    SameVolume,
+    CrossVolume,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompletionState {
+    Prepared,
+    StopPending,
+    UnknownStop,
+    Stopped,
+    ArchivePending,
+    UnknownArchive,
+    PayloadPending,
+    RemoveRecordPending,
+    UnknownRemoveRecord,
+    Finished,
+    Blocked,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompletionFileState {
+    Prepared,
+    MovePending,
+    UnknownMove,
+    DestinationReceipted,
+    SourceDeletePending,
+    UnknownSourceDelete,
+    HandedOff,
+    Blocked,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompletionFileRecord {
+    pub index: u32,
+    pub relative_path: String,
+    pub size: u64,
+    pub source_evidence: FileEvidence,
+    pub strategy: CompletionHandoffStrategy,
+    pub state: CompletionFileState,
+    pub revision: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompletionRecord {
+    pub request_id: RequestId,
+    pub operation_id: OperationId,
+    pub registry_id: String,
+    pub torrent_id: TorrentId,
+    pub identity: TorrentIdentity,
+    pub source_relative: String,
+    pub source_evidence: FileEvidence,
+    pub source_metainfo_digest: [u8; 32],
+    pub working_volume_id: u64,
+    pub completed_volume_id: u64,
+    pub archive_volume_id: u64,
+    pub working_save_path: String,
+    pub total_bytes: u64,
+    pub state: CompletionState,
+    pub problem_code: Option<String>,
+    pub revision: u64,
+    pub files: Vec<CompletionFileRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CompletionReservation {
+    New(CompletionRecord),
+    Replay(CompletionRecord),
+    Conflict { operation_id: OperationId },
+    ActiveConflict { operation_id: OperationId },
+}
+
+pub trait CompletionJournal: Send + Sync {
+    fn reserve_completion(
+        &self,
+        preflight: &CompletionPreflight,
+    ) -> Result<CompletionReservation, PortError>;
+
+    fn get_completion(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<CompletionRecord>, PortError>;
+
+    fn list_recoverable_completions(&self) -> Result<Vec<CompletionRecord>, PortError>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -41,6 +141,32 @@ pub struct CompletionPreflight {
     pub working_save_path: String,
     pub files: Vec<CompletionFilePlan>,
     pub total_bytes: u64,
+}
+
+impl CompletionPreflight {
+    pub fn fingerprint(&self) -> [u8; 32] {
+        let request = CompletionRequest {
+            request_id: self.request_id.clone(),
+            registry_id: self.registry_id.clone(),
+        };
+        request.fingerprint()
+    }
+
+    pub const fn payload_strategy(&self) -> CompletionHandoffStrategy {
+        if self.working_volume_id == self.completed_volume_id {
+            CompletionHandoffStrategy::SameVolume
+        } else {
+            CompletionHandoffStrategy::CrossVolume
+        }
+    }
+
+    pub const fn archive_strategy(&self) -> CompletionHandoffStrategy {
+        if self.source_evidence.identity.volume_id == self.archive_volume_id {
+            CompletionHandoffStrategy::SameVolume
+        } else {
+            CompletionHandoffStrategy::CrossVolume
+        }
+    }
 }
 
 pub struct CompletionPreflightService {
