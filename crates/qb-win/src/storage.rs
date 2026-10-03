@@ -5,7 +5,10 @@ use std::{
 };
 
 use qb_application::{
-    storage::{FileEvidence, FileIdentity, IncomingFileSnapshot, Storage},
+    storage::{
+        FileEvidence, FileIdentity, IncomingFileSnapshot, ManagedRoot, Storage,
+        StorageVolumeStatus,
+    },
     PortError,
 };
 use thiserror::Error;
@@ -164,6 +167,26 @@ impl ManagedStorage {
 }
 
 impl Storage for ManagedStorage {
+    fn volume_status(&self, root: ManagedRoot) -> Result<StorageVolumeStatus, PortError> {
+        let role = match root {
+            ManagedRoot::Incoming => ManagedRootRole::Incoming,
+            ManagedRoot::Archive => ManagedRootRole::Archive,
+            ManagedRoot::Working => ManagedRootRole::Working,
+            ManagedRoot::Completed => ManagedRootRole::Completed,
+            ManagedRoot::Runtime => ManagedRootRole::Runtime,
+        };
+        let volume = self
+            .roots
+            .observe_volume(role)
+            .map_err(map_storage_port_error)?;
+        Ok(StorageVolumeStatus {
+            root,
+            volume_id: u64::from(volume.serial_number),
+            free_bytes: volume.free_bytes,
+            total_bytes: volume.total_bytes,
+        })
+    }
+
     fn list_incoming(&self) -> Result<Vec<String>, PortError> {
         self.revalidate_incoming_root()?;
 
@@ -945,6 +968,15 @@ mod tests {
         assert!(volume.volume_root.is_absolute());
         assert!(volume.total_bytes > 0);
         assert!(volume.free_bytes <= volume.total_bytes);
+
+        let storage = ManagedStorage::new(roots);
+        let status = storage
+            .volume_status(ManagedRoot::Working)
+            .expect("application volume status");
+        assert_eq!(status.root, ManagedRoot::Working);
+        assert_eq!(status.volume_id, u64::from(volume.serial_number));
+        assert_eq!(status.free_bytes, volume.free_bytes);
+        assert_eq!(status.total_bytes, volume.total_bytes);
 
         fs::remove_dir_all(temp).expect("cleanup");
     }
