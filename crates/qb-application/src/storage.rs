@@ -29,7 +29,26 @@ pub struct IncomingFileSnapshot {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedRoot {
+    Incoming,
+    Archive,
+    Working,
+    Completed,
+    Runtime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageVolumeStatus {
+    pub root: ManagedRoot,
+    pub volume_id: u64,
+    pub free_bytes: u64,
+    pub total_bytes: u64,
+}
+
 pub trait Storage: Send + Sync {
+    fn volume_status(&self, root: ManagedRoot) -> Result<StorageVolumeStatus, PortError>;
+
     fn list_incoming(&self) -> Result<Vec<String>, PortError>;
 
     fn read_incoming(
@@ -408,6 +427,15 @@ mod tests {
     }
 
     impl Storage for FakeStorage {
+        fn volume_status(&self, root: ManagedRoot) -> Result<StorageVolumeStatus, PortError> {
+            Ok(StorageVolumeStatus {
+                root,
+                volume_id: 7,
+                free_bytes: 1_000_000,
+                total_bytes: 2_000_000,
+            })
+        }
+
         fn list_incoming(&self) -> Result<Vec<String>, PortError> {
             Ok(self
                 .files
