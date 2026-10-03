@@ -129,10 +129,7 @@ pub trait MutationJournal: Send + Sync {
         operation_id: &OperationId,
     ) -> Result<MutationRecord, PortError>;
 
-    fn mark_retry_ready(
-        &self,
-        operation_id: &OperationId,
-    ) -> Result<MutationRecord, PortError>;
+    fn mark_retry_ready(&self, operation_id: &OperationId) -> Result<MutationRecord, PortError>;
 
     fn finish(&self, operation_id: &OperationId) -> Result<MutationRecord, PortError>;
 
@@ -205,7 +202,6 @@ mod tests {
     }
 }
 
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MutationExecutionStatus {
     Finished,
@@ -260,7 +256,9 @@ impl MutationService {
             }
         };
 
-        self.advance(record, replayed).await.map(MutationExecutionResult::Execution)
+        self.advance(record, replayed)
+            .await
+            .map(MutationExecutionResult::Execution)
     }
 
     pub async fn recover_all(&self) -> Result<Vec<MutationExecution>, PortError> {
@@ -352,10 +350,8 @@ impl MutationService {
                         let unknown = if record.disposition == MutationDisposition::Unknown {
                             record
                         } else {
-                            self.journal.mark_unknown(
-                                &record.operation_id,
-                                "QBIT_MUTATION_UNCERTAIN",
-                            )?
+                            self.journal
+                                .mark_unknown(&record.operation_id, "QBIT_MUTATION_UNCERTAIN")?
                         };
                         return Ok(execution(
                             MutationExecutionStatus::Unknown,
@@ -419,8 +415,7 @@ impl MutationService {
             crate::torrent::EffectAttempt::Accepted => {
                 match self.observe_desired(&record.command).await {
                     Ok(true) => {
-                        let observed =
-                            self.journal.mark_observed_applied(&pending.operation_id)?;
+                        let observed = self.journal.mark_observed_applied(&pending.operation_id)?;
                         let finished = self.journal.finish(&observed.operation_id)?;
                         Ok(execution(
                             MutationExecutionStatus::Finished,
@@ -506,11 +501,10 @@ impl MutationService {
 
         match command {
             MutationCommand::TorrentControl { torrent_id, .. } => {
-                let torrent = self
-                    .client
-                    .get(torrent_id)
-                    .await?
-                    .ok_or_else(|| PortError::new("TORRENT_NOT_FOUND", "torrent was not found"))?;
+                let torrent =
+                    self.client.get(torrent_id).await?.ok_or_else(|| {
+                        PortError::new("TORRENT_NOT_FOUND", "torrent was not found")
+                    })?;
                 if torrent.state == qb_domain::torrent::TorrentState::Unknown {
                     return Err(PortError::new(
                         "TORRENT_STATE_UNKNOWN",
@@ -527,8 +521,7 @@ impl MutationService {
                     ));
                 }
             }
-            MutationCommand::SetDownloadLimit { .. }
-            | MutationCommand::SetUploadLimit { .. } => {}
+            MutationCommand::SetDownloadLimit { .. } | MutationCommand::SetUploadLimit { .. } => {}
             MutationCommand::SetQueueTarget { .. } => unreachable!("handled locally"),
         }
 
@@ -572,16 +565,13 @@ impl MutationService {
             MutationCommand::SetUploadLimit { bytes_per_sec } => {
                 Ok(self.client.transfer_info().await?.upload_limit_bps == *bytes_per_sec)
             }
-            MutationCommand::SetQueueTarget { target_client_count } => {
-                Ok(self.journal.queue_target()? == Some(*target_client_count))
-            }
+            MutationCommand::SetQueueTarget {
+                target_client_count,
+            } => Ok(self.journal.queue_target()? == Some(*target_client_count)),
         }
     }
 
-    async fn perform_effect(
-        &self,
-        command: &MutationCommand,
-    ) -> crate::torrent::EffectAttempt {
+    async fn perform_effect(&self, command: &MutationCommand) -> crate::torrent::EffectAttempt {
         match command {
             MutationCommand::TorrentControl { torrent_id, action } => match action {
                 TorrentControlAction::Stop => self.client.stop(torrent_id).await,
@@ -589,7 +579,11 @@ impl MutationService {
             },
             MutationCommand::SetActiveDownloads {
                 max_active_downloads,
-            } => self.client.set_active_downloads(*max_active_downloads).await,
+            } => {
+                self.client
+                    .set_active_downloads(*max_active_downloads)
+                    .await
+            }
             MutationCommand::SetDownloadLimit { bytes_per_sec } => {
                 self.client.set_download_limit(*bytes_per_sec).await
             }
