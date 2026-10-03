@@ -42,6 +42,7 @@ pub struct Bootstrap {
     pub storage_status: Option<Arc<StorageStatusService>>,
     pub release: Option<Arc<ReleaseService>>,
     pub completion: Option<Arc<CompletionService>>,
+    pub completion_journal: Arc<dyn CompletionJournal>,
     pub qbit_startup_problem: Option<String>,
     _instance_guard: InstanceGuard,
 }
@@ -151,18 +152,6 @@ pub fn build(runtime_override: Option<PathBuf>) -> Result<Bootstrap> {
         }
     }
 
-    if completion.is_none() {
-        let recoverable = completion_journal
-            .list_recoverable_completions()
-            .map_err(|error| anyhow!("inspect durable completion recovery state: {error}"))?;
-        if !recoverable.is_empty() {
-            return Err(anyhow!(
-                "{} durable completion operation(s) require both managed storage and qBittorrent configuration",
-                recoverable.len()
-            ));
-        }
-    }
-
     Ok(Bootstrap {
         config,
         runtime,
@@ -173,6 +162,7 @@ pub fn build(runtime_override: Option<PathBuf>) -> Result<Bootstrap> {
         storage_status,
         release,
         completion,
+        completion_journal,
         qbit_startup_problem,
         _instance_guard: instance_guard,
     })
