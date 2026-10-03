@@ -1243,8 +1243,6 @@ impl CompletionService {
             ));
         }
 
-        let mut delete_intent_created_now = false;
-
         if let (Some(destination), Some(sha256)) = (
             record.archive_destination_evidence.clone(),
             record.archive_sha256,
@@ -1254,7 +1252,7 @@ impl CompletionService {
                     record,
                     PortError::new(
                         "ARCHIVE_DIGEST_MISMATCH",
-                        "durable Archive receipt digest does not match retained metainfo digest",
+                        "durable Archive destination digest does not match retained metainfo",
                     ),
                 );
             }
@@ -1268,7 +1266,7 @@ impl CompletionService {
                     record,
                     PortError::new(
                         "ARCHIVE_DESTINATION_CHANGED",
-                        "Archive destination changed after durable receipt",
+                        "Archive destination changed after durable destination receipt",
                     ),
                 );
             }
@@ -1291,19 +1289,26 @@ impl CompletionService {
                         record,
                         PortError::new(
                             "HANDOFF_SOURCE_CHANGED",
-                            "Incoming metainfo changed before Archive source-delete intent",
+                            "Incoming metainfo changed before Archive source delete",
                         ),
                     );
                 }
             }
 
+            let mut delete_intent_created_now = false;
             if matches!(
                 record.state,
                 CompletionState::ArchivePending | CompletionState::UnknownArchive
             ) {
-                if record.state == CompletionState::UnknownArchive && !explicit_request {
+                record = self
+                    .journal
+                    .mark_archive_source_delete_pending(&record.operation_id)?;
+                delete_intent_created_now = true;
+            }
+
+            if record.state == CompletionState::UnknownArchiveSourceDelete && !explicit_request {
                 return Ok(HandoffProgress::Halt {
-                    status: CompletionExecutionStatus::UnknownArchive,
+                    status: CompletionExecutionStatus::UnknownArchiveSourceDelete,
                     record,
                     problem: Some(PortError::new(
                         "ARCHIVE_DELETE_UNCERTAIN",
@@ -1311,9 +1316,29 @@ impl CompletionService {
                     )),
                 });
             }
-            if record.state == CompletionState::UnknownArchive {
-                record = self.journal.retry_archive(&record.operation_id)?;
-                record = self.journal.mark_archive_pending(&record.operation_id)?;
+
+            if record.state == CompletionState::ArchiveSourceDeletePending
+                && !delete_intent_created_now
+                && !explicit_request
+            {
+                let unknown = self.journal.mark_unknown_archive_source_delete(
+                    &record.operation_id,
+                    "ARCHIVE_DELETE_UNCERTAIN",
+                )?;
+                return Ok(HandoffProgress::Halt {
+                    status: CompletionExecutionStatus::UnknownArchiveSourceDelete,
+                    record: unknown,
+                    problem: Some(PortError::new(
+                        "ARCHIVE_DELETE_UNCERTAIN",
+                        "restart observed source still present after durable Archive source-delete intent",
+                    )),
+                });
+            }
+
+            if record.state == CompletionState::UnknownArchiveSourceDelete {
+                record = self
+                    .journal
+                    .retry_archive_source_delete(&record.operation_id)?;
             }
 
             match self.storage.delete_managed_exact(
@@ -1335,11 +1360,12 @@ impl CompletionService {
                         )?;
                         return Ok(HandoffProgress::Continue(receipted));
                     }
-                    let unknown = self
-                        .journal
-                        .mark_unknown_archive(&record.operation_id, "ARCHIVE_DELETE_UNCERTAIN")?;
+                    let unknown = self.journal.mark_unknown_archive_source_delete(
+                        &record.operation_id,
+                        "ARCHIVE_DELETE_UNCERTAIN",
+                    )?;
                     return Ok(HandoffProgress::Halt {
-                        status: CompletionExecutionStatus::UnknownArchive,
+                        status: CompletionExecutionStatus::UnknownArchiveSourceDelete,
                         record: unknown,
                         problem: Some(PortError::new(
                             "ARCHIVE_DELETE_UNCERTAIN",
@@ -1357,16 +1383,28 @@ impl CompletionService {
                     );
                 }
                 Err(problem) => {
-                    let unknown = self
-                        .journal
-                        .mark_unknown_archive(&record.operation_id, problem.code)?;
+                    let unknown = self.journal.mark_unknown_archive_source_delete(
+                        &record.operation_id,
+                        problem.code,
+                    )?;
                     return Ok(HandoffProgress::Halt {
-                        status: CompletionExecutionStatus::UnknownArchive,
+                        status: CompletionExecutionStatus::UnknownArchiveSourceDelete,
                         record: unknown,
                         problem: Some(problem),
                     });
                 }
             }
+        }
+
+        if matches!(
+            record.state,
+            CompletionState::ArchiveSourceDeletePending
+                | CompletionState::UnknownArchiveSourceDelete
+        ) {
+            return Err(PortError::new(
+                "JOURNAL_STATE_INVALID",
+                "Archive source-delete state is missing durable destination evidence",
+            ));
         }
 
         if record.state == CompletionState::UnknownArchive && !explicit_request {
@@ -1375,7 +1413,7 @@ impl CompletionService {
                 record,
                 problem: Some(PortError::new(
                     "ARCHIVE_HANDOFF_UNCERTAIN",
-                    "cross-volume Archive handoff remains uncertain; explicit replay is required before another copy/publish attempt",
+                    "cross-volume Archive copy/publish remains uncertain; explicit replay is required before another copy/publish attempt",
                 )),
             });
         }
@@ -1401,12 +1439,12 @@ impl CompletionService {
                     sha256,
                     ..
                 } if sha256 == record.source_metainfo_digest => {
-                    record = self.journal.mark_archive_destination_receipted(
+                    let receipted = self.journal.mark_archive_destination_receipted(
                         &record.operation_id,
                         &destination,
                         sha256,
                     )?;
-                    return self.advance_cross_volume_archive(record, explicit_request);
+                    return self.advance_cross_volume_archive(receipted, explicit_request);
                 }
                 VerifiedCopyOutcome::Verified { .. } => {
                     return self.block_handoff(
@@ -1475,6 +1513,7 @@ impl CompletionService {
                 });
             }
         };
+
         if sha256 != record.source_metainfo_digest {
             return self.block_handoff(
                 record,
@@ -1544,12 +1583,12 @@ impl CompletionService {
             }
         };
 
-        record = self.journal.mark_archive_destination_receipted(
+        let receipted = self.journal.mark_archive_destination_receipted(
             &record.operation_id,
             &destination,
             sha256,
         )?;
-        self.advance_cross_volume_archive(record, explicit_request)
+        self.advance_cross_volume_archive(receipted, explicit_request)
     }
 
     fn completion_archive_temp_relative(operation_id: &OperationId) -> String {
