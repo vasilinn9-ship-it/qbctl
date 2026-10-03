@@ -660,7 +660,6 @@ fn release_problem_code(code: &str) -> &'static str {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -674,9 +673,7 @@ mod tests {
     use qb_domain::torrent::{TorrentId, TorrentState};
 
     use crate::{
-        storage::{
-            FileIdentity, IncomingFileSnapshot, StorageVolumeStatus,
-        },
+        storage::{FileIdentity, IncomingFileSnapshot, StorageVolumeStatus},
         torrent::{
             AddTorrentRequest, EffectFuture, FileObservation, NetworkPreferences, PortFuture,
             QbitProbe, QueueSettings, TrackerEvidence, TransferInfo,
@@ -729,8 +726,7 @@ mod tests {
             let mut state = self.state.lock().expect("release journal mutex");
             let fingerprint = request.fingerprint();
             if let Some(record) = state.record.clone() {
-                if state.fingerprint == Some(fingerprint)
-                    && record.request_id == request.request_id
+                if state.fingerprint == Some(fingerprint) && record.request_id == request.request_id
                 {
                     return Ok(ReleaseReservation::Replay(record));
                 }
@@ -790,7 +786,10 @@ mod tests {
                 .collect())
         }
 
-        fn mark_stop_pending(&self, _operation_id: &OperationId) -> Result<ReleaseRecord, PortError> {
+        fn mark_stop_pending(
+            &self,
+            _operation_id: &OperationId,
+        ) -> Result<ReleaseRecord, PortError> {
             self.update(&[ReleaseState::Prepared], ReleaseState::StopPending, None)
         }
 
@@ -1120,7 +1119,11 @@ mod tests {
             remaining_bytes,
             download_rate_bps: 0,
             upload_rate_bps: 0,
-            progress_ppm: if remaining_bytes == 0 { 1_000_000 } else { 500_000 },
+            progress_ppm: if remaining_bytes == 0 {
+                1_000_000
+            } else {
+                500_000
+            },
             availability: None,
             peers_connected: 0,
             peers_known: 0,
