@@ -678,31 +678,18 @@ fn map_port_error(error: QbitError) -> PortError {
 
 #[derive(Debug, Deserialize)]
 struct TorrentDto {
-    #[serde(default)]
     hash: String,
-    #[serde(default)]
     name: String,
-    #[serde(default)]
     state: String,
-    #[serde(default)]
     total_size: i64,
-    #[serde(default)]
     amount_left: i64,
-    #[serde(default)]
     dlspeed: i64,
-    #[serde(default)]
     upspeed: i64,
-    #[serde(default)]
     progress: f64,
-    #[serde(default)]
     availability: Option<f64>,
-    #[serde(default)]
     peers: i64,
-    #[serde(default)]
     peers_total: i64,
-    #[serde(default)]
     seeds: i64,
-    #[serde(default)]
     seeds_total: i64,
 }
 
@@ -721,68 +708,39 @@ struct FileDto {
 
 #[derive(Debug, Deserialize)]
 struct TransferInfoDto {
-    #[serde(default)]
     dl_info_speed: i64,
-    #[serde(default)]
     up_info_speed: i64,
-    #[serde(default)]
     dl_rate_limit: i64,
-    #[serde(default)]
     up_rate_limit: i64,
-    #[serde(default)]
     dht_nodes: i64,
-    #[serde(default)]
     connection_status: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct PreferencesDto {
-    #[serde(default)]
     queueing_enabled: bool,
-    #[serde(default)]
     max_active_downloads: i64,
-    #[serde(default)]
     max_active_torrents: i64,
-    #[serde(default)]
     dont_count_slow_torrents: bool,
-    #[serde(default)]
     listen_port: i64,
-    #[serde(default)]
     upnp: bool,
-    #[serde(default)]
     dht: bool,
-    #[serde(default)]
     pex: bool,
-    #[serde(default)]
     lsd: bool,
-    #[serde(default)]
     current_network_interface: String,
-    #[serde(default)]
     current_interface_address: String,
-    #[serde(default)]
     max_connec: i64,
-    #[serde(default)]
     max_connec_per_torrent: i64,
 }
 
 #[derive(Debug, Deserialize)]
 struct TrackerDto {
-    #[serde(default)]
     url: String,
-    #[serde(default)]
     status: i64,
-    #[serde(default = "minus_one")]
     num_peers: i64,
-    #[serde(default = "minus_one")]
     num_seeds: i64,
-    #[serde(default = "minus_one")]
     num_leeches: i64,
-    #[serde(default)]
     msg: String,
-}
-
-const fn minus_one() -> i64 {
-    -1
 }
 
 #[cfg(test)]
@@ -885,6 +843,22 @@ mod tests {
         assert_eq!(map_state("pausedDL"), TorrentState::Stopped);
         assert_eq!(map_state("pausedUP"), TorrentState::Stopped);
         assert_eq!(map_state("future-state"), TorrentState::Unknown);
+    }
+
+    #[test]
+    fn required_observation_fields_fail_closed_when_missing() {
+        assert!(serde_json::from_str::<TransferInfoDto>(
+            r#"{"dl_info_speed":1,"up_info_speed":2,"dl_rate_limit":3,"up_rate_limit":4,"dht_nodes":5}"#,
+        )
+        .is_err());
+        assert!(serde_json::from_str::<PreferencesDto>(
+            r#"{"queueing_enabled":true,"max_active_downloads":3}"#,
+        )
+        .is_err());
+        assert!(serde_json::from_str::<TrackerDto>(
+            r#"{"url":"https://tracker.example","status":2}"#,
+        )
+        .is_err());
     }
 
     #[test]
