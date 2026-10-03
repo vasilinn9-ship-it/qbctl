@@ -945,7 +945,7 @@ mod tests {
         assert!(files[1].is_seed);
 
         let requests = server.finish().await;
-        assert!(requests[1].starts_with(
+        assert!(requests[1].to_ascii_lowercase().starts_with(
             "get /api/v2/torrents/files?hash=abcdef0123456789abcdef0123456789abcdef01 http/1.1"
         ));
     }
@@ -972,8 +972,9 @@ mod tests {
 
         let requests = server.finish().await;
         assert_eq!(requests.len(), 2);
-        assert!(requests[1].starts_with("post /api/v2/torrents/stop http/1.1"));
-        assert!(requests[1].contains("hashes=abcdef0123456789abcdef0123456789abcdef01"));
+        let request = requests[1].to_ascii_lowercase();
+        assert!(request.starts_with("post /api/v2/torrents/stop http/1.1"));
+        assert!(request.contains("hashes=abcdef0123456789abcdef0123456789abcdef01"));
     }
 
     #[tokio::test]
@@ -1000,8 +1001,16 @@ mod tests {
 
         let requests = server.finish().await;
         assert_eq!(requests.len(), 4);
-        assert!(requests[1].contains("cookie: sid=first"));
-        assert!(requests[3].contains("cookie: sid=second"));
+        assert!(
+            requests[1]
+                .to_ascii_lowercase()
+                .contains("cookie: sid=first")
+        );
+        assert!(
+            requests[3]
+                .to_ascii_lowercase()
+                .contains("cookie: sid=second")
+        );
     }
 
     #[tokio::test]
@@ -1053,10 +1062,12 @@ mod tests {
         ));
 
         let requests = server.finish().await;
-        assert!(requests[1].starts_with("post /api/v2/app/setpreferences http/1.1"));
-        assert!(requests[1].contains("max_active_downloads"));
-        assert!(requests[2].starts_with("post /api/v2/transfer/setdownloadlimit http/1.1"));
-        assert!(requests[2].contains("limit=24000000"));
+        let queue_request = requests[1].to_ascii_lowercase();
+        let limit_request = requests[2].to_ascii_lowercase();
+        assert!(queue_request.starts_with("post /api/v2/app/setpreferences http/1.1"));
+        assert!(queue_request.contains("max_active_downloads"));
+        assert!(limit_request.starts_with("post /api/v2/transfer/setdownloadlimit http/1.1"));
+        assert!(limit_request.contains("limit=24000000"));
     }
 
     use std::sync::{Arc, Mutex};
