@@ -1,8 +1,13 @@
 use std::{
-    fs, io,
+    fs::{self, File, OpenOptions},
+    io::{self, Read},
     path::{Component, Path, PathBuf},
 };
 
+use qb_application::{
+    storage::{FileEvidence, FileIdentity, IncomingFileSnapshot, Storage},
+    PortError,
+};
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -130,6 +135,155 @@ impl ValidatedManagedRootLayout {
         observe_volume(role, self.path(role))
     }
 }
+
+#[derive(Clone, Debug)]
+pub struct ManagedStorage {
+    roots: ValidatedManagedRootLayout,
+}
+
+impl ManagedStorage {
+    pub fn new(roots: ValidatedManagedRootLayout) -> Self {
+        Self { roots }
+    }
+
+    pub fn roots(&self) -> &ValidatedManagedRootLayout {
+        &self.roots
+    }
+
+    fn revalidate_incoming_root(&self) -> Result<(), PortError> {
+        let refreshed = validate_root(ManagedRootRole::Incoming, &self.roots.incoming)
+            .map_err(map_storage_port_error)?;
+        if !paths_equal(&refreshed, &self.roots.incoming) {
+            return Err(PortError::new(
+                "STORAGE_ROOT_CHANGED",
+                "Incoming root identity changed after validation",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Storage for ManagedStorage {
+    fn list_incoming(&self) -> Result<Vec<String>, PortError> {
+        self.revalidate_incoming_root()?;
+
+        let entries = fs::read_dir(&self.roots.incoming)
+            .map_err(|error| PortError::new("STORAGE_IO", error.to_string()))?;
+        let mut paths = Vec::new();
+
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| PortError::new("STORAGE_IO", error.to_string()))?;
+            let name = entry.file_name().into_string().map_err(|_| {
+                PortError::new(
+                    "STORAGE_PATH_INVALID",
+                    "Incoming contains a non-Unicode entry name",
+                )
+            })?;
+            if !is_torrent_name(&name) {
+                continue;
+            }
+            ManagedRelativePath::parse(&name).map_err(|_| {
+                PortError::new(
+                    "STORAGE_PATH_INVALID",
+                    format!("unsafe Incoming entry name: {name}"),
+                )
+            })?;
+            paths.push(name);
+        }
+
+        paths.sort_by(|left, right| {
+            left.to_ascii_lowercase()
+                .cmp(&right.to_ascii_lowercase())
+                .then_with(|| left.cmp(right))
+        });
+        Ok(paths)
+    }
+
+    fn read_incoming(
+        &self,
+        relative_path: &str,
+        max_bytes: usize,
+    ) -> Result<IncomingFileSnapshot, PortError> {
+        if max_bytes == 0 {
+            return Err(PortError::new(
+                "STORAGE_LIMIT_INVALID",
+                "Incoming read limit must be greater than zero",
+            ));
+        }
+
+        self.revalidate_incoming_root()?;
+
+        let managed = ManagedRelativePath::parse(relative_path).map_err(|_| {
+            PortError::new(
+                "STORAGE_PATH_INVALID",
+                format!("unsafe Incoming path: {relative_path}"),
+            )
+        })?;
+        if managed.as_path().components().count() != 1 || !is_torrent_name(relative_path) {
+            return Err(PortError::new(
+                "STORAGE_PATH_INVALID",
+                "Incoming metainfo must be a top-level .torrent file",
+            ));
+        }
+
+        let path = self.roots.incoming.join(managed.as_path());
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| PortError::new("STORAGE_IO", error.to_string()))?;
+        if is_reparse_metadata(&metadata) {
+            return Err(PortError::new(
+                "STORAGE_REPARSE_POINT",
+                format!("Incoming entry is a reparse point: {relative_path}"),
+            ));
+        }
+
+        let mut file = open_snapshot_file(&path)
+            .map_err(|error| PortError::new("STORAGE_IO", error.to_string()))?;
+        let before = file_evidence(&file, relative_path)?;
+
+        let read_limit = max_bytes
+            .checked_add(1)
+            .ok_or_else(|| PortError::new("STORAGE_LIMIT_INVALID", "Incoming read limit overflow"))?;
+        let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
+        (&mut file)
+            .take(u64::try_from(read_limit).unwrap_or(u64::MAX))
+            .read_to_end(&mut bytes)
+            .map_err(|error| PortError::new("STORAGE_IO", error.to_string()))?;
+        if bytes.len() > max_bytes {
+            return Err(PortError::new(
+                "STORAGE_SOURCE_TOO_LARGE",
+                format!("Incoming metainfo exceeds {max_bytes} bytes: {relative_path}"),
+            ));
+        }
+
+        let after = file_evidence(&file, relative_path)?;
+        if before != after {
+            return Err(PortError::new(
+                "STORAGE_SOURCE_CHANGED",
+                format!("Incoming file changed while it was read: {relative_path}"),
+            ));
+        }
+        if before.size != u64::try_from(bytes.len()).unwrap_or(u64::MAX) {
+            return Err(PortError::new(
+                "STORAGE_SOURCE_CHANGED",
+                format!("Incoming file size changed while it was read: {relative_path}"),
+            ));
+        }
+
+        Ok(IncomingFileSnapshot {
+            relative_path: relative_path.to_string(),
+            evidence: before,
+            bytes,
+        })
+    }
+}
+
+fn is_torrent_name(value: &str) -> bool {
+    value
+        .rsplit_once('.')
+        .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("torrent"))
+}
+
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -405,6 +559,136 @@ fn observe_volume(_role: ManagedRootRole, _path: &Path) -> Result<VolumeObservat
 }
 
 #[cfg(windows)]
+fn open_snapshot_file(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+    };
+
+    OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(not(windows))]
+fn open_snapshot_file(path: &Path) -> io::Result<File> {
+    OpenOptions::new().read(true).open(path)
+}
+
+#[cfg(windows)]
+fn file_evidence(file: &File, relative_path: &str) -> Result<FileEvidence, PortError> {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        GetFileInformationByHandle,
+    };
+
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) };
+    if ok == 0 {
+        return Err(PortError::new(
+            "STORAGE_EVIDENCE_UNAVAILABLE",
+            io::Error::last_os_error().to_string(),
+        ));
+    }
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(PortError::new(
+            "STORAGE_REPARSE_POINT",
+            format!("Incoming entry is a reparse point: {relative_path}"),
+        ));
+    }
+    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+        return Err(PortError::new(
+            "STORAGE_NOT_FILE",
+            format!("Incoming entry is not a regular file: {relative_path}"),
+        ));
+    }
+
+    let file_id = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    let size = (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow);
+    let modified_marker = (u128::from(info.ftLastWriteTime.dwHighDateTime) << 32)
+        | u128::from(info.ftLastWriteTime.dwLowDateTime);
+
+    Ok(FileEvidence {
+        identity: FileIdentity {
+            volume_id: u64::from(info.dwVolumeSerialNumber),
+            file_id,
+        },
+        size,
+        modified_marker,
+    })
+}
+
+#[cfg(unix)]
+fn file_evidence(file: &File, relative_path: &str) -> Result<FileEvidence, PortError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| PortError::new("STORAGE_EVIDENCE_UNAVAILABLE", error.to_string()))?;
+    if !metadata.is_file() {
+        return Err(PortError::new(
+            "STORAGE_NOT_FILE",
+            format!("Incoming entry is not a regular file: {relative_path}"),
+        ));
+    }
+    let modified_marker = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |duration| duration.as_nanos());
+
+    Ok(FileEvidence {
+        identity: FileIdentity {
+            volume_id: metadata.dev(),
+            file_id: metadata.ino(),
+        },
+        size: metadata.size(),
+        modified_marker,
+    })
+}
+
+#[cfg(all(not(windows), not(unix)))]
+fn file_evidence(_file: &File, _relative_path: &str) -> Result<FileEvidence, PortError> {
+    Err(PortError::new(
+        "STORAGE_EVIDENCE_UNAVAILABLE",
+        "file identity is unavailable on this platform",
+    ))
+}
+
+fn map_storage_port_error(error: StorageError) -> PortError {
+    let code = match error {
+        StorageError::RootReparsePoint { .. } => "STORAGE_REPARSE_POINT",
+        StorageError::RootOverlap { .. }
+        | StorageError::RootNotAbsolute { .. }
+        | StorageError::RootContainsTraversal { .. }
+        | StorageError::RootNotDirectory { .. }
+        | StorageError::RootNotLocalFixedVolume { .. } => "STORAGE_ROOT_INVALID",
+        StorageError::VolumeObservationUnsupported => "STORAGE_UNSUPPORTED",
+        StorageError::RelativePathEmpty
+        | StorageError::RelativePathAbsolute(_)
+        | StorageError::InvalidRelativeComponent(_)
+        | StorageError::ReservedDeviceName(_) => "STORAGE_PATH_INVALID",
+        StorageError::RootIo { .. } => "STORAGE_IO",
+    };
+    PortError::new(code, error.to_string())
+}
+
+#[cfg(windows)]
+fn paths_equal(first: &Path, second: &Path) -> bool {
+    windows_path_components(first) == windows_path_components(second)
+}
+
+#[cfg(not(windows))]
+fn paths_equal(first: &Path, second: &Path) -> bool {
+    first == second
+}
+
+#[cfg(windows)]
 fn roots_overlap(first: &Path, second: &Path) -> bool {
     let first = windows_path_components(first);
     let second = windows_path_components(second);
@@ -534,6 +818,104 @@ mod tests {
         assert!(validated.working.is_absolute());
         assert!(validated.completed.is_absolute());
         assert!(validated.runtime.is_absolute());
+        fs::remove_dir_all(temp).expect("cleanup");
+    }
+
+    fn valid_roots(temp: &Path) -> ValidatedManagedRootLayout {
+        let incoming = temp.join("incoming");
+        let archive = temp.join("archive");
+        let working = temp.join("working");
+        let completed = temp.join("completed");
+        let runtime = temp.join("runtime");
+        for path in [&incoming, &archive, &working, &completed, &runtime] {
+            fs::create_dir_all(path).expect("create root");
+        }
+        ManagedRootLayout {
+            incoming,
+            archive,
+            working,
+            completed,
+            runtime,
+        }
+        .validate()
+        .expect("valid roots")
+    }
+
+    #[test]
+    fn managed_storage_lists_only_top_level_torrents_in_deterministic_order() {
+        let temp = temp_root("scan");
+        let roots = valid_roots(&temp);
+        fs::write(roots.incoming.join("b.TORRENT"), b"b").expect("b");
+        fs::write(roots.incoming.join("a.torrent"), b"a").expect("a");
+        fs::write(roots.incoming.join("note.txt"), b"x").expect("note");
+        fs::create_dir_all(roots.incoming.join("nested")).expect("nested");
+        fs::write(roots.incoming.join("nested").join("c.torrent"), b"c").expect("c");
+
+        let storage = ManagedStorage::new(roots);
+        assert_eq!(
+            storage.list_incoming().expect("list"),
+            vec!["a.torrent".to_string(), "b.TORRENT".to_string()]
+        );
+
+        fs::remove_dir_all(temp).expect("cleanup");
+    }
+
+    #[test]
+    fn managed_storage_reads_stable_file_evidence_and_bytes() {
+        let temp = temp_root("snapshot");
+        let roots = valid_roots(&temp);
+        fs::write(roots.incoming.join("sample.torrent"), b"metainfo").expect("fixture");
+
+        let storage = ManagedStorage::new(roots);
+        let snapshot = storage
+            .read_incoming("sample.torrent", 1024)
+            .expect("snapshot");
+
+        assert_eq!(snapshot.relative_path, "sample.torrent");
+        assert_eq!(snapshot.bytes, b"metainfo");
+        assert_eq!(snapshot.evidence.size, 8);
+        assert_ne!(snapshot.evidence.identity.file_id, 0);
+
+        fs::remove_dir_all(temp).expect("cleanup");
+    }
+
+    #[test]
+    fn managed_storage_rejects_nested_or_oversized_incoming_reads() {
+        let temp = temp_root("reject-read");
+        let roots = valid_roots(&temp);
+        fs::write(roots.incoming.join("large.torrent"), b"12345").expect("fixture");
+
+        let storage = ManagedStorage::new(roots);
+        let nested = storage
+            .read_incoming(r"nested\file.torrent", 1024)
+            .expect_err("nested must fail");
+        assert_eq!(nested.code, "STORAGE_PATH_INVALID");
+
+        let large = storage
+            .read_incoming("large.torrent", 4)
+            .expect_err("oversized must fail");
+        assert_eq!(large.code, "STORAGE_SOURCE_TOO_LARGE");
+
+        fs::remove_dir_all(temp).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_storage_rejects_incoming_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = temp_root("source-symlink");
+        let roots = valid_roots(&temp);
+        let outside = temp.join("outside.torrent");
+        fs::write(&outside, b"secret").expect("outside");
+        symlink(&outside, roots.incoming.join("link.torrent")).expect("symlink");
+
+        let storage = ManagedStorage::new(roots);
+        let error = storage
+            .read_incoming("link.torrent", 1024)
+            .expect_err("symlink must fail");
+        assert_eq!(error.code, "STORAGE_REPARSE_POINT");
+
         fs::remove_dir_all(temp).expect("cleanup");
     }
 

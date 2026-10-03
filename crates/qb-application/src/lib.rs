@@ -1,4 +1,5 @@
 pub mod mutation;
+pub mod storage;
 pub mod system;
 pub mod torrent;
 

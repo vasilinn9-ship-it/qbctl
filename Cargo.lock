@@ -965,6 +965,7 @@ name = "qb-win"
 version = "0.1.0"
 dependencies = [
  "fs2",
+ "qb-application",
  "thiserror",
  "windows-sys",
 ]
