@@ -191,7 +191,7 @@ impl QbitClient {
                 peers: row.num_peers,
                 seeds: row.num_seeds,
                 leeches: row.num_leeches,
-                message: sanitize_untrusted_text(&row.msg, 512),
+                message: sanitize_tracker_message(&row.msg, 512),
             })
             .collect())
     }
@@ -617,8 +617,22 @@ fn redact_tracker_identity(value: &str) -> String {
                 None => format!("{}://{}", url.scheme(), host),
             }
         }
-        Err(_) => sanitize_untrusted_text(value, 128),
+        Err(_) => "<invalid-tracker>".to_string(),
     }
+}
+
+fn sanitize_tracker_message(value: &str, max_chars: usize) -> String {
+    sanitize_untrusted_text(value, max_chars)
+        .split_whitespace()
+        .map(|token| {
+            if token.contains("://") {
+                "<tracker-url>"
+            } else {
+                token
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn sanitize_untrusted_text(value: &str, max_chars: usize) -> String {
@@ -803,6 +817,17 @@ mod tests {
             redact_tracker_identity("https://tracker.example:8443/announce/secret-passkey"),
             "https://tracker.example:8443"
         );
+        assert_eq!(
+            redact_tracker_identity("not a url /announce/secret-passkey"),
+            "<invalid-tracker>"
+        );
+
+        let message = sanitize_tracker_message(
+            "timeout from https://tracker.example/announce/secret-passkey",
+            512,
+        );
+        assert_eq!(message, "timeout from <tracker-url>");
+        assert!(!message.contains("secret-passkey"));
     }
 
     #[test]
