@@ -38,9 +38,8 @@ pub fn build(runtime_override: Option<PathBuf>) -> Result<Bootstrap> {
         InstanceGuard::acquire(&runtime_root).context("acquire daemon ownership")?;
     let config = Config::load(runtime_root.path()).context("load config")?;
 
-    let journal = Arc::new(
-        Journal::open(runtime_root.path().join("state.sqlite")).context("open journal")?,
-    );
+    let journal =
+        Arc::new(Journal::open(runtime_root.path().join("state.sqlite")).context("open journal")?);
     let journal_health: Arc<dyn JournalHealthPort> = journal.clone();
     let mutation_journal: Arc<dyn MutationJournal> = journal;
 
