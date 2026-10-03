@@ -371,17 +371,13 @@ fn observe_managed_file(
         if is_reparse_metadata(&metadata) {
             return Err(PortError::new(
                 "STORAGE_REPARSE_POINT",
-                format!(
-                    "managed {role:?} path traverses a reparse point: {relative_path}"
-                ),
+                format!("managed {role:?} path traverses a reparse point: {relative_path}"),
             ));
         }
         if index + 1 < components.len() && !metadata.is_dir() {
             return Err(PortError::new(
                 "STORAGE_PATH_INVALID",
-                format!(
-                    "managed {role:?} path has a non-directory parent: {relative_path}"
-                ),
+                format!("managed {role:?} path has a non-directory parent: {relative_path}"),
             ));
         }
     }
