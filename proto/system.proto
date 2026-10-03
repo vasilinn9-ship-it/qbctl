@@ -3,6 +3,7 @@ syntax = "proto3";
 package qbctl.v1;
 
 import "common.proto";
+import "torrent.proto";
 
 enum DaemonState {
   DAEMON_STATE_UNSPECIFIED = 0;
@@ -54,6 +55,11 @@ message Request {
     CapabilitiesRequest capabilities = 10;
     StatusRequest status = 11;
     DoctorRequest doctor = 12;
+    TorrentListRequest torrent_list = 20;
+    TorrentGetRequest torrent_get = 21;
+    QueueGetRequest queue_get = 22;
+    TransferLimitsGetRequest transfer_limits_get = 23;
+    QbitProbeRequest qbit_probe = 24;
   }
 }
 
@@ -70,5 +76,10 @@ message Response {
     CapabilitiesResponse capabilities = 20;
     StatusResponse system_status = 21;
     DoctorResponse doctor = 22;
+    TorrentListResponse torrent_list = 23;
+    TorrentGetResponse torrent_get = 24;
+    QueueSettingsResponse queue_settings = 25;
+    TransferLimitsResponse transfer_limits = 26;
+    QbitProbeResponse qbit_probe = 27;
   }
 }
