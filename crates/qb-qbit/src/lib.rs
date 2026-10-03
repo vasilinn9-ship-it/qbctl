@@ -252,8 +252,8 @@ impl QbitClient {
 
     async fn mutation_post_form(&self, endpoint: &str, form: &[(&str, String)]) -> EffectAttempt {
         for attempt in 0..2 {
-            let sid = match self.ensure_session().await {
-                Ok(sid) => sid,
+            let session_cookie = match self.ensure_session().await {
+                Ok(session_cookie) => session_cookie,
                 Err(error) => return EffectAttempt::NotSent(map_port_error(error)),
             };
 
