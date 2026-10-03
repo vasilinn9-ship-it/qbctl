@@ -788,6 +788,13 @@ mod tests {
     }
 
     #[test]
+    fn rejects_hybrid_with_different_v1_v2_layouts() {
+        let bytes = b"d4:infod9:file treed9:other.txtd0:d6:lengthi0eeee6:lengthi0e12:meta versioni2e4:name8:file.txt12:piece lengthi16384e6:pieces0:ee";
+        let error = parse_inner(bytes).expect_err("hybrid layout mismatch");
+        assert!(error.to_string().contains("file layouts differ"));
+    }
+
+    #[test]
     fn rejects_path_traversal_component() {
         let bytes =
             b"d4:infod5:filesld6:lengthi1e4:pathl2:..1:aeee4:name4:test12:piece lengthi1e6:pieces20:01234567890123456789ee";
