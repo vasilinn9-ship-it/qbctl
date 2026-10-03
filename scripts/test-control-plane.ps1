@@ -199,7 +199,7 @@ foreach ($root in @($incomingRoot, $archiveRoot, $workingRoot, $completedRoot)) 
 
 function ConvertTo-TomlBasicString {
     param([string]$Value)
-    return $Value.Replace("\\", "\\\\").Replace('"', '\"')
+    return $Value.Replace('\', '\\').Replace('"', '\"')
 }
 
 $config = @"
