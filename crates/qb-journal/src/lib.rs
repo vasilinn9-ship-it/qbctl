@@ -1278,6 +1278,63 @@ mod tests {
     }
 
     #[test]
+    fn queue_target_revision_persists_across_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.sqlite");
+
+        {
+            let journal = Journal::open(&path).expect("journal");
+            let command = MutationCommand::SetQueueTarget {
+                target_client_count: 80,
+            };
+            let operation_id = match journal
+                .reserve_request_inner(&request_id("queue-policy-1"), &command)
+                .expect("reserve first queue target")
+            {
+                RequestReservation::New(record) => record.operation_id,
+                other => panic!("unexpected reservation: {other:?}"),
+            };
+            journal
+                .apply_queue_target_inner(&operation_id, 80)
+                .expect("apply first queue target");
+
+            let policy = journal.queue_target().expect("first policy");
+            assert_eq!(policy.revision, 2);
+            assert_eq!(policy.target_client_count, Some(80));
+        }
+
+        {
+            let reopened = Journal::open(&path).expect("reopen");
+            let policy = reopened.queue_target().expect("reopened policy");
+            assert_eq!(policy.revision, 2);
+            assert_eq!(policy.target_client_count, Some(80));
+
+            let command = MutationCommand::SetQueueTarget {
+                target_client_count: 64,
+            };
+            let operation_id = match reopened
+                .reserve_request_inner(&request_id("queue-policy-2"), &command)
+                .expect("reserve second queue target")
+            {
+                RequestReservation::New(record) => record.operation_id,
+                other => panic!("unexpected reservation: {other:?}"),
+            };
+            reopened
+                .apply_queue_target_inner(&operation_id, 64)
+                .expect("apply second queue target");
+
+            let policy = reopened.queue_target().expect("second policy");
+            assert_eq!(policy.revision, 3);
+            assert_eq!(policy.target_client_count, Some(64));
+        }
+
+        let reopened_again = Journal::open(&path).expect("reopen again");
+        let policy = reopened_again.queue_target().expect("persisted policy");
+        assert_eq!(policy.revision, 3);
+        assert_eq!(policy.target_client_count, Some(64));
+    }
+
+    #[test]
     fn mutation_checkpoint_progress_is_monotonic() {
         let dir = tempfile::tempdir().expect("tempdir");
         let journal = Journal::open(dir.path().join("state.sqlite")).expect("journal");
