@@ -3022,7 +3022,10 @@ mod tests {
         ) -> Result<CompletionRecord, PortError> {
             self.transition(
                 operation_id,
-                &[CompletionState::StopPending],
+                &[
+                    CompletionState::StopPending,
+                    CompletionState::RemoveRecordPending,
+                ],
                 CompletionState::Failed,
                 Some(problem_code),
             )
@@ -3063,6 +3066,34 @@ mod tests {
                 CompletionState::Stopped,
                 None,
             )
+        }
+
+        fn mark_archive_destination_receipted(
+            &self,
+            operation_id: &OperationId,
+            destination: &FileEvidence,
+            destination_sha256: [u8; 32],
+        ) -> Result<CompletionRecord, PortError> {
+            let mut state = self.record.lock().expect("completion journal mutex");
+            let record = state
+                .as_mut()
+                .ok_or_else(|| PortError::new("COMPLETION_NOT_FOUND", operation_id.to_string()))?;
+            if &record.operation_id != operation_id
+                || !matches!(
+                    record.state,
+                    CompletionState::ArchivePending | CompletionState::UnknownArchive
+                )
+            {
+                return Err(PortError::new(
+                    "OPERATION_TRANSITION_INVALID",
+                    "invalid fake Archive destination receipt transition",
+                ));
+            }
+            record.archive_destination_evidence = Some(destination.clone());
+            record.archive_sha256 = Some(destination_sha256);
+            record.problem_code = None;
+            record.revision += 1;
+            Ok(record.clone())
         }
 
         fn mark_archive_receipted(
@@ -3231,6 +3262,46 @@ mod tests {
                 operation_id,
                 &[CompletionState::PayloadPending],
                 CompletionState::RemoveRecordPending,
+                None,
+            )
+        }
+
+        fn mark_unknown_remove_record(
+            &self,
+            operation_id: &OperationId,
+            problem_code: &str,
+        ) -> Result<CompletionRecord, PortError> {
+            self.transition(
+                operation_id,
+                &[CompletionState::RemoveRecordPending],
+                CompletionState::UnknownRemoveRecord,
+                Some(problem_code),
+            )
+        }
+
+        fn retry_remove_record(
+            &self,
+            operation_id: &OperationId,
+        ) -> Result<CompletionRecord, PortError> {
+            self.transition(
+                operation_id,
+                &[CompletionState::UnknownRemoveRecord],
+                CompletionState::RemoveRecordPending,
+                None,
+            )
+        }
+
+        fn finish_completion(
+            &self,
+            operation_id: &OperationId,
+        ) -> Result<CompletionRecord, PortError> {
+            self.transition(
+                operation_id,
+                &[
+                    CompletionState::RemoveRecordPending,
+                    CompletionState::UnknownRemoveRecord,
+                ],
+                CompletionState::Finished,
                 None,
             )
         }
