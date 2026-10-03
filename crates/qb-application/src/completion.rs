@@ -1396,10 +1396,7 @@ mod tests {
             )
         }
 
-        fn retry_stop(
-            &self,
-            operation_id: &OperationId,
-        ) -> Result<CompletionRecord, PortError> {
+        fn retry_stop(&self, operation_id: &OperationId) -> Result<CompletionRecord, PortError> {
             self.transition(
                 operation_id,
                 &[CompletionState::UnknownStop, CompletionState::StopPending],
@@ -1408,10 +1405,7 @@ mod tests {
             )
         }
 
-        fn mark_stopped(
-            &self,
-            operation_id: &OperationId,
-        ) -> Result<CompletionRecord, PortError> {
+        fn mark_stopped(&self, operation_id: &OperationId) -> Result<CompletionRecord, PortError> {
             self.transition(
                 operation_id,
                 &[CompletionState::StopPending, CompletionState::UnknownStop],
