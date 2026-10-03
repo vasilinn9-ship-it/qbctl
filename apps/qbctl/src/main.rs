@@ -162,7 +162,9 @@ enum StorageCommand {
 #[derive(Debug, Subcommand)]
 enum OperationCommand {
     List,
-    Get { operation_id: String },
+    Get {
+        operation_id: String,
+    },
     Recover {
         operation_id: String,
         #[arg(long)]
