@@ -249,9 +249,8 @@ mod tests {
             rejected: Vec::new(),
         };
 
-        let plan =
-            plan_incoming_capacity_from_storage(&CapacityStorage, &scan, 10, Vec::new())
-                .expect("capacity plan");
+        let plan = plan_incoming_capacity_from_storage(&CapacityStorage, &scan, 10, Vec::new())
+            .expect("capacity plan");
 
         assert_eq!(plan.decisions[0].explanation.volume_id, 7);
         assert_eq!(plan.decisions[0].explanation.free_bytes, 120);
