@@ -4939,13 +4939,16 @@ mod tests {
                     'incoming_cleanup_events',
                     'release_operations',
                     'release_events',
-                    'retained_capacity'
+                    'retained_capacity',
+                    'completion_operations',
+                    'completion_events',
+                    'operation_files'
                  )",
                 [],
                 |row| row.get(0),
             )
             .expect("table count");
-        assert_eq!(table_count, 12);
+        assert_eq!(table_count, 15);
     }
 
     fn cleanup_intent() -> IncomingCleanupIntent {
@@ -5444,6 +5447,129 @@ mod tests {
         journal
             .finish_admission(&operation_id)
             .expect("admission finished")
+    }
+
+    fn completion_preflight(
+        admission: &AdmissionRecord,
+        request_id_value: &str,
+    ) -> CompletionPreflight {
+        CompletionPreflight {
+            request_id: RequestId::new(request_id_value).expect("request id"),
+            registry_id: admission.registry_id.clone(),
+            torrent_id: admission
+                .identity
+                .qbit_selector_ids()
+                .into_iter()
+                .next()
+                .expect("selector"),
+            identity: admission.identity.clone(),
+            source_relative: admission.source_relative.clone(),
+            source_evidence: admission.source_evidence.clone(),
+            source_metainfo_digest: admission.source_metainfo_digest,
+            working_volume_id: admission.working_volume_id,
+            completed_volume_id: admission.working_volume_id,
+            archive_volume_id: admission.source_evidence.identity.volume_id,
+            working_save_path: admission.working_save_path.clone(),
+            total_bytes: 4096,
+            files: vec![
+                qb_application::completion::CompletionFilePlan {
+                    relative_path: "dir/a.bin".into(),
+                    size: 1024,
+                    source_evidence: qb_application::storage::FileEvidence {
+                        identity: qb_application::storage::FileIdentity {
+                            volume_id: admission.working_volume_id,
+                            file_id: 101,
+                        },
+                        size: 1024,
+                        modified_marker: 1001,
+                    },
+                },
+                qb_application::completion::CompletionFilePlan {
+                    relative_path: "dir/b.bin".into(),
+                    size: 3072,
+                    source_evidence: qb_application::storage::FileEvidence {
+                        identity: qb_application::storage::FileIdentity {
+                            volume_id: admission.working_volume_id,
+                            file_id: 102,
+                        },
+                        size: 3072,
+                        modified_marker: 1002,
+                    },
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn completion_reservation_is_atomic_replayable_and_persists_file_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.sqlite");
+        let admission = {
+            let journal = Journal::open(&path).expect("journal");
+            finished_admission(&journal, "completion-admission")
+        };
+        let preflight = completion_preflight(&admission, "completion-request");
+
+        let operation_id = {
+            let journal = Journal::open(&path).expect("reopen");
+            let record = match journal
+                .reserve_completion(&preflight)
+                .expect("reserve completion")
+            {
+                CompletionReservation::New(record) => record,
+                other => panic!("unexpected completion reservation: {other:?}"),
+            };
+            assert_eq!(record.state, CompletionState::Prepared);
+            assert_eq!(record.registry_id, admission.registry_id);
+            assert_eq!(record.files.len(), 2);
+            assert_eq!(record.files[0].relative_path, "dir/a.bin");
+            assert_eq!(
+                record.files[0].strategy,
+                CompletionHandoffStrategy::SameVolume
+            );
+            assert_eq!(record.files[0].state, CompletionFileState::Prepared);
+
+            match journal
+                .reserve_completion(&preflight)
+                .expect("completion replay")
+            {
+                CompletionReservation::Replay(existing) => {
+                    assert_eq!(existing.operation_id, record.operation_id);
+                    assert_eq!(existing.files, record.files);
+                }
+                other => panic!("unexpected completion replay: {other:?}"),
+            }
+
+            let mut conflict = preflight.clone();
+            conflict.registry_id = "different-registry".into();
+            assert!(matches!(
+                journal.reserve_completion(&conflict).expect("request conflict"),
+                CompletionReservation::Conflict { .. }
+            ));
+
+            let mut active = preflight.clone();
+            active.request_id = RequestId::new("completion-active-conflict").expect("request id");
+            assert!(matches!(
+                journal.reserve_completion(&active).expect("active conflict"),
+                CompletionReservation::ActiveConflict { .. }
+            ));
+
+            record.operation_id
+        };
+
+        let reopened = Journal::open(&path).expect("reopen again");
+        let record = reopened
+            .get_completion(&operation_id)
+            .expect("get completion")
+            .expect("completion");
+        assert_eq!(record.files.len(), 2);
+        assert_eq!(record.total_bytes, 4096);
+
+        let recoverable = reopened
+            .list_recoverable_completions()
+            .expect("recoverable completions");
+        assert_eq!(recoverable.len(), 1);
+        assert_eq!(recoverable[0].operation_id, operation_id);
     }
 
     #[test]
