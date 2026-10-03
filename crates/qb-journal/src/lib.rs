@@ -15,6 +15,11 @@ use qb_application::{
         IncomingCleanupIntent, IncomingCleanupJournal, IncomingCleanupRecord,
         IncomingCleanupReservation, IncomingCleanupState, INCOMING_CLEANUP_FINGERPRINT_VERSION,
     },
+    completion::{
+        CompletionFileRecord, CompletionFileState, CompletionHandoffStrategy, CompletionJournal,
+        CompletionPreflight, CompletionRecord, CompletionReservation, CompletionState,
+        COMPLETION_FINGERPRINT_VERSION,
+    },
     mutation::{
         MutationCommand, MutationDisposition, MutationJournal, MutationRecord, QueueTargetPolicy,
         RequestReservation, TorrentControlAction, FINGERPRINT_VERSION,
@@ -36,7 +41,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, Transact
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 #[derive(Debug, Error)]
 pub enum JournalError {
@@ -2361,6 +2366,11 @@ fn migrate(connection: &mut Connection) -> Result<(), JournalError> {
         version = 6;
     }
 
+    if version == 6 {
+        migrate_v6_to_v7(connection)?;
+        version = 7;
+    }
+
     if version != SCHEMA_VERSION {
         return Err(JournalError::InvalidState(format!(
             "migration stopped at schema {version}"
@@ -2690,6 +2700,122 @@ fn migrate_v5_to_v6(connection: &mut Connection) -> Result<(), JournalError> {
         WHERE singleton = 1;
 
         PRAGMA user_version = 6;
+        "#,
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v6_to_v7(connection: &mut Connection) -> Result<(), JournalError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE completion_operations (
+            operation_id TEXT PRIMARY KEY,
+            request_id TEXT NOT NULL UNIQUE,
+            fingerprint_version INTEGER NOT NULL,
+            completion_fingerprint BLOB NOT NULL CHECK(length(completion_fingerprint) = 32),
+            registry_id TEXT NOT NULL REFERENCES torrent_registry(registry_id),
+            torrent_id TEXT NOT NULL CHECK(length(torrent_id) = 40),
+            identity_v1 BLOB CHECK(identity_v1 IS NULL OR length(identity_v1) = 20),
+            identity_v2 BLOB CHECK(identity_v2 IS NULL OR length(identity_v2) = 32),
+            source_relative TEXT NOT NULL CHECK(length(source_relative) > 0),
+            source_volume_id BLOB NOT NULL CHECK(length(source_volume_id) = 8),
+            source_file_id BLOB NOT NULL CHECK(length(source_file_id) = 8),
+            source_size BLOB NOT NULL CHECK(length(source_size) = 8),
+            source_modified_marker BLOB NOT NULL CHECK(length(source_modified_marker) = 16),
+            source_metainfo_digest BLOB NOT NULL CHECK(length(source_metainfo_digest) = 32),
+            working_volume_id BLOB NOT NULL CHECK(length(working_volume_id) = 8),
+            completed_volume_id BLOB NOT NULL CHECK(length(completed_volume_id) = 8),
+            archive_volume_id BLOB NOT NULL CHECK(length(archive_volume_id) = 8),
+            working_save_path TEXT NOT NULL CHECK(length(working_save_path) > 0),
+            total_bytes BLOB NOT NULL CHECK(length(total_bytes) = 8),
+            payload_strategy TEXT NOT NULL CHECK(payload_strategy IN ('same_volume','cross_volume')),
+            archive_strategy TEXT NOT NULL CHECK(archive_strategy IN ('same_volume','cross_volume')),
+            state TEXT NOT NULL CHECK(state IN (
+                'prepared',
+                'stop_pending',
+                'unknown_stop',
+                'stopped',
+                'archive_pending',
+                'unknown_archive',
+                'payload_pending',
+                'remove_record_pending',
+                'unknown_remove_record',
+                'finished',
+                'blocked',
+                'failed'
+            )),
+            problem_code TEXT,
+            revision INTEGER NOT NULL CHECK(revision > 0),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            finished_at TEXT,
+            CHECK(identity_v1 IS NOT NULL OR identity_v2 IS NOT NULL)
+        );
+
+        CREATE UNIQUE INDEX completion_active_registry_idx
+        ON completion_operations(registry_id)
+        WHERE state NOT IN ('finished','blocked','failed');
+
+        CREATE INDEX completion_recovery_idx
+        ON completion_operations(state, created_at, operation_id);
+
+        CREATE TABLE completion_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operation_id TEXT NOT NULL REFERENCES completion_operations(operation_id),
+            revision INTEGER NOT NULL CHECK(revision > 0),
+            event_kind TEXT NOT NULL,
+            state TEXT NOT NULL,
+            problem_code TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(operation_id, revision)
+        );
+
+        CREATE TABLE operation_files (
+            operation_id TEXT NOT NULL REFERENCES completion_operations(operation_id),
+            file_index INTEGER NOT NULL CHECK(file_index >= 0),
+            relative_path TEXT NOT NULL CHECK(length(relative_path) > 0),
+            expected_size BLOB NOT NULL CHECK(length(expected_size) = 8),
+            source_volume_id BLOB NOT NULL CHECK(length(source_volume_id) = 8),
+            source_file_id BLOB NOT NULL CHECK(length(source_file_id) = 8),
+            source_size BLOB NOT NULL CHECK(length(source_size) = 8),
+            source_modified_marker BLOB NOT NULL CHECK(length(source_modified_marker) = 16),
+            handoff_strategy TEXT NOT NULL CHECK(handoff_strategy IN ('same_volume','cross_volume')),
+            state TEXT NOT NULL CHECK(state IN (
+                'prepared',
+                'move_pending',
+                'unknown_move',
+                'destination_receipted',
+                'source_delete_pending',
+                'unknown_source_delete',
+                'handed_off',
+                'blocked',
+                'failed'
+            )),
+            temp_relative TEXT,
+            destination_volume_id BLOB CHECK(destination_volume_id IS NULL OR length(destination_volume_id) = 8),
+            destination_file_id BLOB CHECK(destination_file_id IS NULL OR length(destination_file_id) = 8),
+            destination_size BLOB CHECK(destination_size IS NULL OR length(destination_size) = 8),
+            destination_modified_marker BLOB CHECK(destination_modified_marker IS NULL OR length(destination_modified_marker) = 16),
+            destination_sha256 BLOB CHECK(destination_sha256 IS NULL OR length(destination_sha256) = 32),
+            problem_code TEXT,
+            revision INTEGER NOT NULL CHECK(revision > 0),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(operation_id, file_index)
+        );
+
+        CREATE UNIQUE INDEX operation_files_path_idx
+        ON operation_files(operation_id, relative_path COLLATE NOCASE);
+
+        UPDATE schema_meta
+        SET schema_version = 7,
+            application_min_version = '0.1.0',
+            migrated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE singleton = 1;
+
+        PRAGMA user_version = 7;
         "#,
     )?;
     transaction.commit()?;
