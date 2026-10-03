@@ -2082,6 +2082,13 @@ impl CompletionJournal for Journal {
             Some(problem_code),
         )
     }
+
+    fn mark_payload_handed_off(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<CompletionRecord, PortError> {
+        finish_completion_payload(self, operation_id)
+    }
 }
 
 impl ReleaseJournal for Journal {
@@ -4093,6 +4100,83 @@ fn transition_completion(
             PortError::new(
                 "JOURNAL_STATE_INVALID",
                 "completion operation disappeared after transition",
+            )
+        })?;
+    transaction
+        .commit()
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    Ok(record)
+}
+
+fn finish_completion_payload(
+    journal: &Journal,
+    operation_id: &OperationId,
+) -> Result<CompletionRecord, PortError> {
+    let mut connection = journal.connection.lock().expect("journal mutex poisoned");
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    let current = load_completion_record(&transaction, operation_id.as_str())
+        .map_err(map_port_error)?
+        .ok_or_else(|| PortError::new("COMPLETION_NOT_FOUND", operation_id.to_string()))?;
+    if current.state != CompletionState::PayloadPending {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            "payload completion requires PayloadPending state",
+        ));
+    }
+    if current.files.is_empty()
+        || current
+            .files
+            .iter()
+            .any(|file| file.state != CompletionFileState::HandedOff)
+    {
+        return Err(PortError::new(
+            "PAYLOAD_RECEIPTS_INCOMPLETE",
+            "every completion file must be HandedOff before qBittorrent record removal",
+        ));
+    }
+
+    let revision = current
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| PortError::new("JOURNAL_STATE_INVALID", "completion revision overflow"))?;
+    let changed = transaction
+        .execute(
+            "UPDATE completion_operations
+             SET state = 'remove_record_pending',
+                 problem_code = NULL,
+                 revision = ?1,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE operation_id = ?2
+               AND revision = ?3
+               AND state = 'payload_pending'",
+            params![revision, operation_id.as_str(), current.revision],
+        )
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    if changed != 1 {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            "completion payload receipt gate changed concurrently",
+        ));
+    }
+    insert_completion_event(
+        &transaction,
+        operation_id.as_str(),
+        revision,
+        "remove_record_pending",
+        None,
+    )
+    .map_err(map_port_error)?;
+    let record = load_completion_record(&transaction, operation_id.as_str())
+        .map_err(map_port_error)?
+        .ok_or_else(|| {
+            PortError::new(
+                "JOURNAL_STATE_INVALID",
+                "completion disappeared after payload receipt gate",
             )
         })?;
     transaction
