@@ -220,7 +220,7 @@ pub struct MutationExecution {
 
 #[derive(Debug)]
 pub enum MutationExecutionResult {
-    Execution(MutationExecution),
+    Execution(Box<MutationExecution>),
     Conflict { operation_id: OperationId },
 }
 
@@ -258,7 +258,7 @@ impl MutationService {
 
         self.advance(record, replayed)
             .await
-            .map(MutationExecutionResult::Execution)
+            .map(|execution| MutationExecutionResult::Execution(Box::new(execution)))
     }
 
     pub async fn recover_all(&self) -> Result<Vec<MutationExecution>, PortError> {
