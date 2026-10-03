@@ -3991,7 +3991,10 @@ mod tests {
             .await
             .expect("cross-volume Archive recovery");
         assert_eq!(recovered.len(), 1);
-        assert_eq!(recovered[0].status, CompletionExecutionStatus::UnknownArchive);
+        assert_eq!(
+            recovered[0].status,
+            CompletionExecutionStatus::UnknownArchive
+        );
         assert_eq!(recovered[0].record.state, CompletionState::UnknownArchive);
         assert_eq!(storage.delete_calls.load(Ordering::SeqCst), 1);
 
