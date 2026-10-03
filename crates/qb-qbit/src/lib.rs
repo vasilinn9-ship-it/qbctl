@@ -247,7 +247,7 @@ impl QbitClient {
         for attempt in 0..2 {
             let sid = match self.ensure_session().await {
                 Ok(sid) => sid,
-                Err(error) => return EffectAttempt::Rejected(map_port_error(error)),
+                Err(error) => return EffectAttempt::NotSent(map_port_error(error)),
             };
 
             let response = self
