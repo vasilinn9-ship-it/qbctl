@@ -145,10 +145,8 @@ mod tests {
 
     #[test]
     fn torrent_id_canonicalizes_full_v2_hash_to_qbit_id() {
-        let id = TorrentId::new(
-            "ABCDEF0123456789ABCDEF0123456789ABCDEF01112233445566778899AABBCC",
-        )
-        .expect("valid v2 hash");
+        let id = TorrentId::new("ABCDEF0123456789ABCDEF0123456789ABCDEF01112233445566778899AABBCC")
+            .expect("valid v2 hash");
         assert_eq!(id.as_str(), "abcdef0123456789abcdef0123456789abcdef01");
     }
 
