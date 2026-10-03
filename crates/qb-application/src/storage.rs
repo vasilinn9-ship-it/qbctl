@@ -3,7 +3,11 @@ use std::{collections::BTreeMap, sync::Arc};
 use qb_domain::torrent::TorrentMetainfo;
 use sha2::{Digest, Sha256};
 
-use crate::{torrent::MetainfoReader, PortError};
+use crate::{
+    registry::{RegistryRecord, RegistryState, TorrentRegistry},
+    torrent::MetainfoReader,
+    PortError,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileIdentity {
@@ -59,8 +63,17 @@ pub struct IncomingRedundantCopy {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IncomingAlreadyProcessed {
+    pub relative_path: String,
+    pub registry_id: String,
+    pub registry_state: RegistryState,
+    pub registered_source_relative: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IncomingScan {
     pub eligible: Vec<IncomingCandidate>,
+    pub already_processed: Vec<IncomingAlreadyProcessed>,
     pub redundant_identical: Vec<IncomingRedundantCopy>,
     pub rejected: Vec<IncomingRejection>,
 }
@@ -68,11 +81,20 @@ pub struct IncomingScan {
 pub struct IncomingScanService {
     storage: Arc<dyn Storage>,
     metainfo: Arc<dyn MetainfoReader>,
+    registry: Arc<dyn TorrentRegistry>,
 }
 
 impl IncomingScanService {
-    pub fn new(storage: Arc<dyn Storage>, metainfo: Arc<dyn MetainfoReader>) -> Self {
-        Self { storage, metainfo }
+    pub fn new(
+        storage: Arc<dyn Storage>,
+        metainfo: Arc<dyn MetainfoReader>,
+        registry: Arc<dyn TorrentRegistry>,
+    ) -> Self {
+        Self {
+            storage,
+            metainfo,
+            registry,
+        }
     }
 
     pub fn scan(&self, max_metainfo_bytes: usize) -> Result<IncomingScan, PortError> {
@@ -117,12 +139,45 @@ impl IncomingScanService {
             });
         }
 
-        let (eligible, redundant_identical, duplicate_rejections) =
+        let (eligible, mut redundant_identical, duplicate_rejections) =
             self.reconcile_duplicates(eligible, max_metainfo_bytes);
         rejected.extend(duplicate_rejections);
 
+        let mut fresh = Vec::new();
+        let mut already_processed = Vec::new();
+        let mut allowed_canonical_paths = BTreeMap::new();
+
+        for candidate in eligible {
+            match self.registry.find_by_identity(&candidate.metainfo.identity) {
+                Ok(Some(record)) => {
+                    allowed_canonical_paths.insert(candidate.relative_path.clone(), ());
+                    already_processed.push(already_processed(candidate, record));
+                }
+                Ok(None) => {
+                    allowed_canonical_paths.insert(candidate.relative_path.clone(), ());
+                    fresh.push(candidate);
+                }
+                Err(error) if error.code == "IDENTITY_CONFLICT" => {
+                    rejected.push(IncomingRejection {
+                        relative_path: candidate.relative_path,
+                        problem_code: error.code,
+                        message: error.message,
+                    });
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        redundant_identical
+            .retain(|copy| allowed_canonical_paths.contains_key(&copy.canonical_path));
+        already_processed.sort_by(|left, right| {
+            path_order(&left.relative_path, &right.relative_path)
+        });
+        rejected.sort_by(|left, right| path_order(&left.relative_path, &right.relative_path));
+
         Ok(IncomingScan {
-            eligible,
+            eligible: fresh,
+            already_processed,
             redundant_identical,
             rejected,
         })
@@ -256,6 +311,18 @@ impl IncomingScanService {
     }
 }
 
+fn already_processed(
+    candidate: IncomingCandidate,
+    record: RegistryRecord,
+) -> IncomingAlreadyProcessed {
+    IncomingAlreadyProcessed {
+        relative_path: candidate.relative_path,
+        registry_id: record.registry_id,
+        registry_state: record.state,
+        registered_source_relative: record.source_relative,
+    }
+}
+
 fn source_digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
@@ -357,6 +424,46 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FakeRegistry {
+        records: Vec<RegistryRecord>,
+        conflict_identity: Option<TorrentIdentity>,
+    }
+
+    impl TorrentRegistry for FakeRegistry {
+        fn find_by_identity(
+            &self,
+            identity: &TorrentIdentity,
+        ) -> Result<Option<RegistryRecord>, PortError> {
+            if self
+                .conflict_identity
+                .as_ref()
+                .is_some_and(|conflict| conflict.shares_alias_with(identity))
+            {
+                return Err(PortError::new(
+                    "IDENTITY_CONFLICT",
+                    "fixture registry identity conflict",
+                ));
+            }
+
+            Ok(self
+                .records
+                .iter()
+                .find(|record| record.identity.shares_alias_with(identity))
+                .cloned())
+        }
+
+        fn register_incoming(
+            &self,
+            _candidate: &crate::registry::RegisterIncoming,
+        ) -> Result<crate::registry::RegisterIncomingResult, PortError> {
+            Err(PortError::new(
+                "INTERNAL_INVARIANT_VIOLATION",
+                "read-only scan must not register",
+            ))
+        }
+    }
+
     struct FakeMetainfoReader;
 
     impl MetainfoReader for FakeMetainfoReader {
@@ -408,12 +515,17 @@ mod tests {
                 snapshot("A.torrent", b"same", 2),
             ],
         });
-        let service = IncomingScanService::new(storage, Arc::new(FakeMetainfoReader));
+        let service = IncomingScanService::new(
+            storage,
+            Arc::new(FakeMetainfoReader),
+            Arc::new(FakeRegistry::default()),
+        );
 
         let scan = service.scan(1024).expect("scan");
 
         assert_eq!(scan.eligible.len(), 1);
         assert_eq!(scan.eligible[0].relative_path, "A.torrent");
+        assert!(scan.already_processed.is_empty());
         assert_eq!(scan.redundant_identical.len(), 1);
         assert_eq!(scan.redundant_identical[0].canonical_path, "A.torrent");
         assert_eq!(scan.redundant_identical[0].redundant_path, "z.torrent");
@@ -428,11 +540,16 @@ mod tests {
                 snapshot("b.torrent", b"second", 2),
             ],
         });
-        let service = IncomingScanService::new(storage, Arc::new(FakeMetainfoReader));
+        let service = IncomingScanService::new(
+            storage,
+            Arc::new(FakeMetainfoReader),
+            Arc::new(FakeRegistry::default()),
+        );
 
         let scan = service.scan(1024).expect("scan");
 
         assert!(scan.eligible.is_empty());
+        assert!(scan.already_processed.is_empty());
         assert!(scan.redundant_identical.is_empty());
         assert_eq!(scan.rejected.len(), 2);
         assert!(scan
@@ -451,17 +568,81 @@ mod tests {
                 snapshot("d-other.torrent", b"unrelated", 4),
             ],
         });
-        let service = IncomingScanService::new(storage, Arc::new(FakeMetainfoReader));
+        let service = IncomingScanService::new(
+            storage,
+            Arc::new(FakeMetainfoReader),
+            Arc::new(FakeRegistry::default()),
+        );
 
         let scan = service.scan(1024).expect("scan");
 
         assert_eq!(scan.eligible.len(), 1);
         assert_eq!(scan.eligible[0].relative_path, "d-other.torrent");
+        assert!(scan.already_processed.is_empty());
         assert_eq!(scan.rejected.len(), 3);
         assert!(scan
             .rejected
             .iter()
             .all(|entry| entry.problem_code == "IDENTITY_CONTENT_CONFLICT"));
+    }
+
+    #[test]
+    fn incoming_scan_classifies_registered_identity_as_already_processed() {
+        let storage = Arc::new(FakeStorage {
+            files: vec![snapshot("known.torrent", b"v1", 1)],
+        });
+        let identity = TorrentIdentity::new(Some([0x11; 20]), None).expect("identity");
+        let registry = Arc::new(FakeRegistry {
+            records: vec![RegistryRecord {
+                registry_id: "registry-1".into(),
+                identity,
+                state: RegistryState::Finished,
+                source_relative: "archive/known.torrent".into(),
+                source_metainfo_digest: [0x77; 32],
+                operation_id: Some("operation-1".into()),
+                archive_ref: Some("archive/known.torrent".into()),
+                handoff_file_count: 1,
+                handoff_receipt_count: 1,
+            }],
+            conflict_identity: None,
+        });
+        let service =
+            IncomingScanService::new(storage, Arc::new(FakeMetainfoReader), registry);
+
+        let scan = service.scan(1024).expect("scan");
+
+        assert!(scan.eligible.is_empty());
+        assert_eq!(scan.already_processed.len(), 1);
+        assert_eq!(scan.already_processed[0].relative_path, "known.torrent");
+        assert_eq!(scan.already_processed[0].registry_id, "registry-1");
+        assert_eq!(
+            scan.already_processed[0].registry_state,
+            RegistryState::Finished
+        );
+        assert!(scan.rejected.is_empty());
+    }
+
+    #[test]
+    fn incoming_scan_reports_registry_identity_conflict_without_mutation() {
+        let storage = Arc::new(FakeStorage {
+            files: vec![snapshot("conflict.torrent", b"v1", 1)],
+        });
+        let registry = Arc::new(FakeRegistry {
+            records: Vec::new(),
+            conflict_identity: Some(
+                TorrentIdentity::new(Some([0x11; 20]), None).expect("identity"),
+            ),
+        });
+        let service =
+            IncomingScanService::new(storage, Arc::new(FakeMetainfoReader), registry);
+
+        let scan = service.scan(1024).expect("scan");
+
+        assert!(scan.eligible.is_empty());
+        assert!(scan.already_processed.is_empty());
+        assert!(scan.redundant_identical.is_empty());
+        assert_eq!(scan.rejected.len(), 1);
+        assert_eq!(scan.rejected[0].problem_code, "IDENTITY_CONFLICT");
     }
 
     #[test]
@@ -472,13 +653,18 @@ mod tests {
                 snapshot("b.torrent", b"bad", 2),
             ],
         });
-        let service = IncomingScanService::new(storage, Arc::new(FakeMetainfoReader));
+        let service = IncomingScanService::new(
+            storage,
+            Arc::new(FakeMetainfoReader),
+            Arc::new(FakeRegistry::default()),
+        );
 
         let scan = service.scan(1024).expect("scan");
 
         assert_eq!(scan.eligible.len(), 1);
         assert_eq!(scan.eligible[0].relative_path, "a.torrent");
         assert_ne!(scan.eligible[0].source_sha256, [0; 32]);
+        assert!(scan.already_processed.is_empty());
         assert!(scan.redundant_identical.is_empty());
         assert_eq!(scan.rejected.len(), 1);
         assert_eq!(scan.rejected[0].relative_path, "b.torrent");
