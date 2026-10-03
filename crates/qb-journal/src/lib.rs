@@ -2048,6 +2048,57 @@ impl CompletionJournal for Journal {
         )
     }
 
+    fn mark_file_destination_receipted(
+        &self,
+        operation_id: &OperationId,
+        file_index: u32,
+        destination: &qb_application::storage::FileEvidence,
+        destination_sha256: [u8; 32],
+    ) -> Result<CompletionRecord, PortError> {
+        transition_completion_file(
+            self,
+            operation_id,
+            file_index,
+            CompletionFileState::DestinationReceipted,
+            Some(destination),
+            Some(destination_sha256),
+            None,
+        )
+    }
+
+    fn mark_file_source_delete_pending(
+        &self,
+        operation_id: &OperationId,
+        file_index: u32,
+    ) -> Result<CompletionRecord, PortError> {
+        transition_completion_file(
+            self,
+            operation_id,
+            file_index,
+            CompletionFileState::SourceDeletePending,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn mark_file_unknown_source_delete(
+        &self,
+        operation_id: &OperationId,
+        file_index: u32,
+        problem_code: &str,
+    ) -> Result<CompletionRecord, PortError> {
+        transition_completion_file(
+            self,
+            operation_id,
+            file_index,
+            CompletionFileState::UnknownSourceDelete,
+            None,
+            None,
+            Some(problem_code),
+        )
+    }
+
     fn mark_file_handed_off(
         &self,
         operation_id: &OperationId,
@@ -4325,15 +4376,33 @@ fn transition_completion_file(
             CompletionFileState::Prepared | CompletionFileState::UnknownMove
         ),
         CompletionFileState::UnknownMove => file.state == CompletionFileState::MovePending,
-        CompletionFileState::HandedOff => matches!(
+        CompletionFileState::DestinationReceipted => matches!(
             file.state,
             CompletionFileState::MovePending | CompletionFileState::UnknownMove
+        ),
+        CompletionFileState::SourceDeletePending => matches!(
+            file.state,
+            CompletionFileState::DestinationReceipted
+                | CompletionFileState::UnknownSourceDelete
+        ),
+        CompletionFileState::UnknownSourceDelete => {
+            file.state == CompletionFileState::SourceDeletePending
+        }
+        CompletionFileState::HandedOff => matches!(
+            file.state,
+            CompletionFileState::MovePending
+                | CompletionFileState::UnknownMove
+                | CompletionFileState::SourceDeletePending
+                | CompletionFileState::UnknownSourceDelete
         ),
         CompletionFileState::Blocked => matches!(
             file.state,
             CompletionFileState::Prepared
                 | CompletionFileState::MovePending
                 | CompletionFileState::UnknownMove
+                | CompletionFileState::DestinationReceipted
+                | CompletionFileState::SourceDeletePending
+                | CompletionFileState::UnknownSourceDelete
         ),
         _ => false,
     };
@@ -4368,11 +4437,11 @@ fn transition_completion_file(
         .execute(
             "UPDATE operation_files
              SET state = ?1,
-                 destination_volume_id = ?2,
-                 destination_file_id = ?3,
-                 destination_size = ?4,
-                 destination_modified_marker = ?5,
-                 destination_sha256 = ?6,
+                 destination_volume_id = COALESCE(?2, destination_volume_id),
+                 destination_file_id = COALESCE(?3, destination_file_id),
+                 destination_size = COALESCE(?4, destination_size),
+                 destination_modified_marker = COALESCE(?5, destination_modified_marker),
+                 destination_sha256 = COALESCE(?6, destination_sha256),
                  problem_code = ?7,
                  revision = ?8,
                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
