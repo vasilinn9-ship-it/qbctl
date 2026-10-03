@@ -128,12 +128,20 @@ mod platform {
         }
 
         pub async fn accept(&mut self) -> Result<ServerConnection, IpcError> {
-            let server = self.pending.take().expect("pending server exists");
-            server.connect().await?;
+            // Keep the pending instance owned by the listener while awaiting.
+            // NamedPipeServer::connect is cancel-safe, so a cancelled accept
+            // must leave this instance available for the next poll.
+            self.pending
+                .as_ref()
+                .expect("pending server exists")
+                .connect()
+                .await?;
 
-            // Keep one listening instance available before handing the connected
-            // instance to a client task. Tokio's named-pipe contract requires this
-            // to avoid reconnect races between short-lived clients.
+            let server = self.pending.take().expect("connected server exists");
+
+            // Create the next listening instance before handing the connected
+            // instance to a client task. This keeps the pipe continuously
+            // available between short-lived clients.
             self.pending = Some(create_server(&self.pipe_name, false)?);
 
             Ok(ServerConnection {
@@ -193,13 +201,17 @@ mod platform {
         }
 
         #[tokio::test]
-        async fn listener_keeps_a_pending_instance_for_immediate_reconnect() {
+        async fn listener_accept_is_cancel_safe_and_keeps_a_pending_instance() {
             let name = format!(r"\\.\pipe\qbctl-ipc-reconnect-test-{}", std::process::id());
             let mut listener = ServerListener::bind(&name).expect("listener");
 
+            let cancelled =
+                tokio::time::timeout(Duration::from_millis(10), listener.accept()).await;
+            assert!(cancelled.is_err(), "accept unexpectedly completed");
+
             let first_client = ClientConnection::connect(&name)
                 .await
-                .expect("first client");
+                .expect("first client after cancelled accept");
             let first_server = listener.accept().await.expect("first accept");
             drop(first_client);
             drop(first_server);
