@@ -611,9 +611,7 @@ impl MutationService {
             )),
             MutationCommand::SetQueueTarget {
                 target_client_count,
-            } => Ok(
-                self.journal.queue_target()?.target_client_count == Some(*target_client_count)
-            ),
+            } => Ok(self.journal.queue_target()?.target_client_count == Some(*target_client_count)),
         }
     }
 
