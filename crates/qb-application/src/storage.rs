@@ -149,9 +149,7 @@ impl IncomingScanService {
 
         for candidate in eligible {
             match self.registry.find_by_identity(&candidate.metainfo.identity) {
-                Ok(Some(record))
-                    if record.source_metainfo_digest == candidate.source_sha256 =>
-                {
+                Ok(Some(record)) if record.source_metainfo_digest == candidate.source_sha256 => {
                     allowed_canonical_paths.insert(candidate.relative_path.clone(), ());
                     processed.push(classify_already_processed(candidate, record));
                 }
@@ -159,8 +157,7 @@ impl IncomingScanService {
                     rejected.push(IncomingRejection {
                         relative_path: candidate.relative_path,
                         problem_code: "IDENTITY_CONFLICT",
-                        message:
-                            "registered torrent identity has different metainfo bytes".into(),
+                        message: "registered torrent identity has different metainfo bytes".into(),
                     });
                 }
                 Ok(None) => {
