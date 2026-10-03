@@ -465,7 +465,7 @@ fn render_human(response: &Response) -> Result<(), CliError> {
             let state =
                 DaemonState::try_from(value.daemon_state).unwrap_or(DaemonState::Unspecified);
             println!(
-                "{} · instance {} · schema {} · mutations {}",
+                "{} · instance {} · schema {} · mutations {} · recovery blockers {}",
                 state.as_str_name(),
                 value.instance_id,
                 value.schema_version,
@@ -473,8 +473,18 @@ fn render_human(response: &Response) -> Result<(), CliError> {
                     "enabled"
                 } else {
                     "disabled"
-                }
+                },
+                value.recovery_blockers.iter().map(|blocker| blocker.count).sum::<u64>()
             );
+            for blocker in &value.recovery_blockers {
+                println!(
+                    "  recovery {} · {} · {} · count {}",
+                    blocker.kind,
+                    blocker.state,
+                    blocker.problem_code.as_deref().unwrap_or("none"),
+                    blocker.count
+                );
+            }
         }
         Some(response::Payload::Doctor(value)) => {
             for check in &value.checks {
@@ -716,6 +726,26 @@ fn render_fields(response: &Response) -> Result<(), CliError> {
                 "mutation_admission_enabled={}",
                 value.mutation_admission_enabled
             );
+            println!("recovery_blocker_count={}", value.recovery_blockers.len());
+            println!(
+                "recovery_blocked_operation_count={}",
+                value.recovery_blockers.iter().map(|blocker| blocker.count).sum::<u64>()
+            );
+            for (index, blocker) in value.recovery_blockers.iter().enumerate() {
+                println!(
+                    "recovery_blocker.{index}.kind={}",
+                    sanitize_field(&blocker.kind)
+                );
+                println!(
+                    "recovery_blocker.{index}.state={}",
+                    sanitize_field(&blocker.state)
+                );
+                println!(
+                    "recovery_blocker.{index}.problem_code={}",
+                    sanitize_field(blocker.problem_code.as_deref().unwrap_or(""))
+                );
+                println!("recovery_blocker.{index}.count={}", blocker.count);
+            }
         }
         Some(response::Payload::Doctor(value)) => {
             println!("check_count={}", value.checks.len());
