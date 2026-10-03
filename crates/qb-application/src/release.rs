@@ -1379,10 +1379,15 @@ mod tests {
             Vec::new(),
             vec![FakeEffect::Uncertain],
         ));
-        let service = service(journal.clone(), storage.clone(), client.clone());
+        let release_service = service(journal.clone(), storage.clone(), client.clone());
         let request = release_request();
 
-        let first = execution(service.execute(&request).await.expect("execute release"));
+        let first = execution(
+            release_service
+                .execute(&request)
+                .await
+                .expect("execute release"),
+        );
         assert_eq!(first.status, ReleaseExecutionStatus::UnknownDelete);
         assert_eq!(first.record.state, ReleaseState::UnknownDelete);
         assert_eq!(client.delete_calls.load(Ordering::SeqCst), 1);
