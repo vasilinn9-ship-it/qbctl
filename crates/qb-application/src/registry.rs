@@ -45,6 +45,13 @@ pub trait TorrentRegistry: Send + Sync {
         &self,
         candidate: &RegisterIncoming,
     ) -> Result<RegisterIncomingResult, PortError>;
+
+    fn list_processing(&self) -> Result<Vec<RegistryRecord>, PortError> {
+        Err(PortError::new(
+            "REGISTRY_LIST_UNSUPPORTED",
+            "processing registry enumeration is not supported by this adapter",
+        ))
+    }
 }
 
 #[cfg(test)]
