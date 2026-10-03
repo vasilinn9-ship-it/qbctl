@@ -214,6 +214,40 @@ mod tests {
     }
 
     #[test]
+    fn resume_postcondition_fails_closed_on_error_and_unknown() {
+        use qb_domain::torrent::TorrentState;
+
+        assert!(torrent_control_postcondition(
+            TorrentControlAction::Start,
+            TorrentState::Downloading,
+        ));
+        assert!(torrent_control_postcondition(
+            TorrentControlAction::Start,
+            TorrentState::Checking,
+        ));
+        assert!(!torrent_control_postcondition(
+            TorrentControlAction::Start,
+            TorrentState::Stopped,
+        ));
+        assert!(!torrent_control_postcondition(
+            TorrentControlAction::Start,
+            TorrentState::Error,
+        ));
+        assert!(!torrent_control_postcondition(
+            TorrentControlAction::Start,
+            TorrentState::Unknown,
+        ));
+        assert!(torrent_control_postcondition(
+            TorrentControlAction::Stop,
+            TorrentState::Stopped,
+        ));
+        assert!(!torrent_control_postcondition(
+            TorrentControlAction::Stop,
+            TorrentState::Downloading,
+        ));
+    }
+
+    #[test]
     fn transfer_limit_postcondition_allows_kib_quantization() {
         assert!(limit_matches_requested(24_000_000, 23_999_488));
         assert!(limit_matches_requested(24_000_000, 24_000_512));
@@ -584,10 +618,7 @@ impl MutationService {
                         "qBittorrent returned an unknown torrent state",
                     ));
                 }
-                Ok(match action {
-                    TorrentControlAction::Stop => torrent.state.is_stopped(),
-                    TorrentControlAction::Start => !torrent.state.is_stopped(),
-                })
+                Ok(torrent_control_postcondition(*action, torrent.state))
             }
             MutationCommand::SetActiveDownloads {
                 max_active_downloads,
@@ -637,6 +668,21 @@ impl MutationService {
             }
             MutationCommand::SetQueueTarget { .. } => unreachable!("handled locally"),
         }
+    }
+}
+
+fn torrent_control_postcondition(
+    action: TorrentControlAction,
+    state: qb_domain::torrent::TorrentState,
+) -> bool {
+    match action {
+        TorrentControlAction::Stop => state.is_stopped(),
+        TorrentControlAction::Start => !matches!(
+            state,
+            qb_domain::torrent::TorrentState::Stopped
+                | qb_domain::torrent::TorrentState::Error
+                | qb_domain::torrent::TorrentState::Unknown
+        ),
     }
 }
 
