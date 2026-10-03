@@ -206,7 +206,7 @@ mod platform {
             let mut listener = ServerListener::bind(&name).expect("listener");
 
             let cancelled =
-                tokio::time::timeout(Duration::from_millis(10), listener.accept()).await;
+                tokio::time::timeout(std::time::Duration::from_millis(10), listener.accept()).await;
             assert!(cancelled.is_err(), "accept unexpectedly completed");
 
             let first_client = ClientConnection::connect(&name)
