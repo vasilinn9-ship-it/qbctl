@@ -2,8 +2,8 @@ use std::{net::IpAddr, str::FromStr, time::Duration};
 
 use qb_application::{
     torrent::{
-        ConnectionStatus, NetworkPreferences, PortFuture, QbitProbe, QueueSettings, TorrentClient,
-        TorrentView, TrackerEvidence, TrackerStatus, TransferInfo,
+        ConnectionStatus, EffectAttempt, EffectFuture, NetworkPreferences, PortFuture, QbitProbe,
+        QueueSettings, TorrentClient, TorrentView, TrackerEvidence, TrackerStatus, TransferInfo,
     },
     PortError,
 };
@@ -243,6 +243,97 @@ impl QbitClient {
         Err(QbitError::Authentication)
     }
 
+    async fn mutation_post_form(
+        &self,
+        endpoint: &str,
+        form: &[(&str, String)],
+    ) -> EffectAttempt {
+        for attempt in 0..2 {
+            let sid = match self.ensure_session().await {
+                Ok(sid) => sid,
+                Err(error) => return EffectAttempt::Rejected(map_port_error(error)),
+            };
+
+            let response = self
+                .http
+                .post(self.endpoint(endpoint))
+                .header(ORIGIN, &self.origin)
+                .header(COOKIE, format!("SID={sid}"))
+                .form(form)
+                .send()
+                .await;
+
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    return EffectAttempt::Uncertain(PortError::new(
+                        "QBIT_MUTATION_UNCERTAIN",
+                        error.to_string(),
+                    ));
+                }
+            };
+
+            if response.status() == StatusCode::FORBIDDEN && attempt == 0 {
+                *self.sid.write().await = None;
+                continue;
+            }
+
+            if response.status().is_success() {
+                return EffectAttempt::Accepted;
+            }
+
+            if response.status().is_server_error() {
+                return EffectAttempt::Uncertain(PortError::new(
+                    "QBIT_MUTATION_UNCERTAIN",
+                    format!("qBittorrent returned HTTP {}", response.status()),
+                ));
+            }
+
+            let code = if response.status() == StatusCode::FORBIDDEN {
+                "QBIT_AUTH_FAILED"
+            } else {
+                "QBIT_MUTATION_REJECTED"
+            };
+            return EffectAttempt::Rejected(PortError::new(
+                code,
+                format!("qBittorrent returned HTTP {}", response.status()),
+            ));
+        }
+
+        EffectAttempt::Rejected(PortError::new(
+            "QBIT_AUTH_FAILED",
+            "qBittorrent authentication failed",
+        ))
+    }
+
+    async fn stop_inner(&self, id: &TorrentId) -> EffectAttempt {
+        let form = [("hashes", id.as_str().to_string())];
+        self.mutation_post_form("torrents/stop", &form).await
+    }
+
+    async fn start_inner(&self, id: &TorrentId) -> EffectAttempt {
+        let form = [("hashes", id.as_str().to_string())];
+        self.mutation_post_form("torrents/start", &form).await
+    }
+
+    async fn set_active_downloads_inner(&self, value: u32) -> EffectAttempt {
+        let json = serde_json::json!({ "max_active_downloads": value }).to_string();
+        let form = [("json", json)];
+        self.mutation_post_form("app/setPreferences", &form).await
+    }
+
+    async fn set_download_limit_inner(&self, bytes_per_sec: u64) -> EffectAttempt {
+        let form = [("limit", bytes_per_sec.to_string())];
+        self.mutation_post_form("transfer/setDownloadLimit", &form)
+            .await
+    }
+
+    async fn set_upload_limit_inner(&self, bytes_per_sec: u64) -> EffectAttempt {
+        let form = [("limit", bytes_per_sec.to_string())];
+        self.mutation_post_form("transfer/setUploadLimit", &form)
+            .await
+    }
+
     async fn ensure_session(&self) -> Result<String, QbitError> {
         if let Some(sid) = self.sid.read().await.clone() {
             return Ok(sid);
@@ -325,6 +416,26 @@ impl TorrentClient for QbitClient {
 
     fn trackers(&self, id: &TorrentId) -> PortFuture<'_, Vec<TrackerEvidence>> {
         Box::pin(async move { self.trackers_inner(id).await.map_err(map_port_error) })
+    }
+
+    fn stop(&self, id: &TorrentId) -> EffectFuture<'_> {
+        Box::pin(async move { self.stop_inner(id).await })
+    }
+
+    fn start(&self, id: &TorrentId) -> EffectFuture<'_> {
+        Box::pin(async move { self.start_inner(id).await })
+    }
+
+    fn set_active_downloads(&self, value: u32) -> EffectFuture<'_> {
+        Box::pin(async move { self.set_active_downloads_inner(value).await })
+    }
+
+    fn set_download_limit(&self, bytes_per_sec: u64) -> EffectFuture<'_> {
+        Box::pin(async move { self.set_download_limit_inner(bytes_per_sec).await })
+    }
+
+    fn set_upload_limit(&self, bytes_per_sec: u64) -> EffectFuture<'_> {
+        Box::pin(async move { self.set_upload_limit_inner(bytes_per_sec).await })
     }
 }
 
