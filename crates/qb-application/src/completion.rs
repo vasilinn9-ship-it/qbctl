@@ -1000,23 +1000,25 @@ impl CompletionService {
                 }
                 Err(problem) => return self.block_handoff(record, problem),
             },
-            CompletionState::ArchivePending | CompletionState::UnknownArchive => match observation {
-                Ok(SameVolumeObservation::Applied(destination)) => {
-                    let receipted = self.journal.mark_archive_receipted(
-                        &record.operation_id,
-                        &destination,
-                        record.source_metainfo_digest,
-                    )?;
-                    return Ok(HandoffProgress::Continue(receipted));
-                }
-                Ok(SameVolumeObservation::SourceReady) => {
-                    if record.state == CompletionState::UnknownArchive {
-                        record = self.journal.retry_archive(&record.operation_id)?;
-                        record = self.journal.mark_archive_pending(&record.operation_id)?;
+            CompletionState::ArchivePending | CompletionState::UnknownArchive => {
+                match observation {
+                    Ok(SameVolumeObservation::Applied(destination)) => {
+                        let receipted = self.journal.mark_archive_receipted(
+                            &record.operation_id,
+                            &destination,
+                            record.source_metainfo_digest,
+                        )?;
+                        return Ok(HandoffProgress::Continue(receipted));
                     }
+                    Ok(SameVolumeObservation::SourceReady) => {
+                        if record.state == CompletionState::UnknownArchive {
+                            record = self.journal.retry_archive(&record.operation_id)?;
+                            record = self.journal.mark_archive_pending(&record.operation_id)?;
+                        }
+                    }
+                    Err(problem) => return self.block_handoff(record, problem),
                 }
-                Err(problem) => return self.block_handoff(record, problem),
-            },
+            }
             _ => {
                 return Err(PortError::new(
                     "OPERATION_TRANSITION_INVALID",
@@ -1055,10 +1057,9 @@ impl CompletionService {
                         Ok(HandoffProgress::Continue(receipted))
                     }
                     Ok(SameVolumeObservation::SourceReady) => {
-                        let unknown = self.journal.mark_unknown_archive(
-                            &record.operation_id,
-                            "ARCHIVE_MOVE_UNCERTAIN",
-                        )?;
+                        let unknown = self
+                            .journal
+                            .mark_unknown_archive(&record.operation_id, "ARCHIVE_MOVE_UNCERTAIN")?;
                         Ok(HandoffProgress::Halt {
                             status: CompletionExecutionStatus::UnknownArchive,
                             record: unknown,
@@ -1248,10 +1249,7 @@ impl CompletionService {
                                 record,
                                 problem: Some(PortError::new(
                                     "HANDOFF_MOVE_UNCERTAIN",
-                                    format!(
-                                        "move result is uncertain for {}",
-                                        file.relative_path
-                                    ),
+                                    format!("move result is uncertain for {}", file.relative_path),
                                 )),
                             });
                         }
@@ -1362,11 +1360,9 @@ impl CompletionService {
         file: &CompletionFileRecord,
         problem: PortError,
     ) -> Result<HandoffProgress, PortError> {
-        let updated = self.journal.mark_file_blocked(
-            &record.operation_id,
-            file.index,
-            problem.code,
-        )?;
+        let updated =
+            self.journal
+                .mark_file_blocked(&record.operation_id, file.index, problem.code)?;
         self.block_handoff(updated, problem)
     }
 
@@ -1621,9 +1617,10 @@ mod tests {
             expected_source: &FileEvidence,
         ) -> Result<SameVolumeMoveOutcome, PortError> {
             let mut files = self.files.lock().expect("files mutex");
-            let Some(source_index) = files.iter().position(|(root, path, _)| {
-                *root == source_root && path == relative_path
-            }) else {
+            let Some(source_index) = files
+                .iter()
+                .position(|(root, path, _)| *root == source_root && path == relative_path)
+            else {
                 return Ok(SameVolumeMoveOutcome::SourceMissing);
             };
             let source_evidence = files[source_index].2.clone();
@@ -1632,9 +1629,10 @@ mod tests {
                     observed: source_evidence,
                 });
             }
-            if let Some((_, _, observed)) = files.iter().find(|(root, path, _)| {
-                *root == destination_root && path == relative_path
-            }) {
+            if let Some((_, _, observed)) = files
+                .iter()
+                .find(|(root, path, _)| *root == destination_root && path == relative_path)
+            {
                 return Ok(SameVolumeMoveOutcome::DestinationExists {
                     observed: observed.clone(),
                 });
@@ -1861,7 +1859,8 @@ mod tests {
             let record = state
                 .as_mut()
                 .ok_or_else(|| PortError::new("COMPLETION_NOT_FOUND", operation_id.to_string()))?;
-            if &record.operation_id != operation_id || record.state != CompletionState::PayloadPending
+            if &record.operation_id != operation_id
+                || record.state != CompletionState::PayloadPending
             {
                 return Err(PortError::new(
                     "OPERATION_TRANSITION_INVALID",
@@ -1872,7 +1871,9 @@ mod tests {
                 .files
                 .iter_mut()
                 .find(|file| file.index == file_index)
-                .ok_or_else(|| PortError::new("COMPLETION_FILE_NOT_FOUND", file_index.to_string()))?;
+                .ok_or_else(|| {
+                    PortError::new("COMPLETION_FILE_NOT_FOUND", file_index.to_string())
+                })?;
             if !expected.contains(&file.state) {
                 return Err(PortError::new(
                     "OPERATION_TRANSITION_INVALID",
@@ -2113,13 +2114,13 @@ mod tests {
             )
         }
 
-        fn retry_archive(
-            &self,
-            operation_id: &OperationId,
-        ) -> Result<CompletionRecord, PortError> {
+        fn retry_archive(&self, operation_id: &OperationId) -> Result<CompletionRecord, PortError> {
             self.transition(
                 operation_id,
-                &[CompletionState::ArchivePending, CompletionState::UnknownArchive],
+                &[
+                    CompletionState::ArchivePending,
+                    CompletionState::UnknownArchive,
+                ],
                 CompletionState::Stopped,
                 None,
             )
@@ -2162,7 +2163,10 @@ mod tests {
             self.transition_file(
                 operation_id,
                 file_index,
-                &[CompletionFileState::Prepared, CompletionFileState::UnknownMove],
+                &[
+                    CompletionFileState::Prepared,
+                    CompletionFileState::UnknownMove,
+                ],
                 CompletionFileState::MovePending,
                 None,
                 None,
@@ -2197,7 +2201,10 @@ mod tests {
             self.transition_file(
                 operation_id,
                 file_index,
-                &[CompletionFileState::MovePending, CompletionFileState::UnknownMove],
+                &[
+                    CompletionFileState::MovePending,
+                    CompletionFileState::UnknownMove,
+                ],
                 CompletionFileState::HandedOff,
                 Some(destination),
                 destination_sha256,
