@@ -1000,7 +1000,10 @@ mod tests {
         let working_path = storage
             .root_path(ManagedRoot::Working)
             .expect("validated Working root path");
-        assert_eq!(Path::new(&working_path), storage.roots().path(ManagedRootRole::Working));
+        assert_eq!(
+            Path::new(&working_path),
+            storage.roots().path(ManagedRootRole::Working)
+        );
 
         fs::remove_dir_all(temp).expect("cleanup");
     }

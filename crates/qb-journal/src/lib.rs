@@ -1695,7 +1695,7 @@ fn migrate_v3_to_v4(connection: &mut Connection) -> Result<(), JournalError> {
         r#"
         CREATE TABLE admission_reservations (
             operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id),
-            registry_id TEXT NOT NULL UNIQUE REFERENCES torrent_registry(registry_id),
+            registry_id TEXT NOT NULL REFERENCES torrent_registry(registry_id),
             source_relative TEXT NOT NULL CHECK(length(source_relative) > 0),
             source_volume_id BLOB NOT NULL CHECK(length(source_volume_id) = 8),
             source_file_id BLOB NOT NULL CHECK(length(source_file_id) = 8),
@@ -1713,6 +1713,10 @@ fn migrate_v3_to_v4(connection: &mut Connection) -> Result<(), JournalError> {
 
         CREATE INDEX admission_reservations_volume_state_idx
         ON admission_reservations(working_volume_id, reservation_state);
+
+        CREATE UNIQUE INDEX admission_reservations_active_registry_idx
+        ON admission_reservations(registry_id)
+        WHERE reservation_state = 'active';
 
         UPDATE schema_meta
         SET schema_version = 4,
