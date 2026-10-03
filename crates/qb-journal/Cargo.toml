@@ -6,8 +6,10 @@ publish.workspace = true
 
 [dependencies]
 qb-application = { path = "../qb-application" }
+qb-domain = { path = "../qb-domain" }
 rusqlite.workspace = true
 thiserror.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
