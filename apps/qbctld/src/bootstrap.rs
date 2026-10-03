@@ -11,7 +11,7 @@ use qb_application::{
     mutation::{MutationJournal, MutationService},
     registry::TorrentRegistry,
     release::{ReleaseJournal, ReleaseService},
-    storage::{IncomingScanService, Storage},
+    storage::{IncomingScanService, Storage, StorageStatusService},
     system::{RuntimeHealthPort, SystemService},
     torrent::{MetainfoReader, TorrentClient, TorrentService},
     JournalHealthPort,
@@ -38,6 +38,7 @@ pub struct Bootstrap {
     pub torrents: Option<Arc<TorrentService>>,
     pub mutations: Arc<MutationService>,
     pub incoming: Option<Arc<IncomingService>>,
+    pub storage_status: Option<Arc<StorageStatusService>>,
     pub release: Option<Arc<ReleaseService>>,
     pub qbit_startup_problem: Option<String>,
     _instance_guard: InstanceGuard,
@@ -77,6 +78,9 @@ pub fn build(runtime_override: Option<PathBuf>) -> Result<Bootstrap> {
     let incoming = storage.as_ref().map(|storage| {
         build_incoming_service(storage.clone(), registry.clone(), cleanup_journal.clone())
     });
+    let storage_status = storage
+        .as_ref()
+        .map(|storage| build_storage_status_service(storage.clone(), registry.clone()));
 
     let (torrents, mutation_client, release_client, qbit_startup_problem) =
         match config.qbittorrent.as_ref() {
@@ -133,6 +137,7 @@ pub fn build(runtime_override: Option<PathBuf>) -> Result<Bootstrap> {
         torrents,
         mutations,
         incoming,
+        storage_status,
         release,
         qbit_startup_problem,
         _instance_guard: instance_guard,
@@ -163,6 +168,19 @@ fn build_incoming_service(
     let cleanup = IncomingCleanupService::new(cleanup_journal, storage, MAX_METAINFO_BYTES);
 
     Arc::new(IncomingService::new(scan, cleanup, MAX_METAINFO_BYTES))
+}
+
+fn build_storage_status_service(
+    storage: Arc<dyn Storage>,
+    registry: Arc<dyn TorrentRegistry>,
+) -> Arc<StorageStatusService> {
+    let metainfo: Arc<dyn MetainfoReader> = Arc::new(LocalMetainfoReader);
+    let scan = IncomingScanService::new(storage.clone(), metainfo, registry);
+    Arc::new(StorageStatusService::new(
+        storage,
+        scan,
+        MAX_METAINFO_BYTES,
+    ))
 }
 
 fn build_qbit_client(config: &QbitConfig) -> Result<Arc<QbitClient>> {
