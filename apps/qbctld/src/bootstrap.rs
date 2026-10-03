@@ -112,17 +112,24 @@ pub fn build(runtime_override: Option<PathBuf>) -> Result<Bootstrap> {
                 Some("qBittorrent is not configured for the Rust daemon".into()),
             ),
         };
-    let mutations = Arc::new(MutationService::new(mutation_journal, mutation_client));
+    let mutation_lane = qb_application::mutation_lane();
+    let mutations = Arc::new(
+        MutationService::new(mutation_journal, mutation_client)
+            .with_mutation_lane(mutation_lane.clone()),
+    );
     let release = storage
         .as_ref()
         .zip(release_client)
         .map(|(storage, client)| {
-            Arc::new(ReleaseService::new(
-                release_journal.clone(),
-                storage.clone(),
-                client,
-                MAX_METAINFO_BYTES,
-            ))
+            Arc::new(
+                ReleaseService::new(
+                    release_journal.clone(),
+                    storage.clone(),
+                    client,
+                    MAX_METAINFO_BYTES,
+                )
+                .with_mutation_lane(mutation_lane.clone()),
+            )
         });
 
     let completion = storage
@@ -130,14 +137,17 @@ pub fn build(runtime_override: Option<PathBuf>) -> Result<Bootstrap> {
         .zip(completion_client)
         .map(|(storage, client)| {
             let metainfo: Arc<dyn MetainfoReader> = Arc::new(LocalMetainfoReader);
-            Arc::new(CompletionService::new(
-                completion_journal.clone(),
-                registry.clone(),
-                storage.clone(),
-                metainfo,
-                client,
-                MAX_METAINFO_BYTES,
-            ))
+            Arc::new(
+                CompletionService::new(
+                    completion_journal.clone(),
+                    registry.clone(),
+                    storage.clone(),
+                    metainfo,
+                    client,
+                    MAX_METAINFO_BYTES,
+                )
+                .with_mutation_lane(mutation_lane.clone()),
+            )
         });
 
     if release.is_none() {
