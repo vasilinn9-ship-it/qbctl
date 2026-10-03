@@ -636,4 +636,216 @@ mod tests {
         assert_eq!(map_state("stalledDL"), TorrentState::StalledDownloading);
         assert_eq!(map_state("future-state"), TorrentState::Unknown);
     }
+
+    #[tokio::test]
+    async fn probe_authenticates_and_reads_versions() {
+        let server = FakeHttpServer::spawn(vec![
+            FakeResponse::ok("Ok.").with_header("Set-Cookie", "SID=test-session; HttpOnly"),
+            FakeResponse::ok("v5.2.4"),
+            FakeResponse::ok("2.16.2"),
+        ])
+        .await;
+
+        let client = QbitClient::new(
+            &server.url,
+            QbitCredentials::new("admin", "secret"),
+            Duration::from_secs(2),
+        )
+        .expect("client");
+
+        let probe = client.probe_inner().await.expect("probe");
+        assert_eq!(probe.application_version, "v5.2.4");
+        assert_eq!(probe.webapi_version, "2.16.2");
+        assert!(probe.mutation_ready);
+
+        let requests = server.finish().await;
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].starts_with("POST /api/v2/auth/login HTTP/1.1"));
+        assert!(requests[0].contains("origin: http://127.0.0.1:"));
+        assert!(requests[0].contains("username=admin"));
+        assert!(requests[0].contains("password=secret"));
+        assert!(requests[1].contains("cookie: SID=test-session"));
+        assert!(requests[2].contains("cookie: SID=test-session"));
+    }
+
+    #[tokio::test]
+    async fn forbidden_read_reauthenticates_once() {
+        let server = FakeHttpServer::spawn(vec![
+            FakeResponse::ok("Ok.").with_header("Set-Cookie", "SID=first; HttpOnly"),
+            FakeResponse::status("403 Forbidden", ""),
+            FakeResponse::ok("Ok.").with_header("Set-Cookie", "SID=second; HttpOnly"),
+            FakeResponse::ok(
+                r#"{"dl_info_speed":1,"up_info_speed":2,"dl_rate_limit":3,"up_rate_limit":4,"dht_nodes":5,"connection_status":"connected"}"#,
+            ),
+        ])
+        .await;
+
+        let client = QbitClient::new(
+            &server.url,
+            QbitCredentials::new("admin", "secret"),
+            Duration::from_secs(2),
+        )
+        .expect("client");
+
+        let info = client.transfer_info_inner().await.expect("transfer info");
+        assert_eq!(info.download_rate_bps, 1);
+        assert_eq!(info.upload_rate_bps, 2);
+        assert_eq!(info.connection_status, ConnectionStatus::Connected);
+
+        let requests = server.finish().await;
+        assert_eq!(requests.len(), 4);
+        assert!(requests[1].contains("cookie: SID=first"));
+        assert!(requests[3].contains("cookie: SID=second"));
+    }
+
+    #[tokio::test]
+    async fn torrent_read_normalizes_unknown_state() {
+        let server = FakeHttpServer::spawn(vec![
+            FakeResponse::ok("Ok.").with_header("Set-Cookie", "SID=test; HttpOnly"),
+            FakeResponse::ok(
+                r#"[{"hash":"abcdef0123456789abcdef0123456789abcdef01","name":"sample","state":"futureState","total_size":100,"amount_left":25,"dlspeed":7,"upspeed":3,"progress":0.75,"availability":1.5,"peers":2,"peers_total":4,"seeds":1,"seeds_total":3}]"#,
+            ),
+        ])
+        .await;
+
+        let client = QbitClient::new(
+            &server.url,
+            QbitCredentials::new("admin", "secret"),
+            Duration::from_secs(2),
+        )
+        .expect("client");
+
+        let torrents = client.list_inner().await.expect("torrent list");
+        assert_eq!(torrents.len(), 1);
+        assert_eq!(torrents[0].state, TorrentState::Unknown);
+        assert_eq!(torrents[0].progress_ppm, 750_000);
+        assert_eq!(torrents[0].peers_connected, 2);
+
+        server.finish().await;
+    }
+
+    use std::sync::{Arc, Mutex};
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        task::JoinHandle,
+    };
+
+    struct FakeResponse {
+        status: &'static str,
+        headers: Vec<(&'static str, &'static str)>,
+        body: &'static str,
+    }
+
+    impl FakeResponse {
+        fn ok(body: &'static str) -> Self {
+            Self::status("200 OK", body)
+        }
+
+        fn status(status: &'static str, body: &'static str) -> Self {
+            Self {
+                status,
+                headers: Vec::new(),
+                body,
+            }
+        }
+
+        fn with_header(mut self, name: &'static str, value: &'static str) -> Self {
+            self.headers.push((name, value));
+            self
+        }
+    }
+
+    struct FakeHttpServer {
+        url: String,
+        requests: Arc<Mutex<Vec<String>>>,
+        task: JoinHandle<()>,
+    }
+
+    impl FakeHttpServer {
+        async fn spawn(responses: Vec<FakeResponse>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let address = listener.local_addr().expect("local address");
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&requests);
+
+            let task = tokio::spawn(async move {
+                for response in responses {
+                    let (mut socket, _) = listener.accept().await.expect("accept");
+                    let request = read_http_request(&mut socket).await;
+                    recorded.lock().expect("requests mutex").push(request);
+
+                    let mut headers = String::new();
+                    for (name, value) in response.headers {
+                        headers.push_str(name);
+                        headers.push_str(": ");
+                        headers.push_str(value);
+                        headers.push_str("\r\n");
+                    }
+                    let wire = format!(
+                        "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n{}",
+                        response.status,
+                        response.body.len(),
+                        headers,
+                        response.body
+                    );
+                    socket.write_all(wire.as_bytes()).await.expect("write response");
+                    socket.shutdown().await.expect("shutdown");
+                }
+            });
+
+            Self {
+                url: format!("http://{address}"),
+                requests,
+                task,
+            }
+        }
+
+        async fn finish(self) -> Vec<String> {
+            self.task.await.expect("server task");
+            Arc::try_unwrap(self.requests)
+                .expect("no request references")
+                .into_inner()
+                .expect("requests mutex")
+        }
+    }
+
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> String {
+        let mut data = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        let header_end;
+
+        loop {
+            let read = socket.read(&mut buffer).await.expect("read request");
+            assert!(read > 0, "connection closed before headers");
+            data.extend_from_slice(&buffer[..read]);
+            if let Some(position) = find_bytes(&data, b"\r\n\r\n") {
+                header_end = position + 4;
+                break;
+            }
+            assert!(data.len() < 64 * 1024, "request headers too large");
+        }
+
+        let header_text = String::from_utf8_lossy(&data[..header_end]).to_ascii_lowercase();
+        let content_length = header_text
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length: "))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+
+        while data.len() < header_end + content_length {
+            let read = socket.read(&mut buffer).await.expect("read request body");
+            assert!(read > 0, "connection closed before request body");
+            data.extend_from_slice(&buffer[..read]);
+        }
+
+        String::from_utf8_lossy(&data).to_ascii_lowercase()
+    }
+
+    fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
 }
