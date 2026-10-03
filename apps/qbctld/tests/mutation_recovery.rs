@@ -280,3 +280,94 @@ async fn blocked_preflight_is_not_automatic_restart_work() {
     assert_eq!(replay.status, MutationExecutionStatus::Finished);
     assert_eq!(client.stop_calls.load(Ordering::SeqCst), 1);
 }
+
+
+#[tokio::test]
+async fn restart_recovers_uncertain_without_duplicate_stop() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("state.sqlite");
+    let client = Arc::new(FakeTorrentClient::new(DOWNLOADING, true));
+    let request_id = RequestId::new("restart-uncertain-stop").expect("request id");
+
+    {
+        let (service, journal) = service(&path, Arc::clone(&client));
+        let first = service
+            .execute(&request_id, stop_command())
+            .await
+            .expect("first execute");
+        let first = match first {
+            MutationExecutionResult::Execution(value) => value,
+            other => panic!("unexpected result: {other:?}"),
+        };
+        assert_eq!(first.status, MutationExecutionStatus::Unknown);
+        assert_eq!(client.stop_calls.load(Ordering::SeqCst), 1);
+        drop(service);
+        drop(journal);
+    }
+
+    client.uncertain_stop.store(false, Ordering::SeqCst);
+    let (restarted, _journal) = service(&path, Arc::clone(&client));
+    let recovered = restarted.recover_all().await.expect("restart recovery");
+
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].status, MutationExecutionStatus::Finished);
+    assert!(recovered[0].replayed);
+    assert_eq!(client.stop_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn restart_observes_effect_pending_before_retrying() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("state.sqlite");
+    let client = Arc::new(FakeTorrentClient::new(DOWNLOADING, false));
+    let request_id = RequestId::new("restart-pending-stop").expect("request id");
+    let command = stop_command();
+
+    {
+        let journal = Arc::new(Journal::open(&path).expect("journal"));
+        let reservation = MutationJournal::reserve_request(journal.as_ref(), &request_id, &command)
+            .expect("reserve request");
+        let operation_id = match reservation {
+            qb_application::mutation::RequestReservation::New(record) => record.operation_id,
+            other => panic!("unexpected reservation: {other:?}"),
+        };
+        MutationJournal::mark_effect_pending(journal.as_ref(), &operation_id, "qbit.stop")
+            .expect("persist effect intent");
+    }
+
+    let (restarted, _journal) = service(&path, Arc::clone(&client));
+    let recovered = restarted.recover_all().await.expect("restart recovery");
+
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].status, MutationExecutionStatus::Finished);
+    assert_eq!(client.stop_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(client.torrent_state(), TorrentState::Stopped);
+}
+
+#[tokio::test]
+async fn restart_finishes_observed_effect_pending_without_retry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("state.sqlite");
+    let client = Arc::new(FakeTorrentClient::new(STOPPED, false));
+    let request_id = RequestId::new("restart-observed-stop").expect("request id");
+    let command = stop_command();
+
+    {
+        let journal = Arc::new(Journal::open(&path).expect("journal"));
+        let reservation = MutationJournal::reserve_request(journal.as_ref(), &request_id, &command)
+            .expect("reserve request");
+        let operation_id = match reservation {
+            qb_application::mutation::RequestReservation::New(record) => record.operation_id,
+            other => panic!("unexpected reservation: {other:?}"),
+        };
+        MutationJournal::mark_effect_pending(journal.as_ref(), &operation_id, "qbit.stop")
+            .expect("persist effect intent");
+    }
+
+    let (restarted, _journal) = service(&path, Arc::clone(&client));
+    let recovered = restarted.recover_all().await.expect("restart recovery");
+
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].status, MutationExecutionStatus::Finished);
+    assert_eq!(client.stop_calls.load(Ordering::SeqCst), 0);
+}
