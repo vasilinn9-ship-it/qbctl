@@ -632,9 +632,8 @@ impl MutationJournal for Journal {
             .map_err(JournalError::from)
             .map_err(map_port_error)?;
 
-        let revision = u64::try_from(revision).map_err(|_| {
-            PortError::new("JOURNAL_STATE_INVALID", "policy revision is negative")
-        })?;
+        let revision = u64::try_from(revision)
+            .map_err(|_| PortError::new("JOURNAL_STATE_INVALID", "policy revision is negative"))?;
         let target_client_count = value
             .map(|value| {
                 u32::try_from(value).map_err(|_| {
