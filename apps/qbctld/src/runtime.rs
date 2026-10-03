@@ -106,6 +106,7 @@ pub async fn run(runtime_override: Option<PathBuf>) -> Result<()> {
                     Ok(connection) => {
                         let runtime = Arc::clone(&bootstrap.runtime);
                         let system = Arc::clone(&bootstrap.system);
+                        let storage = bootstrap.storage_status.as_ref().map(Arc::clone);
                         let torrents = bootstrap.torrents.as_ref().map(Arc::clone);
                         let mutations = Arc::clone(&bootstrap.mutations);
                         let qbit_startup_problem =
@@ -115,6 +116,7 @@ pub async fn run(runtime_override: Option<PathBuf>) -> Result<()> {
                                 connection,
                                 runtime,
                                 system,
+                                storage,
                                 torrents,
                                 mutations,
                                 qbit_startup_problem,
