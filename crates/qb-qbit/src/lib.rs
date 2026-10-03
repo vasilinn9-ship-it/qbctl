@@ -390,7 +390,7 @@ impl TorrentClient for QbitClient {
         Box::pin(async move { self.list_inner().await.map_err(map_port_error) })
     }
 
-    fn get(&self, id: &TorrentId) -> PortFuture<'_, Option<TorrentView>> {
+    fn get<'a>(&'a self, id: &'a TorrentId) -> PortFuture<'a, Option<TorrentView>> {
         Box::pin(async move { self.get_inner(id).await.map_err(map_port_error) })
     }
 
@@ -410,15 +410,15 @@ impl TorrentClient for QbitClient {
         })
     }
 
-    fn trackers(&self, id: &TorrentId) -> PortFuture<'_, Vec<TrackerEvidence>> {
+    fn trackers<'a>(&'a self, id: &'a TorrentId) -> PortFuture<'a, Vec<TrackerEvidence>> {
         Box::pin(async move { self.trackers_inner(id).await.map_err(map_port_error) })
     }
 
-    fn stop(&self, id: &TorrentId) -> EffectFuture<'_> {
+    fn stop<'a>(&'a self, id: &'a TorrentId) -> EffectFuture<'a> {
         Box::pin(async move { self.stop_inner(id).await })
     }
 
-    fn start(&self, id: &TorrentId) -> EffectFuture<'_> {
+    fn start<'a>(&'a self, id: &'a TorrentId) -> EffectFuture<'a> {
         Box::pin(async move { self.start_inner(id).await })
     }
 
