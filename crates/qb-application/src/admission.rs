@@ -616,7 +616,6 @@ fn admission_problem_code(code: &str) -> &'static str {
     }
 }
 
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapacityReservation {
     pub responsible: String,
