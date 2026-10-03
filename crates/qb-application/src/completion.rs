@@ -348,10 +348,7 @@ fn normalize_qbit_path(value: &str) -> Result<String, PortError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::BTreeMap,
-        sync::{Arc, Mutex},
-    };
+    use std::sync::{Arc, Mutex};
 
     use qb_domain::torrent::{
         ManifestFile, TorrentManifest, TorrentState,
@@ -363,8 +360,8 @@ mod tests {
             FileIdentity, IncomingDeleteOutcome, IncomingFileSnapshot, StorageVolumeStatus,
         },
         torrent::{
-            AddTorrentRequest, ConnectionStatus, EffectAttempt, EffectFuture, NetworkPreferences,
-            PortFuture, QbitProbe, QueueSettings, TrackerEvidence, TransferInfo,
+            AddTorrentRequest, EffectAttempt, EffectFuture, NetworkPreferences, PortFuture,
+            QbitProbe, QueueSettings, TrackerEvidence, TransferInfo,
         },
     };
 
@@ -432,22 +429,24 @@ mod tests {
     }
 
     struct FakeStorage {
-        files: Mutex<BTreeMap<(ManagedRoot, String), FileEvidence>>,
+        files: Mutex<Vec<(ManagedRoot, String, FileEvidence)>>,
     }
 
     impl FakeStorage {
         fn populated() -> Arc<Self> {
-            let mut files = BTreeMap::new();
-            files.insert(
-                (ManagedRoot::Working, "dir/a.bin".into()),
-                evidence(2, 10),
-            );
-            files.insert(
-                (ManagedRoot::Working, "dir/b.bin".into()),
-                evidence(3, 20),
-            );
             Arc::new(Self {
-                files: Mutex::new(files),
+                files: Mutex::new(vec![
+                    (
+                        ManagedRoot::Working,
+                        "dir/a.bin".into(),
+                        evidence(2, 2, 10),
+                    ),
+                    (
+                        ManagedRoot::Working,
+                        "dir/b.bin".into(),
+                        evidence(2, 3, 20),
+                    ),
+                ]),
             })
         }
     }
@@ -488,8 +487,11 @@ mod tests {
                 .files
                 .lock()
                 .expect("files mutex")
-                .get(&(root, relative_path.to_string()))
-                .cloned())
+                .iter()
+                .find(|(candidate_root, candidate_path, _)| {
+                    *candidate_root == root && candidate_path == relative_path
+                })
+                .map(|(_, _, evidence)| evidence.clone()))
         }
 
         fn list_incoming(&self) -> Result<Vec<String>, PortError> {
@@ -506,7 +508,7 @@ mod tests {
             }
             Ok(IncomingFileSnapshot {
                 relative_path: relative_path.into(),
-                evidence: evidence(1, 8),
+                evidence: evidence(1, 1, 8),
                 bytes: b"metainfo".to_vec(),
             })
         }
@@ -643,12 +645,9 @@ mod tests {
         }
     }
 
-    fn evidence(file_id: u64, size: u64) -> FileEvidence {
+    fn evidence(volume_id: u64, file_id: u64, size: u64) -> FileEvidence {
         FileEvidence {
-            identity: FileIdentity {
-                volume_id: 1,
-                file_id,
-            },
+            identity: FileIdentity { volume_id, file_id },
             size,
             modified_marker: 1,
         }
@@ -707,10 +706,11 @@ mod tests {
             .files
             .lock()
             .expect("files mutex")
-            .insert(
-                (ManagedRoot::Completed, "dir/a.bin".into()),
-                evidence(9, 10),
-            );
+            .push((
+                ManagedRoot::Completed,
+                "dir/a.bin".into(),
+                evidence(2, 9, 10),
+            ));
 
         let error = service(storage, FakeClient::complete())
             .preflight(&request())
@@ -724,8 +724,4 @@ mod tests {
         PortError::new("UNUSED", "unused in completion preflight test")
     }
 
-    #[test]
-    fn connection_status_import_remains_typed() {
-        assert_eq!(ConnectionStatus::Unknown, ConnectionStatus::Unknown);
-    }
 }
