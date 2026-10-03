@@ -158,11 +158,18 @@ pub async fn dispatch(
                     "completion operation service unavailable",
                 );
             };
+            let recovery_request_id = match require_request_id(request_id.as_deref()) {
+                Ok(value) => value,
+                Err(error) => return invalid_request(sequence, request_id, &error),
+            };
             let operation_id = match OperationId::new(command.operation_id) {
                 Ok(value) => value,
                 Err(error) => return invalid_request(sequence, request_id, &error.to_string()),
             };
-            match service.recover_operation(&operation_id).await {
+            match service
+                .recover_operation(&operation_id, &recovery_request_id)
+                .await
+            {
                 Ok(Some(execution)) => {
                     completion_execution_response(sequence, request_id, execution)
                 }
