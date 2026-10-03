@@ -103,6 +103,54 @@ impl TorrentIdentity {
     pub const fn is_hybrid(&self) -> bool {
         self.v1.is_some() && self.v2.is_some()
     }
+
+    pub fn shares_alias_with(&self, other: &Self) -> bool {
+        self.v1
+            .zip(other.v1)
+            .is_some_and(|(left, right)| left == right)
+            || self
+                .v2
+                .zip(other.v2)
+                .is_some_and(|(left, right)| left == right)
+    }
+
+    pub fn qbit_selector_ids(&self) -> Vec<TorrentId> {
+        let mut ids = Vec::with_capacity(2);
+
+        if let Some(v2) = self.v2 {
+            ids.push(
+                TorrentId::new(hex_lower(&v2))
+                    .expect("SHA-256 info hash always forms a valid qBittorrent selector"),
+            );
+        } else if let Some(v1) = self.v1 {
+            ids.push(
+                TorrentId::new(hex_lower(&v1))
+                    .expect("SHA-1 info hash always forms a valid qBittorrent selector"),
+            );
+        }
+
+        if self.v2.is_some() {
+            if let Some(v1) = self.v1 {
+                let alternate = TorrentId::new(hex_lower(&v1))
+                    .expect("SHA-1 info hash always forms a valid qBittorrent selector");
+                if ids.iter().all(|id| id != &alternate) {
+                    ids.push(alternate);
+                }
+            }
+        }
+
+        ids
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -154,6 +202,61 @@ mod tests {
     fn torrent_id_rejects_non_hash_input() {
         assert!(TorrentId::new("not-a-hash").is_err());
         assert!(TorrentId::new("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").is_err());
+    }
+
+    #[test]
+    fn torrent_identity_matches_any_shared_v1_or_v2_alias() {
+        let v1 = [0x11; 20];
+        let v2 = [0x22; 32];
+        let v1_only = TorrentIdentity::new(Some(v1), None).expect("v1");
+        let v2_only = TorrentIdentity::new(None, Some(v2)).expect("v2");
+        let hybrid = TorrentIdentity::new(Some(v1), Some(v2)).expect("hybrid");
+        let other = TorrentIdentity::new(Some([0x33; 20]), Some([0x44; 32])).expect("other");
+
+        assert!(v1_only.shares_alias_with(&hybrid));
+        assert!(v2_only.shares_alias_with(&hybrid));
+        assert!(!v1_only.shares_alias_with(&v2_only));
+        assert!(!hybrid.shares_alias_with(&other));
+    }
+
+    #[test]
+    fn torrent_identity_exposes_qbit_primary_and_hybrid_alternate_ids() {
+        let v1 = [0x11; 20];
+        let mut v2 = [0x22; 32];
+        v2[20] = 0x33;
+
+        let v1_only = TorrentIdentity::new(Some(v1), None).expect("v1");
+        assert_eq!(
+            v1_only
+                .qbit_selector_ids()
+                .iter()
+                .map(TorrentId::as_str)
+                .collect::<Vec<_>>(),
+            vec!["1111111111111111111111111111111111111111"]
+        );
+
+        let v2_only = TorrentIdentity::new(None, Some(v2)).expect("v2");
+        assert_eq!(
+            v2_only
+                .qbit_selector_ids()
+                .iter()
+                .map(TorrentId::as_str)
+                .collect::<Vec<_>>(),
+            vec!["2222222222222222222222222222222222222222"]
+        );
+
+        let hybrid = TorrentIdentity::new(Some(v1), Some(v2)).expect("hybrid");
+        assert_eq!(
+            hybrid
+                .qbit_selector_ids()
+                .iter()
+                .map(TorrentId::as_str)
+                .collect::<Vec<_>>(),
+            vec![
+                "2222222222222222222222222222222222222222",
+                "1111111111111111111111111111111111111111",
+            ]
+        );
     }
 
     #[test]

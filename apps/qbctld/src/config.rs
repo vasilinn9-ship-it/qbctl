@@ -1,4 +1,7 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{bail, Context, Result};
 use qb_ipc::DEFAULT_PIPE;
@@ -8,6 +11,7 @@ use serde::Deserialize;
 pub struct Config {
     pub pipe: String,
     pub qbittorrent: Option<QbitConfig>,
+    pub storage: Option<StorageConfig>,
 }
 
 #[derive(Clone, Debug)]
@@ -18,12 +22,22 @@ pub struct QbitConfig {
     pub request_timeout_seconds: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct StorageConfig {
+    pub incoming: PathBuf,
+    pub archive: PathBuf,
+    pub working: PathBuf,
+    pub completed: PathBuf,
+    pub cleanup_exact_duplicates_on_startup: bool,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     revision: Option<u32>,
     ipc: Option<IpcConfig>,
     qbittorrent: Option<FileQbitConfig>,
+    storage: Option<FileStorageConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -40,6 +54,16 @@ struct FileQbitConfig {
     credential: String,
     #[serde(default = "default_qbit_timeout")]
     request_timeout_seconds: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileStorageConfig {
+    incoming: PathBuf,
+    archive: PathBuf,
+    working: PathBuf,
+    completed: PathBuf,
+    cleanup_exact_duplicates_on_startup: bool,
 }
 
 const fn default_qbit_timeout() -> u64 {
@@ -73,6 +97,13 @@ impl Config {
                 username: qbit.username,
                 credential: qbit.credential,
                 request_timeout_seconds: qbit.request_timeout_seconds,
+            }),
+            storage: file.storage.map(|storage| StorageConfig {
+                incoming: storage.incoming,
+                archive: storage.archive,
+                working: storage.working,
+                completed: storage.completed,
+                cleanup_exact_duplicates_on_startup: storage.cleanup_exact_duplicates_on_startup,
             }),
         };
 
@@ -159,5 +190,25 @@ request_timeout_seconds = 4
         let qbit = config.qbittorrent.expect("qB section");
         assert_eq!(qbit.username, "admin");
         assert_eq!(qbit.credential, "qbctl/qbittorrent");
+    }
+
+    #[test]
+    fn parses_explicit_managed_storage_cleanup_policy() {
+        let config = toml::from_str::<FileConfig>(
+            r#"
+revision = 1
+[storage]
+incoming = "C:\\Managed\\Incoming"
+archive = "C:\\Managed\\Archive"
+working = "C:\\Managed\\Working"
+completed = "C:\\Managed\\Completed"
+cleanup_exact_duplicates_on_startup = true
+"#,
+        )
+        .expect("storage config");
+
+        let storage = config.storage.expect("storage section");
+        assert_eq!(storage.incoming, PathBuf::from(r"C:\Managed\Incoming"));
+        assert!(storage.cleanup_exact_duplicates_on_startup);
     }
 }

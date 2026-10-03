@@ -1,4 +1,5 @@
 use qb_application::{
+    storage::{ManagedRoot, ManagedRootStatus, StorageStatusSnapshot},
     system::{
         DaemonPhase, DoctorReport as ApplicationDoctorReport,
         SystemStatus as ApplicationSystemStatus,
@@ -9,9 +10,10 @@ use qb_application::{
 };
 use qb_domain::torrent::TorrentState;
 use qb_proto::v1::{
-    DaemonState, DoctorCheck, DoctorResponse, QbitProbeResponse, QueueSettingsResponse,
-    StatusResponse, TorrentListResponse, TorrentStateView, TorrentSummary, TrackerEvidenceView,
-    TrackerStatusView, TransferLimitsResponse,
+    DaemonState, DoctorCheck, DoctorResponse, IncomingStatusEntry, ManagedRootView,
+    QbitProbeResponse, QueueSettingsResponse, StatusResponse, StorageListResponse, StorageRootView,
+    StorageStatusResponse, TorrentListResponse, TorrentStateView, TorrentSummary,
+    TrackerEvidenceView, TrackerStatusView, TransferLimitsResponse,
 };
 
 pub fn daemon_state(phase: DaemonPhase) -> DaemonState {
@@ -34,6 +36,111 @@ pub fn system_status(status: ApplicationSystemStatus) -> StatusResponse {
         schema_version: status.schema_version,
         mutation_admission_enabled: status.mutation_admission_enabled,
     }
+}
+
+pub fn storage_list(roots: Vec<ManagedRootStatus>) -> StorageListResponse {
+    StorageListResponse {
+        roots: roots.into_iter().map(storage_root).collect(),
+    }
+}
+
+pub fn storage_status(status: StorageStatusSnapshot) -> StorageStatusResponse {
+    let eligible_count = saturating_u32(status.incoming.eligible.len());
+    let already_processed_count = saturating_u32(status.incoming.already_processed.len());
+    let redundant_identical_count = saturating_u32(status.incoming.redundant_identical.len());
+    let rejected_count = saturating_u32(status.incoming.rejected.len());
+
+    let mut incoming = Vec::with_capacity(
+        status.incoming.eligible.len()
+            + status.incoming.already_processed.len()
+            + status.incoming.redundant_identical.len()
+            + status.incoming.rejected.len(),
+    );
+
+    incoming.extend(
+        status
+            .incoming
+            .eligible
+            .into_iter()
+            .map(|entry| IncomingStatusEntry {
+                relative_path: entry.relative_path,
+                classification: "eligible".into(),
+                registry_id: None,
+                problem_code: None,
+                detail: None,
+            }),
+    );
+    incoming.extend(status.incoming.already_processed.into_iter().map(|entry| {
+        IncomingStatusEntry {
+            relative_path: entry.relative_path,
+            classification: "already_processed".into(),
+            registry_id: Some(entry.registry_id),
+            problem_code: None,
+            detail: Some(format!(
+                "state={:?}; source={}",
+                entry.registry_state, entry.registered_source_relative
+            )),
+        }
+    }));
+    incoming.extend(
+        status
+            .incoming
+            .redundant_identical
+            .into_iter()
+            .map(|entry| IncomingStatusEntry {
+                relative_path: entry.redundant_path,
+                classification: "redundant_identical".into(),
+                registry_id: None,
+                problem_code: None,
+                detail: Some(format!("canonical={}", entry.canonical_path)),
+            }),
+    );
+    incoming.extend(
+        status
+            .incoming
+            .rejected
+            .into_iter()
+            .map(|entry| IncomingStatusEntry {
+                relative_path: entry.relative_path,
+                classification: "rejected".into(),
+                registry_id: None,
+                problem_code: Some(entry.problem_code.into()),
+                detail: Some(entry.message),
+            }),
+    );
+
+    StorageStatusResponse {
+        roots: status.roots.into_iter().map(storage_root).collect(),
+        eligible_count,
+        already_processed_count,
+        redundant_identical_count,
+        rejected_count,
+        incoming,
+    }
+}
+
+fn storage_root(value: ManagedRootStatus) -> StorageRootView {
+    StorageRootView {
+        root: managed_root(value.root) as i32,
+        path: value.path,
+        volume_id: value.volume_id,
+        free_bytes: value.free_bytes,
+        total_bytes: value.total_bytes,
+    }
+}
+
+fn managed_root(root: ManagedRoot) -> ManagedRootView {
+    match root {
+        ManagedRoot::Incoming => ManagedRootView::Incoming,
+        ManagedRoot::Archive => ManagedRootView::Archive,
+        ManagedRoot::Working => ManagedRootView::Working,
+        ManagedRoot::Completed => ManagedRootView::Completed,
+        ManagedRoot::Runtime => ManagedRootView::Unspecified,
+    }
+}
+
+fn saturating_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 pub fn doctor(report: ApplicationDoctorReport) -> DoctorResponse {

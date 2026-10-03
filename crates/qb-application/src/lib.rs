@@ -1,4 +1,10 @@
+pub mod admission;
+pub mod cleanup;
+pub mod incoming;
 pub mod mutation;
+pub mod registry;
+pub mod release;
+pub mod storage;
 pub mod system;
 pub mod torrent;
 

@@ -35,6 +35,47 @@ message StatusResponse {
   bool mutation_admission_enabled = 4;
 }
 
+enum ManagedRootView {
+  MANAGED_ROOT_VIEW_UNSPECIFIED = 0;
+  MANAGED_ROOT_VIEW_INCOMING = 1;
+  MANAGED_ROOT_VIEW_ARCHIVE = 2;
+  MANAGED_ROOT_VIEW_WORKING = 3;
+  MANAGED_ROOT_VIEW_COMPLETED = 4;
+}
+
+message StorageRootView {
+  ManagedRootView root = 1;
+  string path = 2;
+  uint64 volume_id = 3;
+  uint64 free_bytes = 4;
+  uint64 total_bytes = 5;
+}
+
+message StorageListRequest {}
+
+message StorageListResponse {
+  repeated StorageRootView roots = 1;
+}
+
+message StorageStatusRequest {}
+
+message IncomingStatusEntry {
+  string relative_path = 1;
+  string classification = 2;
+  optional string registry_id = 3;
+  optional string problem_code = 4;
+  optional string detail = 5;
+}
+
+message StorageStatusResponse {
+  repeated StorageRootView roots = 1;
+  uint32 eligible_count = 2;
+  uint32 already_processed_count = 3;
+  uint32 redundant_identical_count = 4;
+  uint32 rejected_count = 5;
+  repeated IncomingStatusEntry incoming = 6;
+}
+
 message DoctorRequest {}
 
 message DoctorCheck {
@@ -68,6 +109,8 @@ message Request {
     SetActiveDownloadsRequest queue_downloads_set = 34;
     SetDownloadLimitRequest transfer_download_limit_set = 35;
     SetUploadLimitRequest transfer_upload_limit_set = 36;
+    StorageListRequest storage_list = 37;
+    StorageStatusRequest storage_status = 38;
   }
 }
 
@@ -92,5 +135,7 @@ message Response {
     QueueTargetResponse queue_target = 28;
     MutationResultResponse mutation_result = 29;
     TorrentDiagnoseResponse torrent_diagnose = 30;
+    StorageListResponse storage_list = 31;
+    StorageStatusResponse storage_status = 32;
   }
 }

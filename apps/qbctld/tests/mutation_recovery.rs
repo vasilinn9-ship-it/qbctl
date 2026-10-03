@@ -73,6 +73,7 @@ impl TorrentClient for FakeTorrentClient {
             Ok(Some(TorrentView {
                 id: id.clone(),
                 name: "fixture".into(),
+                save_path: r"C:\Working".into(),
                 state: self.torrent_state(),
                 total_bytes: 100,
                 remaining_bytes: 50,
@@ -134,6 +135,18 @@ impl TorrentClient for FakeTorrentClient {
 
     fn files<'a>(&'a self, _id: &'a TorrentId) -> PortFuture<'a, Vec<FileObservation>> {
         Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn add_torrent<'a>(
+        &'a self,
+        _request: &'a qb_application::torrent::AddTorrentRequest,
+    ) -> EffectFuture<'a> {
+        Box::pin(async {
+            EffectAttempt::NotSent(PortError::new(
+                "QBIT_MUTATION_REJECTED",
+                "fixture does not support add",
+            ))
+        })
     }
 
     fn stop<'a>(&'a self, _id: &'a TorrentId) -> EffectFuture<'a> {

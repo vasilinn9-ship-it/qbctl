@@ -5,7 +5,9 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use qb_application::{
+    cleanup::IncomingCleanupState,
     mutation::MutationExecutionStatus,
+    release::ReleaseExecutionStatus,
     system::{DaemonPhase, RuntimeHealthPort, RuntimeSnapshot},
     PortError,
 };
@@ -104,6 +106,7 @@ pub async fn run(runtime_override: Option<PathBuf>) -> Result<()> {
                     Ok(connection) => {
                         let runtime = Arc::clone(&bootstrap.runtime);
                         let system = Arc::clone(&bootstrap.system);
+                        let storage = bootstrap.storage_status.as_ref().map(Arc::clone);
                         let torrents = bootstrap.torrents.as_ref().map(Arc::clone);
                         let mutations = Arc::clone(&bootstrap.mutations);
                         let qbit_startup_problem =
@@ -113,6 +116,7 @@ pub async fn run(runtime_override: Option<PathBuf>) -> Result<()> {
                                 connection,
                                 runtime,
                                 system,
+                                storage,
                                 torrents,
                                 mutations,
                                 qbit_startup_problem,
@@ -166,6 +170,91 @@ async fn initialize_runtime(bootstrap: &bootstrap::Bootstrap) {
             "one or more durable mutations remain unresolved after startup recovery"
         );
         return;
+    }
+
+    if let Some(incoming) = bootstrap.incoming.as_ref() {
+        let recovered = match incoming.recover_cleanup().await {
+            Ok(records) => records,
+            Err(error) => {
+                bootstrap.runtime.set_phase(DaemonPhase::Degraded);
+                error!(error = %error, "startup Incoming cleanup recovery failed");
+                return;
+            }
+        };
+        let recovered_blocked = recovered
+            .iter()
+            .filter(|record| record.state == IncomingCleanupState::Blocked)
+            .count();
+        if recovered_blocked > 0 {
+            warn!(
+                recovered_blocked,
+                "one or more Incoming cleanup intents were blocked by changed source evidence"
+            );
+        }
+
+        if bootstrap
+            .config
+            .storage
+            .as_ref()
+            .is_some_and(|storage| storage.cleanup_exact_duplicates_on_startup)
+        {
+            let pass = match incoming.run_once().await {
+                Ok(pass) => pass,
+                Err(error) => {
+                    bootstrap.runtime.set_phase(DaemonPhase::Degraded);
+                    error!(error = %error, "startup Incoming scan/cleanup failed");
+                    return;
+                }
+            };
+            let cleanup_deleted = pass
+                .cleanup
+                .iter()
+                .filter(|record| record.state == IncomingCleanupState::Deleted)
+                .count();
+            let cleanup_blocked = pass
+                .cleanup
+                .iter()
+                .filter(|record| record.state == IncomingCleanupState::Blocked)
+                .count();
+            info!(
+                eligible = pass.scan.eligible.len(),
+                already_processed = pass.scan.already_processed.len(),
+                redundant_exact = pass.scan.redundant_identical.len(),
+                rejected = pass.scan.rejected.len(),
+                cleanup_deleted,
+                cleanup_blocked,
+                "startup Incoming scan/cleanup completed"
+            );
+        }
+    }
+
+    if let Some(release) = bootstrap.release.as_ref() {
+        let recovered = match release.recover_all().await {
+            Ok(results) => results,
+            Err(error) => {
+                bootstrap.runtime.set_phase(DaemonPhase::Degraded);
+                error!(error = %error, "startup queue release recovery failed");
+                return;
+            }
+        };
+        let unresolved = recovered
+            .iter()
+            .filter(|execution| execution.status != ReleaseExecutionStatus::Finished)
+            .count();
+        if unresolved > 0 {
+            bootstrap.runtime.set_phase(DaemonPhase::Degraded);
+            warn!(
+                unresolved,
+                "one or more durable queue releases remain unresolved after observation-first recovery"
+            );
+            return;
+        }
+        if !recovered.is_empty() {
+            info!(
+                recovered = recovered.len(),
+                "startup durable queue release recovery completed"
+            );
+        }
     }
 
     let Some(torrents) = bootstrap.torrents.as_ref() else {

@@ -1,5 +1,5 @@
 pub const PROTOCOL_MAJOR: u32 = 1;
-pub const PROTOCOL_MINOR: u32 = 0;
+pub const PROTOCOL_MINOR: u32 = 1;
 
 pub mod v1 {
     include!(concat!(env!("OUT_DIR"), "/qbctl.v1.rs"));

@@ -1,6 +1,7 @@
-use std::{env, time::Duration};
+use std::{env, fs, path::PathBuf, time::Duration};
 
-use qb_application::torrent::TorrentClient;
+use qb_application::torrent::{AddTorrentRequest, EffectAttempt, TorrentClient};
+use qb_domain::torrent::{TorrentId, TorrentState};
 use qb_qbit::{QbitClient, QbitCredentials};
 
 #[tokio::test]
@@ -56,4 +57,81 @@ async fn disposable_qbittorrent_authenticates_and_probes() {
         .await
         .expect("real network preferences");
     assert!(network.listen_port > 0, "real listen port must be non-zero");
+
+    let mut metainfo =
+        b"d4:infod6:lengthi4e4:name8:file.bin12:piece lengthi16384e6:pieces20:".to_vec();
+    metainfo.extend_from_slice(&[0_u8; 20]);
+    metainfo.extend_from_slice(b"ee");
+    let request = AddTorrentRequest {
+        metainfo,
+        save_path: "/downloads".into(),
+        stopped: true,
+    };
+    assert!(matches!(
+        client.add_torrent(&request).await,
+        EffectAttempt::Accepted
+    ));
+
+    let id =
+        TorrentId::new("9a3b4b94ae398193bcc849dd8b2024f607c5c27a").expect("fixture torrent id");
+    let mut last_observed = None;
+    for _ in 0..50 {
+        if let Some(torrent) = client.get(&id).await.expect("observe added torrent") {
+            let save_path_matches = torrent.save_path.trim_end_matches('/') == "/downloads";
+            let stopped = torrent.state == TorrentState::Stopped;
+            last_observed = Some(torrent);
+            if stopped && save_path_matches {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let observed = last_observed.expect("added torrent must become observable");
+    assert_eq!(observed.id, id);
+    assert_eq!(
+        observed.state,
+        TorrentState::Stopped,
+        "added torrent did not settle into stopped state"
+    );
+    assert_eq!(
+        observed.save_path.trim_end_matches('/'),
+        "/downloads",
+        "added torrent did not settle on the managed save path"
+    );
+
+    let downloads =
+        PathBuf::from(env::var("QBCTL_QBIT_DOWNLOADS_HOST").expect("QBCTL_QBIT_DOWNLOADS_HOST"));
+    let payload = downloads.join("file.bin");
+    let partial_bytes = b"partial-payload-retained-by-release";
+    fs::write(&payload, partial_bytes).expect("write partial payload fixture");
+    assert_eq!(
+        fs::read(&payload).expect("read partial payload before release"),
+        partial_bytes
+    );
+
+    assert!(matches!(
+        client.remove_keep_files(&id).await,
+        EffectAttempt::Accepted
+    ));
+
+    let mut removed = false;
+    for _ in 0..50 {
+        if client
+            .get(&id)
+            .await
+            .expect("observe removed torrent")
+            .is_none()
+        {
+            removed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(removed, "released qBittorrent record remained observable");
+    assert_eq!(
+        fs::read(&payload).expect("partial payload must survive qBittorrent record removal"),
+        partial_bytes,
+        "deleteFiles=false must preserve partial payload bytes"
+    );
 }
