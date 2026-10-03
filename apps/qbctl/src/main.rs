@@ -8,8 +8,9 @@ use prost::Message;
 use qb_ipc::{ClientConnection, IpcError, DEFAULT_PIPE};
 use qb_proto::{
     v1::{
-        request, response, CapabilitiesRequest, ClientHello, DaemonState, DoctorRequest, Request,
-        Response, ServerHello, Status, StatusRequest,
+        request, response, CapabilitiesRequest, ClientHello, DaemonState, DoctorRequest,
+        QbitProbeRequest, QueueGetRequest, Request, Response, ServerHello, Status, StatusRequest,
+        TorrentGetRequest, TorrentListRequest, TorrentStateView, TransferLimitsGetRequest,
     },
     PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
@@ -41,11 +42,56 @@ enum Command {
         #[command(subcommand)]
         command: DaemonCommand,
     },
+    Qbit {
+        #[command(subcommand)]
+        command: QbitCommand,
+    },
+    Torrent {
+        #[command(subcommand)]
+        command: TorrentCommand,
+    },
+    Queue {
+        #[command(subcommand)]
+        command: QueueCommand,
+    },
+    Transfer {
+        #[command(subcommand)]
+        command: TransferCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum DaemonCommand {
     Status,
+}
+
+#[derive(Debug, Subcommand)]
+enum QbitCommand {
+    Status,
+}
+
+#[derive(Debug, Subcommand)]
+enum TorrentCommand {
+    List,
+    Get { torrent_id: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum QueueCommand {
+    Get,
+}
+
+#[derive(Debug, Subcommand)]
+enum TransferCommand {
+    Limits {
+        #[command(subcommand)]
+        command: TransferLimitsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TransferLimitsCommand {
+    Get,
 }
 
 #[derive(Debug, Error)]
@@ -100,7 +146,7 @@ async fn execute(cli: Cli) -> Result<Response, CliError> {
         protocol_major: PROTOCOL_MAJOR,
         protocol_minor: PROTOCOL_MINOR,
         client_version: env!("CARGO_PKG_VERSION").to_string(),
-        capabilities: vec!["status.v1".into()],
+        capabilities: vec!["status.v1".into(), "torrent.read.v1".into()],
     };
     connection.send_frame(client_hello.encode_to_vec()).await?;
 
@@ -119,6 +165,24 @@ async fn execute(cli: Cli) -> Result<Response, CliError> {
             command: DaemonCommand::Status,
         } => request::Command::Status(StatusRequest {}),
         Command::Doctor => request::Command::Doctor(DoctorRequest {}),
+        Command::Qbit {
+            command: QbitCommand::Status,
+        } => request::Command::QbitProbe(QbitProbeRequest {}),
+        Command::Torrent {
+            command: TorrentCommand::List,
+        } => request::Command::TorrentList(TorrentListRequest {}),
+        Command::Torrent {
+            command: TorrentCommand::Get { torrent_id },
+        } => request::Command::TorrentGet(TorrentGetRequest { torrent_id }),
+        Command::Queue {
+            command: QueueCommand::Get,
+        } => request::Command::QueueGet(QueueGetRequest {}),
+        Command::Transfer {
+            command:
+                TransferCommand::Limits {
+                    command: TransferLimitsCommand::Get,
+                },
+        } => request::Command::TransferLimitsGet(TransferLimitsGetRequest {}),
     };
 
     let request = Request {
@@ -180,6 +244,78 @@ fn render_human(response: &Response) -> Result<(), CliError> {
                 );
             }
         }
+        Some(response::Payload::QbitProbe(value)) => {
+            println!(
+                "qBittorrent {} · WebAPI {} · mutations {}",
+                value.application_version,
+                value.webapi_version,
+                if value.mutation_ready {
+                    "supported"
+                } else {
+                    "disabled"
+                }
+            );
+        }
+        Some(response::Payload::TorrentList(value)) => {
+            println!("{} torrent(s)", value.torrents.len());
+            for torrent in &value.torrents {
+                println!(
+                    "{} {} {:>6.2}% {}",
+                    torrent.id,
+                    torrent_state_name(torrent.state),
+                    f64::from(torrent.progress_ppm) / 10_000.0,
+                    torrent.name
+                );
+            }
+        }
+        Some(response::Payload::TorrentGet(value)) => {
+            if let Some(torrent) = value.torrent.as_ref() {
+                println!("{} {}", torrent.id, torrent.name);
+                println!("  state: {}", torrent_state_name(torrent.state));
+                println!(
+                    "  progress: {:.2}% · remaining: {} bytes",
+                    f64::from(torrent.progress_ppm) / 10_000.0,
+                    torrent.remaining_bytes
+                );
+                println!(
+                    "  rates: down {} B/s · up {} B/s",
+                    torrent.download_rate_bps, torrent.upload_rate_bps
+                );
+                println!(
+                    "  peers: {}/{} · seeds: {}/{}",
+                    torrent.peers_connected,
+                    torrent.peers_known,
+                    torrent.seeds_connected,
+                    torrent.seeds_known
+                );
+            }
+        }
+        Some(response::Payload::QueueSettings(value)) => {
+            println!(
+                "queueing {} · active downloads {} · active torrents {} · slow torrents {}",
+                if value.queueing_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                value.max_active_downloads,
+                value.max_active_torrents,
+                if value.dont_count_slow_torrents {
+                    "not counted"
+                } else {
+                    "counted"
+                }
+            );
+        }
+        Some(response::Payload::TransferLimits(value)) => {
+            println!(
+                "download limit {} B/s · upload limit {} B/s · current {} / {} B/s",
+                value.download_limit_bps,
+                value.upload_limit_bps,
+                value.observed_download_rate_bps,
+                value.observed_upload_rate_bps
+            );
+        }
         None => {}
     }
 
@@ -213,10 +349,85 @@ fn render_fields(response: &Response) -> Result<(), CliError> {
             println!("check_count={}", value.checks.len());
             println!("checks_ok={}", value.checks.iter().all(|check| check.ok));
         }
+        Some(response::Payload::QbitProbe(value)) => {
+            println!("application_version={}", value.application_version);
+            println!("webapi_version={}", value.webapi_version);
+            println!("mutation_ready={}", value.mutation_ready);
+        }
+        Some(response::Payload::TorrentList(value)) => {
+            println!("torrent_count={}", value.torrents.len());
+            for (index, torrent) in value.torrents.iter().enumerate() {
+                print_torrent_fields(index, torrent);
+            }
+        }
+        Some(response::Payload::TorrentGet(value)) => {
+            println!("torrent_present={}", value.torrent.is_some());
+            if let Some(torrent) = value.torrent.as_ref() {
+                print_torrent_fields(0, torrent);
+            }
+        }
+        Some(response::Payload::QueueSettings(value)) => {
+            println!("queueing_enabled={}", value.queueing_enabled);
+            println!("max_active_downloads={}", value.max_active_downloads);
+            println!("max_active_torrents={}", value.max_active_torrents);
+            println!(
+                "dont_count_slow_torrents={}",
+                value.dont_count_slow_torrents
+            );
+        }
+        Some(response::Payload::TransferLimits(value)) => {
+            println!("download_limit_bps={}", value.download_limit_bps);
+            println!("upload_limit_bps={}", value.upload_limit_bps);
+            println!(
+                "observed_download_rate_bps={}",
+                value.observed_download_rate_bps
+            );
+            println!(
+                "observed_upload_rate_bps={}",
+                value.observed_upload_rate_bps
+            );
+        }
         None => {}
     }
 
     Ok(())
+}
+
+fn print_torrent_fields(index: usize, torrent: &qb_proto::v1::TorrentSummary) {
+    println!("torrent.{index}.id={}", torrent.id);
+    println!("torrent.{index}.name={}", sanitize_field(&torrent.name));
+    println!("torrent.{index}.state={}", torrent_state_name(torrent.state));
+    println!("torrent.{index}.total_bytes={}", torrent.total_bytes);
+    println!(
+        "torrent.{index}.remaining_bytes={}",
+        torrent.remaining_bytes
+    );
+    println!(
+        "torrent.{index}.download_rate_bps={}",
+        torrent.download_rate_bps
+    );
+    println!(
+        "torrent.{index}.upload_rate_bps={}",
+        torrent.upload_rate_bps
+    );
+    println!("torrent.{index}.progress_ppm={}", torrent.progress_ppm);
+    println!(
+        "torrent.{index}.peers_connected={}",
+        torrent.peers_connected
+    );
+    println!("torrent.{index}.peers_known={}", torrent.peers_known);
+    println!(
+        "torrent.{index}.seeds_connected={}",
+        torrent.seeds_connected
+    );
+    println!("torrent.{index}.seeds_known={}", torrent.seeds_known);
+}
+
+fn sanitize_field(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !matches!(character, '\r' | '\n' | '='))
+        .collect()
 }
 
 fn status_name(value: i32) -> &'static str {
@@ -228,6 +439,12 @@ fn status_name(value: i32) -> &'static str {
 fn daemon_state_name(value: i32) -> &'static str {
     DaemonState::try_from(value)
         .unwrap_or(DaemonState::Unspecified)
+        .as_str_name()
+}
+
+fn torrent_state_name(value: i32) -> &'static str {
+    TorrentStateView::try_from(value)
+        .unwrap_or(TorrentStateView::Unknown)
         .as_str_name()
 }
 
