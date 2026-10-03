@@ -3630,6 +3630,12 @@ fn load_completion_record(
                 source_modified_marker,
                 handoff_strategy,
                 state,
+                destination_volume_id,
+                destination_file_id,
+                destination_size,
+                destination_modified_marker,
+                destination_sha256,
+                problem_code,
                 revision
          FROM operation_files
          WHERE operation_id = ?1
@@ -3646,7 +3652,13 @@ fn load_completion_record(
             row.get::<_, Vec<u8>>(6)?,
             row.get::<_, String>(7)?,
             row.get::<_, String>(8)?,
-            row.get::<_, u64>(9)?,
+            row.get::<_, Option<Vec<u8>>>(9)?,
+            row.get::<_, Option<Vec<u8>>>(10)?,
+            row.get::<_, Option<Vec<u8>>>(11)?,
+            row.get::<_, Option<Vec<u8>>>(12)?,
+            row.get::<_, Option<Vec<u8>>>(13)?,
+            row.get::<_, Option<String>>(14)?,
+            row.get::<_, u64>(15)?,
         ))
     })?;
 
@@ -3662,6 +3674,12 @@ fn load_completion_record(
             source_modified_marker,
             strategy,
             state,
+            destination_volume_id,
+            destination_file_id,
+            destination_size,
+            destination_modified_marker,
+            destination_sha256,
+            problem_code,
             revision,
         ) = row?;
         let index = u32::try_from(file_index)
@@ -3689,6 +3707,24 @@ fn load_completion_record(
             },
             strategy,
             state,
+            destination_evidence: decode_optional_file_evidence(
+                destination_volume_id.as_deref(),
+                destination_file_id.as_deref(),
+                destination_size.as_deref(),
+                destination_modified_marker.as_deref(),
+                "destination",
+            )?,
+            destination_sha256: destination_sha256
+                .map(|value| {
+                    value.try_into().map_err(|value: Vec<u8>| {
+                        JournalError::InvalidState(format!(
+                            "completion destination sha256 has {} bytes instead of 32",
+                            value.len()
+                        ))
+                    })
+                })
+                .transpose()?,
+            problem_code,
             revision,
         });
     }
@@ -4734,6 +4770,34 @@ fn load_admission_record(
         problem_code,
         revision,
     }))
+}
+
+fn decode_optional_file_evidence(
+    volume_id: Option<&[u8]>,
+    file_id: Option<&[u8]>,
+    size: Option<&[u8]>,
+    modified_marker: Option<&[u8]>,
+    prefix: &str,
+) -> Result<Option<qb_application::storage::FileEvidence>, JournalError> {
+    match (volume_id, file_id, size, modified_marker) {
+        (None, None, None, None) => Ok(None),
+        (Some(volume_id), Some(file_id), Some(size), Some(modified_marker)) => {
+            Ok(Some(qb_application::storage::FileEvidence {
+                identity: qb_application::storage::FileIdentity {
+                    volume_id: decode_u64_blob(volume_id, &format!("{prefix}_volume_id"))?,
+                    file_id: decode_u64_blob(file_id, &format!("{prefix}_file_id"))?,
+                },
+                size: decode_u64_blob(size, &format!("{prefix}_size"))?,
+                modified_marker: decode_u128_blob(
+                    modified_marker,
+                    &format!("{prefix}_modified_marker"),
+                )?,
+            }))
+        }
+        _ => Err(JournalError::InvalidState(format!(
+            "{prefix} evidence columns must be either all null or all present"
+        ))),
+    }
 }
 
 fn decode_u64_blob(bytes: &[u8], field: &str) -> Result<u64, JournalError> {
