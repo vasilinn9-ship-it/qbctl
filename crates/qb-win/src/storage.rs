@@ -11,7 +11,6 @@ use qb_application::{
     },
     PortError,
 };
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -324,14 +323,14 @@ impl Storage for ManagedStorage {
         &self,
         relative_path: &str,
         expected_evidence: &FileEvidence,
-        expected_sha256: &[u8; 32],
+        expected_bytes: &[u8],
         max_bytes: usize,
     ) -> Result<IncomingDeleteOutcome, PortError> {
         delete_incoming_exact(
             &self.roots,
             relative_path,
             expected_evidence,
-            expected_sha256,
+            expected_bytes,
             max_bytes,
         )
     }
@@ -361,7 +360,7 @@ fn delete_incoming_exact(
     roots: &ValidatedManagedRootLayout,
     relative_path: &str,
     expected_evidence: &FileEvidence,
-    expected_sha256: &[u8; 32],
+    expected_bytes: &[u8],
     max_bytes: usize,
 ) -> Result<IncomingDeleteOutcome, PortError> {
     use std::{mem::size_of, os::windows::io::AsRawHandle};
@@ -378,8 +377,8 @@ fn delete_incoming_exact(
         ));
     }
 
-    let refreshed =
-        validate_root(ManagedRootRole::Incoming, &roots.incoming).map_err(map_storage_port_error)?;
+    let refreshed = validate_root(ManagedRootRole::Incoming, &roots.incoming)
+        .map_err(map_storage_port_error)?;
     if !paths_equal(&refreshed, &roots.incoming) {
         return Err(PortError::new(
             "STORAGE_ROOT_CHANGED",
@@ -441,8 +440,7 @@ fn delete_incoming_exact(
     if before.size != u64::try_from(bytes.len()).unwrap_or(u64::MAX) {
         return Ok(IncomingDeleteOutcome::Changed);
     }
-    let digest: [u8; 32] = Sha256::digest(&bytes).into();
-    if &digest != expected_sha256 {
+    if bytes != expected_bytes {
         return Ok(IncomingDeleteOutcome::Changed);
     }
 
@@ -477,7 +475,7 @@ fn delete_incoming_exact(
     _roots: &ValidatedManagedRootLayout,
     _relative_path: &str,
     _expected_evidence: &FileEvidence,
-    _expected_sha256: &[u8; 32],
+    _expected_bytes: &[u8],
     _max_bytes: usize,
 ) -> Result<IncomingDeleteOutcome, PortError> {
     Err(PortError::new(
@@ -1105,14 +1103,12 @@ mod tests {
         let snapshot = storage
             .read_incoming("duplicate.torrent", 1024)
             .expect("snapshot");
-        let digest: [u8; 32] = Sha256::digest(&snapshot.bytes).into();
-
         assert_eq!(
             storage
                 .delete_incoming_exact(
                     "duplicate.torrent",
                     &snapshot.evidence,
-                    &digest,
+                    &snapshot.bytes,
                     1024,
                 )
                 .expect("delete"),
@@ -1121,12 +1117,7 @@ mod tests {
         assert!(!roots.incoming.join("duplicate.torrent").exists());
         assert_eq!(
             storage
-                .delete_incoming_exact(
-                    "duplicate.torrent",
-                    &snapshot.evidence,
-                    &digest,
-                    1024,
-                )
+                .delete_incoming_exact("duplicate.torrent", &snapshot.evidence, &snapshot.bytes, 1024)
                 .expect("observe absent"),
             IncomingDeleteOutcome::Missing
         );
@@ -1146,17 +1137,11 @@ mod tests {
         let snapshot = storage
             .read_incoming("duplicate.torrent", 1024)
             .expect("snapshot");
-        let digest: [u8; 32] = Sha256::digest(&snapshot.bytes).into();
         fs::write(&path, b"replacement-metainfo").expect("replace");
 
         assert_eq!(
             storage
-                .delete_incoming_exact(
-                    "duplicate.torrent",
-                    &snapshot.evidence,
-                    &digest,
-                    1024,
-                )
+                .delete_incoming_exact("duplicate.torrent", &snapshot.evidence, &snapshot.bytes, 1024)
                 .expect("changed"),
             IncomingDeleteOutcome::Changed
         );

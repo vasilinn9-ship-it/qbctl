@@ -86,10 +86,7 @@ pub trait IncomingCleanupJournal: Send + Sync {
 
     fn list_recoverable_cleanups(&self) -> Result<Vec<IncomingCleanupRecord>, PortError>;
 
-    fn mark_cleanup_deleted(
-        &self,
-        cleanup_id: &str,
-    ) -> Result<IncomingCleanupRecord, PortError>;
+    fn mark_cleanup_deleted(&self, cleanup_id: &str) -> Result<IncomingCleanupRecord, PortError>;
 
     fn mark_cleanup_blocked(
         &self,
@@ -147,24 +144,21 @@ impl IncomingCleanupService {
             .collect()
     }
 
-    fn advance(
-        &self,
-        record: IncomingCleanupRecord,
-    ) -> Result<IncomingCleanupRecord, PortError> {
+    fn advance(&self, record: IncomingCleanupRecord) -> Result<IncomingCleanupRecord, PortError> {
         if record.state != IncomingCleanupState::Prepared {
             return Ok(record);
         }
 
-        if !self.canonical_still_exact(&record.intent)? {
+        let Some(canonical_bytes) = self.canonical_exact_bytes(&record.intent)? else {
             return self
                 .journal
                 .mark_cleanup_blocked(&record.cleanup_id, "SOURCE_AMBIGUOUS");
-        }
+        };
 
         match self.storage.delete_incoming_exact(
             &record.intent.redundant_path,
             &record.intent.redundant_evidence,
-            &record.intent.source_sha256,
+            &canonical_bytes,
             self.max_metainfo_bytes,
         )? {
             IncomingDeleteOutcome::Deleted | IncomingDeleteOutcome::Missing => {
@@ -176,7 +170,10 @@ impl IncomingCleanupService {
         }
     }
 
-    fn canonical_still_exact(&self, intent: &IncomingCleanupIntent) -> Result<bool, PortError> {
+    fn canonical_exact_bytes(
+        &self,
+        intent: &IncomingCleanupIntent,
+    ) -> Result<Option<Vec<u8>>, PortError> {
         let snapshot = match self
             .storage
             .read_incoming(&intent.canonical_path, self.max_metainfo_bytes)
@@ -192,13 +189,16 @@ impl IncomingCleanupService {
                         | "STORAGE_SOURCE_TOO_LARGE"
                 ) =>
             {
-                return Ok(false);
+                return Ok(None);
             }
             Err(error) => return Err(error),
         };
 
         let digest: [u8; 32] = Sha256::digest(&snapshot.bytes).into();
-        Ok(snapshot.evidence == intent.canonical_evidence && digest == intent.source_sha256)
+        if snapshot.evidence != intent.canonical_evidence || digest != intent.source_sha256 {
+            return Ok(None);
+        }
+        Ok(Some(snapshot.bytes))
     }
 }
 

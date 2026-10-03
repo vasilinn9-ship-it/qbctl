@@ -72,7 +72,7 @@ pub trait Storage: Send + Sync {
         &self,
         _relative_path: &str,
         _expected_evidence: &FileEvidence,
-        _expected_sha256: &[u8; 32],
+        _expected_bytes: &[u8],
         _max_bytes: usize,
     ) -> Result<IncomingDeleteOutcome, PortError> {
         Err(PortError::new(
