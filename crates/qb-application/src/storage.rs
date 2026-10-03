@@ -53,6 +53,14 @@ pub enum IncomingDeleteOutcome {
     Changed,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SameVolumeMoveOutcome {
+    Moved { destination: FileEvidence },
+    SourceMissing,
+    SourceChanged { observed: FileEvidence },
+    DestinationExists { observed: FileEvidence },
+}
+
 pub trait Storage: Send + Sync {
     fn volume_status(&self, root: ManagedRoot) -> Result<StorageVolumeStatus, PortError>;
 
@@ -68,6 +76,19 @@ pub trait Storage: Send + Sync {
         Err(PortError::new(
             "STORAGE_OBSERVE_UNSUPPORTED",
             "managed file observation is not supported by this storage adapter",
+        ))
+    }
+
+    fn move_same_volume_no_replace(
+        &self,
+        _source_root: ManagedRoot,
+        _destination_root: ManagedRoot,
+        _relative_path: &str,
+        _expected_source: &FileEvidence,
+    ) -> Result<SameVolumeMoveOutcome, PortError> {
+        Err(PortError::new(
+            "STORAGE_MOVE_UNSUPPORTED",
+            "same-volume managed move is not supported by this storage adapter",
         ))
     }
 
