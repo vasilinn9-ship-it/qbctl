@@ -21,14 +21,18 @@ use crate::runtime::RuntimeContext;
 
 const IPC_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
+pub struct OperationServices {
+    pub mutations: Arc<MutationService>,
+    pub completion: Option<Arc<CompletionService>>,
+}
+
 pub async fn serve_connection(
     mut connection: ServerConnection,
     runtime: Arc<RuntimeContext>,
     system: Arc<SystemService>,
     storage: Option<Arc<StorageStatusService>>,
     torrents: Option<Arc<TorrentService>>,
-    mutations: Arc<MutationService>,
-    completion: Option<Arc<CompletionService>>,
+    operations: OperationServices,
     qbit_startup_problem: Option<Arc<str>>,
 ) -> Result<()> {
     let handshake = timeout(
@@ -58,8 +62,10 @@ pub async fn serve_connection(
             &system,
             storage.as_deref(),
             torrents.as_deref(),
-            Some(mutations.as_ref()),
-            completion.as_deref(),
+            dispatch::OperationServices {
+                mutations: Some(operations.mutations.as_ref()),
+                completion: operations.completion.as_deref(),
+            },
             mutation_admission_enabled,
             qbit_startup_problem.as_deref(),
         )
