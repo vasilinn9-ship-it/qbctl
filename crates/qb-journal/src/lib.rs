@@ -1045,8 +1045,8 @@ impl AdmissionJournal for Journal {
             .map_err(JournalError::from)
             .map_err(map_port_error)?;
         if let Some((_, retained_volume, retained_bytes, retained_path)) = &retained_capacity {
-            let retained_volume = decode_u64_blob(retained_volume, "working_volume_id")
-                .map_err(map_port_error)?;
+            let retained_volume =
+                decode_u64_blob(retained_volume, "working_volume_id").map_err(map_port_error)?;
             let retained_bytes =
                 decode_u64_blob(retained_bytes, "retained_bytes").map_err(map_port_error)?;
             if retained_volume != request.working_volume_id
@@ -1493,7 +1493,6 @@ impl AdmissionJournal for Journal {
         .map_err(map_port_error)
     }
 }
-
 
 impl ReleaseJournal for Journal {
     fn reserve_release(&self, request: &ReleaseRequest) -> Result<ReleaseReservation, PortError> {
@@ -2547,7 +2546,6 @@ fn migrate_v4_to_v5(connection: &mut Connection) -> Result<(), JournalError> {
     Ok(())
 }
 
-
 fn migrate_v5_to_v6(connection: &mut Connection) -> Result<(), JournalError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(
@@ -3112,7 +3110,6 @@ fn transition_cleanup(
     Ok(record)
 }
 
-
 struct StoredReleaseRow {
     request_id: String,
     operation_id: String,
@@ -3342,9 +3339,10 @@ fn transition_release(
         ));
     }
 
-    let revision = current.revision.checked_add(1).ok_or_else(|| {
-        PortError::new("JOURNAL_STATE_INVALID", "release revision overflow")
-    })?;
+    let revision = current
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| PortError::new("JOURNAL_STATE_INVALID", "release revision overflow"))?;
     let finished = matches!(
         next,
         ReleaseState::Finished | ReleaseState::Blocked | ReleaseState::Failed
@@ -4505,10 +4503,12 @@ mod tests {
         assert_eq!(retry.checkpoint, "retry_ready");
     }
 
-
     fn finished_admission(journal: &Journal, request_id_value: &str) -> AdmissionRecord {
         let request = admission_request(request_id_value);
-        let operation_id = match journal.reserve_admission(&request).expect("reserve admission") {
+        let operation_id = match journal
+            .reserve_admission(&request)
+            .expect("reserve admission")
+        {
             AdmissionReservationResult::New(record) => record.operation_id,
             other => panic!("unexpected admission reservation: {other:?}"),
         };
@@ -4518,7 +4518,9 @@ mod tests {
         journal
             .mark_admission_observed_applied(&operation_id)
             .expect("admission observed");
-        journal.finish_admission(&operation_id).expect("admission finished")
+        journal
+            .finish_admission(&operation_id)
+            .expect("admission finished")
     }
 
     #[test]
@@ -4536,18 +4538,23 @@ mod tests {
         };
         let release_operation = {
             let journal = Journal::open(&path).expect("reopen");
-            let record = match journal.reserve_release(&release_request).expect("reserve release") {
+            let record = match journal
+                .reserve_release(&release_request)
+                .expect("reserve release")
+            {
                 ReleaseReservation::New(record) => record,
                 other => panic!("unexpected release reservation: {other:?}"),
             };
             assert_eq!(record.state, ReleaseState::Prepared);
             assert_eq!(record.admission_operation_id, admission.operation_id);
             assert_eq!(record.retained_bytes, admission.reserved_bytes);
-            assert!(!journal
-                .get_admission(&admission.operation_id)
-                .expect("admission")
-                .expect("record")
-                .reservation_active);
+            assert!(
+                !journal
+                    .get_admission(&admission.operation_id)
+                    .expect("admission")
+                    .expect("record")
+                    .reservation_active
+            );
             let reservations = journal.capacity_reservations(42).expect("capacity");
             assert_eq!(reservations.len(), 1);
             assert_eq!(reservations[0].responsible, "retained:candidate.torrent");
@@ -4591,7 +4598,9 @@ mod tests {
         reopened
             .mark_delete_pending(&release_operation)
             .expect("delete pending again");
-        let finished = reopened.finish_release(&release_operation).expect("finish release");
+        let finished = reopened
+            .finish_release(&release_operation)
+            .expect("finish release");
         assert_eq!(finished.state, ReleaseState::Finished);
         assert!(reopened
             .list_recoverable_releases()
@@ -4605,13 +4614,18 @@ mod tests {
         assert_eq!(registry.state, RegistryState::Incoming);
         assert!(registry.operation_id.is_none());
 
-        let reservations = reopened.capacity_reservations(42).expect("retained capacity");
+        let reservations = reopened
+            .capacity_reservations(42)
+            .expect("retained capacity");
         assert_eq!(reservations.len(), 1);
         assert_eq!(reservations[0].responsible, "retained:candidate.torrent");
 
         let mut readmission = admission_request("readmission-after-release");
         readmission.identity = admission.identity.clone();
-        match reopened.reserve_admission(&readmission).expect("readmission") {
+        match reopened
+            .reserve_admission(&readmission)
+            .expect("readmission")
+        {
             AdmissionReservationResult::New(record) => {
                 assert!(record.reservation_active);
                 assert_eq!(record.registry_id, admission.registry_id);
@@ -4648,7 +4662,9 @@ mod tests {
             registry_id: "different-registry".into(),
         };
         match journal.reserve_release(&conflict).expect("conflict") {
-            ReleaseReservation::Conflict { operation_id: existing } => {
+            ReleaseReservation::Conflict {
+                operation_id: existing,
+            } => {
                 assert_eq!(existing, operation_id)
             }
             other => panic!("unexpected conflict: {other:?}"),
