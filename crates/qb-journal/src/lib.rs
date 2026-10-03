@@ -5813,25 +5813,23 @@ mod tests {
         };
 
         let journal = Journal::open(&path).expect("reopen transitions");
-        let pending = journal
-            .mark_stop_pending(&operation_id)
+        let pending = CompletionJournal::mark_stop_pending(&journal, &operation_id)
             .expect("stop pending");
         assert_eq!(pending.state, CompletionState::StopPending);
 
-        let unknown = journal
-            .mark_unknown_stop(&operation_id, "QBIT_STOP_UNCERTAIN")
-            .expect("unknown stop");
+        let unknown =
+            CompletionJournal::mark_unknown_stop(&journal, &operation_id, "QBIT_STOP_UNCERTAIN")
+                .expect("unknown stop");
         assert_eq!(unknown.state, CompletionState::UnknownStop);
         assert_eq!(unknown.problem_code.as_deref(), Some("QBIT_STOP_UNCERTAIN"));
 
-        let retry = journal.retry_stop(&operation_id).expect("retry stop");
+        let retry = CompletionJournal::retry_stop(&journal, &operation_id).expect("retry stop");
         assert_eq!(retry.state, CompletionState::Prepared);
         assert!(retry.problem_code.is_none());
 
-        journal
-            .mark_stop_pending(&operation_id)
+        CompletionJournal::mark_stop_pending(&journal, &operation_id)
             .expect("stop pending again");
-        let stopped = journal.mark_stopped(&operation_id).expect("stopped");
+        let stopped = CompletionJournal::mark_stopped(&journal, &operation_id).expect("stopped");
         assert_eq!(stopped.state, CompletionState::Stopped);
 
         drop(journal);
@@ -5890,21 +5888,21 @@ mod tests {
         assert_eq!(recoverable.len(), 1);
         assert_eq!(recoverable[0].operation_id, release_operation);
 
-        let stop_pending = reopened
-            .mark_stop_pending(&release_operation)
+        let stop_pending = ReleaseJournal::mark_stop_pending(&reopened, &release_operation)
             .expect("stop pending");
         assert_eq!(stop_pending.state, ReleaseState::StopPending);
-        let unknown = reopened
-            .mark_unknown_stop(&release_operation, "QBIT_STOP_UNCERTAIN")
-            .expect("unknown stop");
+        let unknown =
+            ReleaseJournal::mark_unknown_stop(&reopened, &release_operation, "QBIT_STOP_UNCERTAIN")
+                .expect("unknown stop");
         assert_eq!(unknown.state, ReleaseState::UnknownStop);
-        let retry = reopened.retry_stop(&release_operation).expect("retry stop");
+        let retry =
+            ReleaseJournal::retry_stop(&reopened, &release_operation).expect("retry stop");
         assert_eq!(retry.state, ReleaseState::Prepared);
 
-        reopened
-            .mark_stop_pending(&release_operation)
+        ReleaseJournal::mark_stop_pending(&reopened, &release_operation)
             .expect("stop pending again");
-        let stopped = reopened.mark_stopped(&release_operation).expect("stopped");
+        let stopped =
+            ReleaseJournal::mark_stopped(&reopened, &release_operation).expect("stopped");
         assert_eq!(stopped.state, ReleaseState::Stopped);
         reopened
             .mark_delete_pending(&release_operation)
