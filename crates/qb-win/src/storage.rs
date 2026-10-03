@@ -172,8 +172,7 @@ impl Storage for ManagedStorage {
         let mut paths = Vec::new();
 
         for entry in entries {
-            let entry =
-                entry.map_err(|error| PortError::new("STORAGE_IO", error.to_string()))?;
+            let entry = entry.map_err(|error| PortError::new("STORAGE_IO", error.to_string()))?;
             let name = entry.file_name().into_string().map_err(|_| {
                 PortError::new(
                     "STORAGE_PATH_INVALID",
@@ -241,9 +240,9 @@ impl Storage for ManagedStorage {
             .map_err(|error| PortError::new("STORAGE_IO", error.to_string()))?;
         let before = file_evidence(&file, relative_path)?;
 
-        let read_limit = max_bytes
-            .checked_add(1)
-            .ok_or_else(|| PortError::new("STORAGE_LIMIT_INVALID", "Incoming read limit overflow"))?;
+        let read_limit = max_bytes.checked_add(1).ok_or_else(|| {
+            PortError::new("STORAGE_LIMIT_INVALID", "Incoming read limit overflow")
+        })?;
         let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
         (&mut file)
             .take(u64::try_from(read_limit).unwrap_or(u64::MAX))
@@ -283,7 +282,6 @@ fn is_torrent_name(value: &str) -> bool {
         .rsplit_once('.')
         .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("torrent"))
 }
-
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -562,9 +560,7 @@ fn observe_volume(_role: ManagedRootRole, _path: &Path) -> Result<VolumeObservat
 fn open_snapshot_file(path: &Path) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
 
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
-    };
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
 
     OpenOptions::new()
         .read(true)
@@ -583,8 +579,8 @@ fn file_evidence(file: &File, relative_path: &str) -> Result<FileEvidence, PortE
     use std::os::windows::io::AsRawHandle;
 
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-        GetFileInformationByHandle,
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
+        FILE_ATTRIBUTE_REPARSE_POINT,
     };
 
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
