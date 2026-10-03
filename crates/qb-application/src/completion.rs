@@ -3924,6 +3924,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cross_volume_archive_is_verified_published_receipted_then_source_deleted() {
+        let journal = Arc::new(FakeCompletionJournal::default());
+        let storage = FakeStorage::cross_volume_archive(0);
+        let client = FakeClient::complete();
+        client.with_stop_effects(vec![FakeStopEffect::AcceptedAndStop]);
+
+        let completed = execution(
+            completion_service(journal, storage.clone(), client)
+                .execute(&request())
+                .await
+                .expect("cross-volume Archive completion"),
+        );
+
+        assert_eq!(
+            completed.status,
+            CompletionExecutionStatus::RemoveRecordPending
+        );
+        assert_eq!(completed.record.state, CompletionState::RemoveRecordPending);
+        assert_eq!(
+            completed.record.archive_sha256,
+            Some(Sha256::digest(b"metainfo").into())
+        );
+        assert_eq!(
+            completed
+                .record
+                .archive_destination_evidence
+                .as_ref()
+                .map(|evidence| evidence.identity.volume_id),
+            Some(4)
+        );
+        assert_eq!(storage.delete_calls.load(Ordering::SeqCst), 1);
+
+        let files = storage.files.lock().expect("files mutex");
+        assert!(!files
+            .iter()
+            .any(|(root, path, _)| *root == ManagedRoot::Incoming && path == "sample.torrent"));
+        assert!(files
+            .iter()
+            .any(|(root, path, _)| *root == ManagedRoot::Archive && path == "sample.torrent"));
+        assert!(!files
+            .iter()
+            .any(|(_, path, _)| path.starts_with("_qbctl_tmp/")));
+    }
+
+    #[tokio::test]
+    async fn cross_volume_archive_delete_uncertainty_requires_explicit_replay() {
+        let journal = Arc::new(FakeCompletionJournal::default());
+        let storage = FakeStorage::cross_volume_archive(1);
+        let client = FakeClient::complete();
+        client.with_stop_effects(vec![FakeStopEffect::AcceptedAndStop]);
+
+        let first = execution(
+            completion_service(journal.clone(), storage.clone(), client.clone())
+                .execute(&request())
+                .await
+                .expect("first cross-volume Archive completion"),
+        );
+        assert_eq!(first.status, CompletionExecutionStatus::UnknownArchive);
+        assert_eq!(first.record.state, CompletionState::UnknownArchive);
+        assert!(first.record.archive_destination_evidence.is_some());
+        assert_eq!(storage.delete_calls.load(Ordering::SeqCst), 1);
+
+        let recovered = completion_service(journal.clone(), storage.clone(), client.clone())
+            .recover_all()
+            .await
+            .expect("cross-volume Archive recovery");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].status, CompletionExecutionStatus::UnknownArchive);
+        assert_eq!(recovered[0].record.state, CompletionState::UnknownArchive);
+        assert_eq!(storage.delete_calls.load(Ordering::SeqCst), 1);
+
+        let replay = execution(
+            completion_service(journal, storage.clone(), client)
+                .execute(&request())
+                .await
+                .expect("explicit Archive replay"),
+        );
+        assert!(replay.replayed);
+        assert_eq!(
+            replay.status,
+            CompletionExecutionStatus::RemoveRecordPending
+        );
+        assert_eq!(replay.record.state, CompletionState::RemoveRecordPending);
+        assert_eq!(storage.delete_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn cross_volume_payload_is_verified_receipted_then_source_deleted() {
         let journal = Arc::new(FakeCompletionJournal::default());
         let storage = FakeStorage::cross_volume(0);
