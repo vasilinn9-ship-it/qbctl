@@ -66,14 +66,16 @@ jobs:
               break
             fi
             if ! docker ps --format '{{.Names}}' | grep -qx qbctl-real-qbit; then
-              printf '%s\n' "$logs"
+              printf '%s\n' "$logs" |
+                sed '/[Pp]assword/s/.*/<redacted qBittorrent password log line>/'
               exit 1
             fi
             sleep 1
           done
 
           if [[ -z "$password" ]]; then
-            docker logs qbctl-real-qbit
+            docker logs qbctl-real-qbit 2>&1 |
+              sed '/[Pp]assword/s/.*/<redacted qBittorrent password log line>/'
             echo "qBittorrent temporary password was not observed" >&2
             exit 1
           fi
@@ -101,7 +103,10 @@ jobs:
         run: cargo test -p qb-qbit --test real_qbit --locked -- --nocapture
       - name: Dump qBittorrent logs on failure
         if: failure()
-        run: docker logs qbctl-real-qbit
+        shell: bash
+        run: |
+          docker logs qbctl-real-qbit 2>&1 |
+            sed '/[Pp]assword/s/.*/<redacted qBittorrent password log line>/'
       - name: Stop disposable qBittorrent
         if: always()
         run: docker rm -f qbctl-real-qbit || true
