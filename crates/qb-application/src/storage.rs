@@ -149,9 +149,19 @@ impl IncomingScanService {
 
         for candidate in eligible {
             match self.registry.find_by_identity(&candidate.metainfo.identity) {
-                Ok(Some(record)) => {
+                Ok(Some(record))
+                    if record.source_metainfo_digest == candidate.source_sha256 =>
+                {
                     allowed_canonical_paths.insert(candidate.relative_path.clone(), ());
                     already_processed.push(already_processed(candidate, record));
+                }
+                Ok(Some(_)) => {
+                    rejected.push(IncomingRejection {
+                        relative_path: candidate.relative_path,
+                        problem_code: "IDENTITY_CONFLICT",
+                        message:
+                            "registered torrent identity has different metainfo bytes".into(),
+                    });
                 }
                 Ok(None) => {
                     allowed_canonical_paths.insert(candidate.relative_path.clone(), ());
@@ -598,7 +608,7 @@ mod tests {
                 identity,
                 state: RegistryState::Finished,
                 source_relative: "archive/known.torrent".into(),
-                source_metainfo_digest: [0x77; 32],
+                source_metainfo_digest: source_digest(b"v1"),
                 operation_id: Some("operation-1".into()),
                 archive_ref: Some("archive/known.torrent".into()),
                 handoff_file_count: 1,
@@ -620,6 +630,38 @@ mod tests {
             RegistryState::Finished
         );
         assert!(scan.rejected.is_empty());
+    }
+
+    #[test]
+    fn incoming_scan_rejects_registered_identity_with_different_metainfo_bytes() {
+        let storage = Arc::new(FakeStorage {
+            files: vec![snapshot("changed.torrent", b"v1", 1)],
+        });
+        let identity = TorrentIdentity::new(Some([0x11; 20]), None).expect("identity");
+        let registry = Arc::new(FakeRegistry {
+            records: vec![RegistryRecord {
+                registry_id: "registry-1".into(),
+                identity,
+                state: RegistryState::Incoming,
+                source_relative: "original.torrent".into(),
+                source_metainfo_digest: [0x77; 32],
+                operation_id: None,
+                archive_ref: None,
+                handoff_file_count: 0,
+                handoff_receipt_count: 0,
+            }],
+            conflict_identity: None,
+        });
+        let service =
+            IncomingScanService::new(storage, Arc::new(FakeMetainfoReader), registry);
+
+        let scan = service.scan(1024).expect("scan");
+
+        assert!(scan.eligible.is_empty());
+        assert!(scan.already_processed.is_empty());
+        assert!(scan.redundant_identical.is_empty());
+        assert_eq!(scan.rejected.len(), 1);
+        assert_eq!(scan.rejected[0].problem_code, "IDENTITY_CONFLICT");
     }
 
     #[test]
