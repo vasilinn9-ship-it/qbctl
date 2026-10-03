@@ -1563,6 +1563,11 @@ mod tests {
         fn populated() -> Arc<Self> {
             Arc::new(Self {
                 files: Mutex::new(vec![
+                    (
+                        ManagedRoot::Incoming,
+                        "sample.torrent".into(),
+                        evidence(1, 1, 8),
+                    ),
                     (ManagedRoot::Working, "dir/a.bin".into(), evidence(2, 2, 10)),
                     (ManagedRoot::Working, "dir/b.bin".into(), evidence(2, 3, 20)),
                 ]),
@@ -2358,6 +2363,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_volume_completion_handoff_receipts_gate_remove_record() {
+        let journal = Arc::new(FakeCompletionJournal::default());
+        let storage = FakeStorage::populated();
+        let client = FakeClient::complete();
+        client.with_stop_effects(vec![FakeStopEffect::AcceptedAndStop]);
+
+        let completed = execution(
+            completion_service(journal, storage.clone(), client)
+                .execute(&request())
+                .await
+                .expect("execute completion"),
+        );
+
+        assert_eq!(
+            completed.status,
+            CompletionExecutionStatus::RemoveRecordPending
+        );
+        assert_eq!(completed.record.state, CompletionState::RemoveRecordPending);
+        assert!(completed.record.archive_destination_evidence.is_some());
+        assert_eq!(
+            completed.record.archive_sha256,
+            Some(Sha256::digest(b"metainfo").into())
+        );
+        assert!(completed
+            .record
+            .files
+            .iter()
+            .all(|file| file.state == CompletionFileState::HandedOff));
+        assert!(completed
+            .record
+            .files
+            .iter()
+            .all(|file| file.destination_evidence.is_some()));
+
+        let files = storage.files.lock().expect("files mutex");
+        assert!(!files.iter().any(|(root, path, _)| {
+            *root == ManagedRoot::Incoming && path == "sample.torrent"
+        }));
+        assert!(files.iter().any(|(root, path, _)| {
+            *root == ManagedRoot::Archive && path == "sample.torrent"
+        }));
+        assert!(!files
+            .iter()
+            .any(|(root, _, _)| *root == ManagedRoot::Working));
+        assert_eq!(
+            files
+                .iter()
+                .filter(|(root, _, _)| *root == ManagedRoot::Completed)
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn stop_uncertainty_recovers_by_observation_without_duplicate_stop() {
         let journal = Arc::new(FakeCompletionJournal::default());
         let storage = FakeStorage::populated();
@@ -2380,8 +2439,14 @@ mod tests {
             .await
             .expect("recover completion");
         assert_eq!(recovered.len(), 1);
-        assert_eq!(recovered[0].status, CompletionExecutionStatus::Stopped);
-        assert_eq!(recovered[0].record.state, CompletionState::Stopped);
+        assert_eq!(
+            recovered[0].status,
+            CompletionExecutionStatus::RemoveRecordPending
+        );
+        assert_eq!(
+            recovered[0].record.state,
+            CompletionState::RemoveRecordPending
+        );
         assert_eq!(client.stop_calls.load(Ordering::SeqCst), 1);
     }
 
@@ -2411,8 +2476,11 @@ mod tests {
                 .expect("explicit replay"),
         );
         assert!(replay.replayed);
-        assert_eq!(replay.status, CompletionExecutionStatus::Stopped);
-        assert_eq!(replay.record.state, CompletionState::Stopped);
+        assert_eq!(
+            replay.status,
+            CompletionExecutionStatus::RemoveRecordPending
+        );
+        assert_eq!(replay.record.state, CompletionState::RemoveRecordPending);
         assert_eq!(client.stop_calls.load(Ordering::SeqCst), 2);
     }
 
