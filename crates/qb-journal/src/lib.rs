@@ -1960,7 +1960,10 @@ impl CompletionJournal for Journal {
         transition_completion(
             self,
             operation_id,
-            &[CompletionState::StopPending],
+            &[
+                CompletionState::StopPending,
+                CompletionState::RemoveRecordPending,
+            ],
             CompletionState::Failed,
             Some(problem_code),
         )
@@ -2153,6 +2156,40 @@ impl CompletionJournal for Journal {
         operation_id: &OperationId,
     ) -> Result<CompletionRecord, PortError> {
         finish_completion_payload(self, operation_id)
+    }
+
+    fn mark_unknown_remove_record(
+        &self,
+        operation_id: &OperationId,
+        problem_code: &str,
+    ) -> Result<CompletionRecord, PortError> {
+        transition_completion(
+            self,
+            operation_id,
+            &[CompletionState::RemoveRecordPending],
+            CompletionState::UnknownRemoveRecord,
+            Some(problem_code),
+        )
+    }
+
+    fn retry_remove_record(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<CompletionRecord, PortError> {
+        transition_completion(
+            self,
+            operation_id,
+            &[CompletionState::UnknownRemoveRecord],
+            CompletionState::RemoveRecordPending,
+            None,
+        )
+    }
+
+    fn finish_completion(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<CompletionRecord, PortError> {
+        finish_completion_operation(self, operation_id)
     }
 }
 
@@ -4242,6 +4279,221 @@ fn finish_completion_payload(
             PortError::new(
                 "JOURNAL_STATE_INVALID",
                 "completion disappeared after payload receipt gate",
+            )
+        })?;
+    transaction
+        .commit()
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    Ok(record)
+}
+
+fn finish_completion_operation(
+    journal: &Journal,
+    operation_id: &OperationId,
+) -> Result<CompletionRecord, PortError> {
+    let mut connection = journal.connection.lock().expect("journal mutex poisoned");
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    let current = load_completion_record(&transaction, operation_id.as_str())
+        .map_err(map_port_error)?
+        .ok_or_else(|| PortError::new("COMPLETION_NOT_FOUND", operation_id.to_string()))?;
+
+    if current.state == CompletionState::Finished {
+        transaction
+            .commit()
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        return Ok(current);
+    }
+    if !matches!(
+        current.state,
+        CompletionState::RemoveRecordPending | CompletionState::UnknownRemoveRecord
+    ) {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            "completion can finish only after qBittorrent record-removal intent",
+        ));
+    }
+    if current.archive_destination_evidence.is_none()
+        || current.archive_sha256.is_none()
+        || current.files.is_empty()
+        || current.files.iter().any(|file| {
+            file.state != CompletionFileState::HandedOff || file.destination_evidence.is_none()
+        })
+    {
+        return Err(PortError::new(
+            "HANDOFF_RECEIPTS_INCOMPLETE",
+            "completion cannot finish before Archive and every payload file have durable receipts",
+        ));
+    }
+
+    let registry = load_registry_record(&transaction, &current.registry_id)
+        .map_err(map_port_error)?
+        .ok_or_else(|| {
+            PortError::new(
+                "JOURNAL_STATE_INVALID",
+                "completion registry record disappeared before finish",
+            )
+        })?;
+    if registry.state != RegistryState::Processing
+        || registry.identity != current.identity
+        || registry.source_relative != current.source_relative
+        || registry.source_metainfo_digest != current.source_metainfo_digest
+    {
+        return Err(PortError::new(
+            "COMPLETION_REGISTRY_STALE",
+            "registry no longer matches the durable completion operation",
+        ));
+    }
+    let admission_operation_id = registry.operation_id.as_deref().ok_or_else(|| {
+        PortError::new(
+            "CAPACITY_OWNERSHIP_CONFLICT",
+            "processing registry has no admission capacity owner",
+        )
+    })?;
+
+    let active_reservation: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*)
+             FROM admission_reservations
+             WHERE operation_id = ?1
+               AND reservation_state = 'active'",
+            [admission_operation_id],
+            |row| row.get(0),
+        )
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    let retained_capacity: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*)
+             FROM retained_capacity
+             WHERE registry_id = ?1",
+            [&current.registry_id],
+            |row| row.get(0),
+        )
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    match (active_reservation, retained_capacity) {
+        (1, 0) => {
+            let changed = transaction
+                .execute(
+                    "UPDATE admission_reservations
+                     SET reservation_state = 'released',
+                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     WHERE operation_id = ?1
+                       AND reservation_state = 'active'",
+                    [admission_operation_id],
+                )
+                .map_err(JournalError::from)
+                .map_err(map_port_error)?;
+            if changed != 1 {
+                return Err(PortError::new(
+                    "CAPACITY_OWNERSHIP_CONFLICT",
+                    "completion could not release active Working capacity",
+                ));
+            }
+        }
+        (0, 1) => {
+            let changed = transaction
+                .execute(
+                    "DELETE FROM retained_capacity
+                     WHERE registry_id = ?1",
+                    [&current.registry_id],
+                )
+                .map_err(JournalError::from)
+                .map_err(map_port_error)?;
+            if changed != 1 {
+                return Err(PortError::new(
+                    "CAPACITY_OWNERSHIP_CONFLICT",
+                    "completion could not release retained Working capacity",
+                ));
+            }
+        }
+        _ => {
+            return Err(PortError::new(
+                "CAPACITY_OWNERSHIP_CONFLICT",
+                "completion requires exactly one active or retained Working capacity owner",
+            ));
+        }
+    }
+
+    let file_count = i64::try_from(current.files.len()).map_err(|_| {
+        PortError::new(
+            "JOURNAL_STATE_INVALID",
+            "completion file count does not fit registry storage",
+        )
+    })?;
+    let registry_changed = transaction
+        .execute(
+            "UPDATE torrent_registry
+             SET state = 'finished',
+                 operation_id = NULL,
+                 archive_ref = ?1,
+                 handoff_file_count = ?2,
+                 handoff_receipt_count = ?2,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE registry_id = ?3
+               AND state = 'processing'
+               AND operation_id = ?4",
+            params![
+                current.source_relative,
+                file_count,
+                current.registry_id,
+                admission_operation_id,
+            ],
+        )
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    if registry_changed != 1 {
+        return Err(PortError::new(
+            "JOURNAL_STATE_INVALID",
+            "completion could not atomically mark registry Finished",
+        ));
+    }
+
+    let revision = current
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| PortError::new("JOURNAL_STATE_INVALID", "completion revision overflow"))?;
+    let changed = transaction
+        .execute(
+            "UPDATE completion_operations
+             SET state = 'finished',
+                 problem_code = NULL,
+                 revision = ?1,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE operation_id = ?2
+               AND revision = ?3
+               AND state IN ('remove_record_pending','unknown_remove_record')",
+            params![revision, operation_id.as_str(), current.revision],
+        )
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    if changed != 1 {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            "completion changed concurrently while finishing",
+        ));
+    }
+    insert_completion_event(
+        &transaction,
+        operation_id.as_str(),
+        revision,
+        "finished",
+        None,
+    )
+    .map_err(map_port_error)?;
+
+    let record = load_completion_record(&transaction, operation_id.as_str())
+        .map_err(map_port_error)?
+        .ok_or_else(|| {
+            PortError::new(
+                "JOURNAL_STATE_INVALID",
+                "completion disappeared after finish",
             )
         })?;
     transaction
