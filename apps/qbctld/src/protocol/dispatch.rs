@@ -738,9 +738,7 @@ mod tests {
         system::{DaemonPhase, RuntimeHealthPort, RuntimeSnapshot, SystemService},
         JournalHealthPort, PortError,
     };
-    use qb_proto::v1::{
-        request, response, PauseTorrentRequest, Request, Status, StatusRequest,
-    };
+    use qb_proto::v1::{request, response, PauseTorrentRequest, Request, Status, StatusRequest};
 
     use super::dispatch;
 
