@@ -941,7 +941,9 @@ impl CompletionService {
             let progress = match record.state {
                 CompletionState::Stopped
                 | CompletionState::ArchivePending
-                | CompletionState::UnknownArchive => self.advance_archive(record).await?,
+                | CompletionState::UnknownArchive => {
+                    self.advance_archive(record, explicit_request).await?
+                }
                 CompletionState::PayloadPending => {
                     self.advance_payload(record, explicit_request).await?
                 }
@@ -1001,16 +1003,10 @@ impl CompletionService {
     async fn advance_archive(
         &self,
         mut record: CompletionRecord,
+        explicit_request: bool,
     ) -> Result<HandoffProgress, PortError> {
         if record.source_evidence.identity.volume_id != record.archive_volume_id {
-            return Ok(HandoffProgress::Halt {
-                status: CompletionExecutionStatus::ArchivePending,
-                record,
-                problem: Some(PortError::new(
-                    "CROSS_VOLUME_ARCHIVE_PENDING",
-                    "Archive is on a different volume; verified copy handoff is required",
-                )),
-            });
+            return self.advance_cross_volume_archive(record, explicit_request);
         }
 
         let observation = self.observe_same_volume_handoff(
@@ -1134,6 +1130,375 @@ impl CompletionService {
                 })
             }
         }
+    }
+
+    fn advance_cross_volume_archive(
+        &self,
+        mut record: CompletionRecord,
+        explicit_request: bool,
+    ) -> Result<HandoffProgress, PortError> {
+        let temp_relative = Self::completion_archive_temp_relative(&record.operation_id);
+
+        if record.state == CompletionState::Stopped {
+            match self
+                .storage
+                .observe_file(ManagedRoot::Incoming, &record.source_relative)?
+            {
+                Some(source) if source == record.source_evidence => {}
+                Some(_) => {
+                    return self.block_handoff(
+                        record,
+                        PortError::new(
+                            "HANDOFF_SOURCE_CHANGED",
+                            "Incoming metainfo changed before cross-volume Archive handoff",
+                        ),
+                    );
+                }
+                None => {
+                    return self.block_handoff(
+                        record,
+                        PortError::new(
+                            "ARCHIVE_SOURCE_MISSING",
+                            "Incoming metainfo is missing before durable Archive intent",
+                        ),
+                    );
+                }
+            }
+            if self
+                .storage
+                .observe_file(ManagedRoot::Archive, &record.source_relative)?
+                .is_some()
+                || self
+                    .storage
+                    .observe_file(ManagedRoot::Archive, &temp_relative)?
+                    .is_some()
+            {
+                return self.block_handoff(
+                    record,
+                    PortError::new(
+                        "ARCHIVE_EFFECT_WITHOUT_INTENT",
+                        "Archive destination/temp exists before durable Archive intent",
+                    ),
+                );
+            }
+            record = self.journal.mark_archive_pending(&record.operation_id)?;
+        }
+
+        if !matches!(
+            record.state,
+            CompletionState::ArchivePending | CompletionState::UnknownArchive
+        ) {
+            return Err(PortError::new(
+                "OPERATION_TRANSITION_INVALID",
+                "cross-volume Archive requires ArchivePending or UnknownArchive",
+            ));
+        }
+
+        if let (Some(destination), Some(sha256)) = (
+            record.archive_destination_evidence.clone(),
+            record.archive_sha256,
+        ) {
+            if sha256 != record.source_metainfo_digest {
+                return self.block_handoff(
+                    record,
+                    PortError::new(
+                        "ARCHIVE_DIGEST_MISMATCH",
+                        "durable Archive receipt digest does not match retained metainfo digest",
+                    ),
+                );
+            }
+            if self
+                .storage
+                .observe_file(ManagedRoot::Archive, &record.source_relative)?
+                .as_ref()
+                != Some(&destination)
+            {
+                return self.block_handoff(
+                    record,
+                    PortError::new(
+                        "ARCHIVE_DESTINATION_CHANGED",
+                        "Archive destination changed after durable receipt",
+                    ),
+                );
+            }
+
+            match self
+                .storage
+                .observe_file(ManagedRoot::Incoming, &record.source_relative)?
+            {
+                None => {
+                    let receipted = self.journal.mark_archive_receipted(
+                        &record.operation_id,
+                        &destination,
+                        sha256,
+                    )?;
+                    return Ok(HandoffProgress::Continue(receipted));
+                }
+                Some(source) if source == record.source_evidence => {}
+                Some(_) => {
+                    return self.block_handoff(
+                        record,
+                        PortError::new(
+                            "HANDOFF_SOURCE_CHANGED",
+                            "Incoming metainfo changed before exact source delete",
+                        ),
+                    );
+                }
+            }
+
+            if record.state == CompletionState::UnknownArchive && !explicit_request {
+                return Ok(HandoffProgress::Halt {
+                    status: CompletionExecutionStatus::UnknownArchive,
+                    record,
+                    problem: Some(PortError::new(
+                        "ARCHIVE_DELETE_UNCERTAIN",
+                        "Archive source delete remains uncertain; explicit replay is required before another delete",
+                    )),
+                });
+            }
+            if record.state == CompletionState::UnknownArchive {
+                record = self.journal.retry_archive(&record.operation_id)?;
+                record = self.journal.mark_archive_pending(&record.operation_id)?;
+            }
+
+            match self.storage.delete_managed_exact(
+                ManagedRoot::Incoming,
+                &record.source_relative,
+                &record.source_evidence,
+                &sha256,
+            ) {
+                Ok(ManagedDeleteOutcome::Deleted | ManagedDeleteOutcome::Missing) => {
+                    if self
+                        .storage
+                        .observe_file(ManagedRoot::Incoming, &record.source_relative)?
+                        .is_none()
+                    {
+                        let receipted = self.journal.mark_archive_receipted(
+                            &record.operation_id,
+                            &destination,
+                            sha256,
+                        )?;
+                        return Ok(HandoffProgress::Continue(receipted));
+                    }
+                    let unknown = self
+                        .journal
+                        .mark_unknown_archive(&record.operation_id, "ARCHIVE_DELETE_UNCERTAIN")?;
+                    return Ok(HandoffProgress::Halt {
+                        status: CompletionExecutionStatus::UnknownArchive,
+                        record: unknown,
+                        problem: Some(PortError::new(
+                            "ARCHIVE_DELETE_UNCERTAIN",
+                            "Archive source delete did not produce an absent source observation",
+                        )),
+                    });
+                }
+                Ok(ManagedDeleteOutcome::Changed) => {
+                    return self.block_handoff(
+                        record,
+                        PortError::new(
+                            "HANDOFF_SOURCE_CHANGED",
+                            "Incoming metainfo changed at exact-delete boundary",
+                        ),
+                    );
+                }
+                Err(problem) => {
+                    let unknown = self
+                        .journal
+                        .mark_unknown_archive(&record.operation_id, problem.code)?;
+                    return Ok(HandoffProgress::Halt {
+                        status: CompletionExecutionStatus::UnknownArchive,
+                        record: unknown,
+                        problem: Some(problem),
+                    });
+                }
+            }
+        }
+
+        if record.state == CompletionState::UnknownArchive && !explicit_request {
+            return Ok(HandoffProgress::Halt {
+                status: CompletionExecutionStatus::UnknownArchive,
+                record,
+                problem: Some(PortError::new(
+                    "ARCHIVE_HANDOFF_UNCERTAIN",
+                    "cross-volume Archive handoff remains uncertain; explicit replay is required before another copy/publish attempt",
+                )),
+            });
+        }
+        if record.state == CompletionState::UnknownArchive {
+            record = self.journal.retry_archive(&record.operation_id)?;
+            record = self.journal.mark_archive_pending(&record.operation_id)?;
+        }
+
+        if self
+            .storage
+            .observe_file(ManagedRoot::Archive, &record.source_relative)?
+            .is_some()
+        {
+            match self.storage.copy_to_temp_verified(
+                ManagedRoot::Incoming,
+                &record.source_relative,
+                ManagedRoot::Archive,
+                &record.source_relative,
+                &record.source_evidence,
+            )? {
+                VerifiedCopyOutcome::Verified {
+                    temp: destination,
+                    sha256,
+                    ..
+                } if sha256 == record.source_metainfo_digest => {
+                    record = self.journal.mark_archive_destination_receipted(
+                        &record.operation_id,
+                        &destination,
+                        sha256,
+                    )?;
+                    return self.advance_cross_volume_archive(record, explicit_request);
+                }
+                VerifiedCopyOutcome::Verified { .. } => {
+                    return self.block_handoff(
+                        record,
+                        PortError::new(
+                            "ARCHIVE_DIGEST_MISMATCH",
+                            "published Archive destination digest does not match retained metainfo",
+                        ),
+                    );
+                }
+                _ => {
+                    return self.block_handoff(
+                        record,
+                        PortError::new(
+                            "DESTINATION_CONFLICT",
+                            "Archive destination exists but cannot be verified against retained metainfo",
+                        ),
+                    );
+                }
+            }
+        }
+
+        let (temp, sha256) = match self.storage.copy_to_temp_verified(
+            ManagedRoot::Incoming,
+            &record.source_relative,
+            ManagedRoot::Archive,
+            &temp_relative,
+            &record.source_evidence,
+        ) {
+            Ok(VerifiedCopyOutcome::Verified { temp, sha256, .. }) => (temp, sha256),
+            Ok(VerifiedCopyOutcome::SourceMissing) => {
+                return self.block_handoff(
+                    record,
+                    PortError::new(
+                        "ARCHIVE_SOURCE_MISSING",
+                        "Incoming metainfo disappeared during verified Archive copy",
+                    ),
+                );
+            }
+            Ok(VerifiedCopyOutcome::SourceChanged { .. }) => {
+                return self.block_handoff(
+                    record,
+                    PortError::new(
+                        "HANDOFF_SOURCE_CHANGED",
+                        "Incoming metainfo changed during verified Archive copy",
+                    ),
+                );
+            }
+            Ok(VerifiedCopyOutcome::TempConflict { .. }) => {
+                return self.block_handoff(
+                    record,
+                    PortError::new(
+                        "ARCHIVE_TEMP_CONFLICT",
+                        "operation-owned Archive temp conflicts with retained metainfo",
+                    ),
+                );
+            }
+            Err(problem) => {
+                let unknown = self
+                    .journal
+                    .mark_unknown_archive(&record.operation_id, problem.code)?;
+                return Ok(HandoffProgress::Halt {
+                    status: CompletionExecutionStatus::UnknownArchive,
+                    record: unknown,
+                    problem: Some(problem),
+                });
+            }
+        };
+        if sha256 != record.source_metainfo_digest {
+            return self.block_handoff(
+                record,
+                PortError::new(
+                    "ARCHIVE_DIGEST_MISMATCH",
+                    "verified Archive copy digest does not match retained metainfo digest",
+                ),
+            );
+        }
+
+        let destination = match self.storage.move_same_volume_no_replace(
+            ManagedRoot::Archive,
+            &temp_relative,
+            ManagedRoot::Archive,
+            &record.source_relative,
+            &temp,
+        ) {
+            Ok(SameVolumeMoveOutcome::Moved { destination }) => destination,
+            Ok(SameVolumeMoveOutcome::DestinationExists { .. })
+            | Ok(SameVolumeMoveOutcome::SourceMissing) => {
+                match self.storage.copy_to_temp_verified(
+                    ManagedRoot::Incoming,
+                    &record.source_relative,
+                    ManagedRoot::Archive,
+                    &record.source_relative,
+                    &record.source_evidence,
+                )? {
+                    VerifiedCopyOutcome::Verified {
+                        temp: destination,
+                        sha256: published_sha256,
+                        ..
+                    } if published_sha256 == record.source_metainfo_digest => destination,
+                    _ => {
+                        let unknown = self
+                            .journal
+                            .mark_unknown_archive(&record.operation_id, "ARCHIVE_PUBLISH_UNCERTAIN")?;
+                        return Ok(HandoffProgress::Halt {
+                            status: CompletionExecutionStatus::UnknownArchive,
+                            record: unknown,
+                            problem: Some(PortError::new(
+                                "ARCHIVE_PUBLISH_UNCERTAIN",
+                                "Archive publish result could not be verified",
+                            )),
+                        });
+                    }
+                }
+            }
+            Ok(SameVolumeMoveOutcome::SourceChanged { .. }) => {
+                return self.block_handoff(
+                    record,
+                    PortError::new(
+                        "ARCHIVE_TEMP_CHANGED",
+                        "operation-owned Archive temp changed before publish",
+                    ),
+                );
+            }
+            Err(problem) => {
+                let unknown = self
+                    .journal
+                    .mark_unknown_archive(&record.operation_id, problem.code)?;
+                return Ok(HandoffProgress::Halt {
+                    status: CompletionExecutionStatus::UnknownArchive,
+                    record: unknown,
+                    problem: Some(problem),
+                });
+            }
+        };
+
+        record = self.journal.mark_archive_destination_receipted(
+            &record.operation_id,
+            &destination,
+            sha256,
+        )?;
+        self.advance_cross_volume_archive(record, explicit_request)
+    }
+
+    fn completion_archive_temp_relative(operation_id: &OperationId) -> String {
+        let payload = Self::completion_temp_relative(operation_id, u32::MAX);
+        payload.replace("4294967295.part", "archive.torrent")
     }
 
     async fn advance_payload(
@@ -3066,6 +3431,34 @@ mod tests {
                 CompletionState::Stopped,
                 None,
             )
+        }
+
+        fn mark_archive_destination_receipted(
+            &self,
+            operation_id: &OperationId,
+            destination: &FileEvidence,
+            destination_sha256: [u8; 32],
+        ) -> Result<CompletionRecord, PortError> {
+            let mut state = self.record.lock().expect("completion journal mutex");
+            let record = state
+                .as_mut()
+                .ok_or_else(|| PortError::new("COMPLETION_NOT_FOUND", operation_id.to_string()))?;
+            if &record.operation_id != operation_id
+                || !matches!(
+                    record.state,
+                    CompletionState::ArchivePending | CompletionState::UnknownArchive
+                )
+            {
+                return Err(PortError::new(
+                    "OPERATION_TRANSITION_INVALID",
+                    "invalid fake Archive destination receipt transition",
+                ));
+            }
+            record.archive_destination_evidence = Some(destination.clone());
+            record.archive_sha256 = Some(destination_sha256);
+            record.problem_code = None;
+            record.revision += 1;
+            Ok(record.clone())
         }
 
         fn mark_archive_destination_receipted(
