@@ -592,7 +592,7 @@ fn map_file(row: FileDto) -> Result<FileObservation, QbitError> {
 
 fn map_state(value: &str) -> TorrentState {
     match value {
-        "downloading" | "forcedDL" | "metaDL" | "allocating" | "moving" => {
+        "downloading" | "forcedDL" | "metaDL" | "forcedMetaDL" | "allocating" | "moving" => {
             TorrentState::Downloading
         }
         "stalledDL" => TorrentState::StalledDownloading,
@@ -857,11 +857,33 @@ mod tests {
 
     #[test]
     fn qbit_state_mapping_is_normalized() {
+        let known = [
+            ("error", TorrentState::Error),
+            ("missingFiles", TorrentState::Error),
+            ("uploading", TorrentState::Uploading),
+            ("stoppedUP", TorrentState::Stopped),
+            ("queuedUP", TorrentState::QueuedUploading),
+            ("stalledUP", TorrentState::StalledUploading),
+            ("checkingUP", TorrentState::Checking),
+            ("forcedUP", TorrentState::Uploading),
+            ("downloading", TorrentState::Downloading),
+            ("metaDL", TorrentState::Downloading),
+            ("forcedMetaDL", TorrentState::Downloading),
+            ("stoppedDL", TorrentState::Stopped),
+            ("queuedDL", TorrentState::QueuedDownloading),
+            ("stalledDL", TorrentState::StalledDownloading),
+            ("checkingDL", TorrentState::Checking),
+            ("forcedDL", TorrentState::Downloading),
+            ("checkingResumeData", TorrentState::Checking),
+            ("moving", TorrentState::Downloading),
+        ];
+        for (raw, expected) in known {
+            assert_eq!(map_state(raw), expected, "unexpected mapping for {raw}");
+        }
+
+        // Keep compatibility with older qBittorrent state names while Rust v1 targets 5.x.
         assert_eq!(map_state("pausedDL"), TorrentState::Stopped);
         assert_eq!(map_state("pausedUP"), TorrentState::Stopped);
-        assert_eq!(map_state("stoppedDL"), TorrentState::Stopped);
-        assert_eq!(map_state("stoppedUP"), TorrentState::Stopped);
-        assert_eq!(map_state("stalledDL"), TorrentState::StalledDownloading);
         assert_eq!(map_state("future-state"), TorrentState::Unknown);
     }
 
