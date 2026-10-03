@@ -264,7 +264,10 @@ fn command_request(command: Command) -> (request::Command, Option<String>) {
         } => (request::Command::StorageList(StorageListRequest {}), None),
         Command::Storage {
             command: StorageCommand::Status,
-        } => (request::Command::StorageStatus(StorageStatusRequest {}), None),
+        } => (
+            request::Command::StorageStatus(StorageStatusRequest {}),
+            None,
+        ),
         Command::Qbit {
             command: QbitCommand::Status,
         } => (request::Command::QbitProbe(QbitProbeRequest {}), None),
@@ -780,10 +783,7 @@ fn render_fields(response: &Response) -> Result<(), CliError> {
 
 fn print_storage_root_fields(index: usize, root: &qb_proto::v1::StorageRootView) {
     println!("storage_root.{index}.role={}", managed_root_name(root.root));
-    println!(
-        "storage_root.{index}.path={}",
-        sanitize_field(&root.path)
-    );
+    println!("storage_root.{index}.path={}", sanitize_field(&root.path));
     println!("storage_root.{index}.volume_id={}", root.volume_id);
     println!("storage_root.{index}.free_bytes={}", root.free_bytes);
     println!("storage_root.{index}.total_bytes={}", root.total_bytes);
