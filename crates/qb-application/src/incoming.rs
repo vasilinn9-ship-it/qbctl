@@ -35,6 +35,10 @@ impl IncomingService {
         Ok(IncomingPass { scan, cleanup })
     }
 
+    pub fn scan(&self) -> Result<IncomingScan, PortError> {
+        self.scan.scan(self.max_metainfo_bytes)
+    }
+
     pub async fn recover_cleanup(&self) -> Result<Vec<IncomingCleanupRecord>, PortError> {
         self.cleanup.recover_all().await
     }
