@@ -6,7 +6,10 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context as _, Result};
 use prost::Message;
-use qb_application::system::SystemService;
+use qb_application::{
+    system::SystemService,
+    torrent::TorrentService,
+};
 use qb_ipc::{IpcError, ServerConnection};
 use qb_proto::v1::Request;
 use tokio::time::timeout;
@@ -19,6 +22,8 @@ pub async fn serve_connection(
     mut connection: ServerConnection,
     runtime: Arc<RuntimeContext>,
     system: Arc<SystemService>,
+    torrents: Option<Arc<TorrentService>>,
+    qbit_startup_problem: Option<Arc<str>>,
 ) -> Result<()> {
     let handshake = timeout(
         IPC_IO_TIMEOUT,
@@ -40,7 +45,13 @@ pub async fn serve_connection(
         };
         let request = Request::decode(frame).context("decode protocol request")?;
 
-        let response = dispatch::dispatch(request, &system);
+        let response = dispatch::dispatch(
+            request,
+            &system,
+            torrents.as_deref(),
+            qbit_startup_problem.as_deref(),
+        )
+        .await;
         timeout(
             IPC_IO_TIMEOUT,
             connection.send_frame(response.encode_to_vec()),
@@ -56,5 +67,9 @@ pub(crate) fn capabilities() -> Vec<String> {
         "journal.sqlite.v1".into(),
         "status.v1".into(),
         "doctor.v1".into(),
+        "torrent.read.v1".into(),
+        "queue.read.v1".into(),
+        "transfer.limits.read.v1".into(),
+        "qbit.probe.v1".into(),
     ]
 }
