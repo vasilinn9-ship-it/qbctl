@@ -1751,6 +1751,32 @@ mod tests {
     }
 
     #[test]
+    fn retained_capacity_is_not_double_counted_for_same_incoming_candidate() {
+        let plan = plan_capacity(
+            7,
+            120,
+            10,
+            vec![CapacityReservation {
+                responsible: "retained:Candidate.torrent".into(),
+                volume_id: 7,
+                bytes: 90,
+            }],
+            vec![CapacityCandidate {
+                key: "candidate.torrent".into(),
+                bytes: 90,
+            }],
+        )
+        .expect("plan");
+
+        assert_eq!(plan.decisions.len(), 1);
+        assert_eq!(plan.decisions[0].disposition, CapacityDisposition::Accepted);
+        assert_eq!(plan.decisions[0].explanation.already_reserved_bytes, 90);
+        assert_eq!(plan.decisions[0].explanation.candidate_bytes, 90);
+        assert_eq!(plan.decisions[0].explanation.required_bytes, 100);
+        assert_eq!(plan.final_reserved_bytes, 90);
+    }
+
+    #[test]
     fn capacity_plan_ignores_reservations_on_other_volumes() {
         let plan = plan_capacity(
             7,
