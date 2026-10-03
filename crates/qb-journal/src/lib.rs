@@ -23,8 +23,8 @@ use qb_application::{
         RegisterIncoming, RegisterIncomingResult, RegistryRecord, RegistryState, TorrentRegistry,
     },
     release::{
-        ReleaseJournal, ReleaseRecord, ReleaseRequest, ReleaseReservation, ReleaseState,
-        RELEASE_FINGERPRINT_VERSION,
+        ReleaseJournal, ReleaseRecord, ReleaseRequest, ReleaseReservation, ReleaseResolution,
+        ReleaseState, RELEASE_FINGERPRINT_VERSION,
     },
     JournalHealthPort, PortError,
 };
@@ -774,6 +774,7 @@ impl IncomingCleanupJournal for Journal {
                     redundant_modified_marker,
                     source_sha256,
                     state,
+                    resolution,
                     problem_code,
                     revision,
                     created_at,
@@ -1665,6 +1666,7 @@ impl ReleaseJournal for Journal {
                     retained_bytes,
                     working_save_path,
                     state,
+                    resolution,
                     problem_code,
                     revision,
                     created_at,
@@ -1673,7 +1675,7 @@ impl ReleaseJournal for Journal {
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
                     ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                    'prepared', NULL, 1,
+                    'prepared', NULL, NULL, 1,
                     strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                     strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                     NULL
@@ -1955,12 +1957,30 @@ impl ReleaseJournal for Journal {
     }
 
     fn finish_release(&self, operation_id: &OperationId) -> Result<ReleaseRecord, PortError> {
-        transition_release(
+        finish_release_with_resolution(
             self,
             operation_id,
             &[ReleaseState::DeletePending, ReleaseState::UnknownDelete],
-            ReleaseState::Finished,
-            None,
+            ReleaseResolution::PreservedIncomplete,
+            true,
+        )
+    }
+
+    fn finish_became_complete(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<ReleaseRecord, PortError> {
+        finish_release_with_resolution(
+            self,
+            operation_id,
+            &[
+                ReleaseState::Prepared,
+                ReleaseState::StopPending,
+                ReleaseState::Stopped,
+                ReleaseState::UnknownStop,
+            ],
+            ReleaseResolution::BecameComplete,
+            false,
         )
     }
 }
@@ -2362,6 +2382,7 @@ fn migrate_v1_to_v2(connection: &mut Connection) -> Result<(), JournalError> {
             checkpoint TEXT NOT NULL,
             disposition TEXT NOT NULL,
             pending_effect_kind TEXT,
+            resolution TEXT CHECK(resolution IS NULL OR resolution IN ('preserved_incomplete', 'became_complete')),
             problem_code TEXT,
             revision INTEGER NOT NULL CHECK(revision > 0),
             created_at TEXT NOT NULL,
@@ -2900,6 +2921,7 @@ struct StoredCleanupRow {
     redundant_modified_marker: Vec<u8>,
     source_sha256: Vec<u8>,
     state: String,
+    resolution: Option<String>,
     problem_code: Option<String>,
     revision: u64,
 }
@@ -3176,8 +3198,9 @@ fn load_release_record(
                     retained_bytes: row.get(13)?,
                     working_save_path: row.get(14)?,
                     state: row.get(15)?,
-                    problem_code: row.get(16)?,
-                    revision: row.get(17)?,
+                    resolution: row.get(16)?,
+                    problem_code: row.get(17)?,
+                    revision: row.get(18)?,
                 })
             },
         )
@@ -3228,6 +3251,11 @@ fn load_release_record(
     let state = parse_release_state(&row.state).ok_or_else(|| {
         JournalError::InvalidState(format!("unknown release state '{}'", row.state))
     })?;
+    let resolution = row
+        .resolution
+        .as_deref()
+        .map(parse_release_resolution)
+        .transpose()?;
 
     Ok(Some(ReleaseRecord {
         request_id,
@@ -3252,6 +3280,7 @@ fn load_release_record(
         retained_bytes: decode_u64_blob(&row.retained_bytes, "retained_bytes")?,
         working_save_path: row.working_save_path,
         state,
+        resolution,
         problem_code: row.problem_code,
         revision: row.revision,
     }))
@@ -3283,6 +3312,23 @@ fn parse_release_state(state: &str) -> Option<ReleaseState> {
         "blocked" => Some(ReleaseState::Blocked),
         "failed" => Some(ReleaseState::Failed),
         _ => None,
+    }
+}
+
+fn release_resolution_name(resolution: ReleaseResolution) -> &'static str {
+    match resolution {
+        ReleaseResolution::PreservedIncomplete => "preserved_incomplete",
+        ReleaseResolution::BecameComplete => "became_complete",
+    }
+}
+
+fn parse_release_resolution(value: &str) -> Result<ReleaseResolution, JournalError> {
+    match value {
+        "preserved_incomplete" => Ok(ReleaseResolution::PreservedIncomplete),
+        "became_complete" => Ok(ReleaseResolution::BecameComplete),
+        other => Err(JournalError::InvalidState(format!(
+            "unknown release resolution '{other}'"
+        ))),
     }
 }
 
@@ -3383,7 +3429,100 @@ fn transition_release(
         ));
     }
 
-    if next == ReleaseState::Finished {
+    insert_release_event(
+        &transaction,
+        operation_id.as_str(),
+        revision,
+        release_state_name(next),
+        problem_code,
+    )
+    .map_err(map_port_error)?;
+
+    let record = load_release_record(&transaction, operation_id.as_str())
+        .map_err(map_port_error)?
+        .ok_or_else(|| {
+            PortError::new(
+                "JOURNAL_STATE_INVALID",
+                "release operation disappeared after transition",
+            )
+        })?;
+    transaction
+        .commit()
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    Ok(record)
+}
+
+
+fn finish_release_with_resolution(
+    journal: &Journal,
+    operation_id: &OperationId,
+    expected: &[ReleaseState],
+    resolution: ReleaseResolution,
+    return_to_incoming: bool,
+) -> Result<ReleaseRecord, PortError> {
+    let mut connection = journal.connection.lock().expect("journal mutex poisoned");
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    let current = load_release_record(&transaction, operation_id.as_str())
+        .map_err(map_port_error)?
+        .ok_or_else(|| PortError::new("RELEASE_NOT_FOUND", operation_id.to_string()))?;
+
+    if current.state == ReleaseState::Finished && current.resolution == Some(resolution) {
+        transaction
+            .commit()
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        return Ok(current);
+    }
+    if !expected.contains(&current.state) {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            format!(
+                "release {} cannot finish from {} with {}",
+                operation_id,
+                release_state_name(current.state),
+                release_resolution_name(resolution)
+            ),
+        ));
+    }
+
+    let revision = current
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| PortError::new("JOURNAL_STATE_INVALID", "release revision overflow"))?;
+    let changed = transaction
+        .execute(
+            "UPDATE release_operations
+             SET state = 'finished',
+                 resolution = ?1,
+                 problem_code = NULL,
+                 revision = ?2,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE operation_id = ?3
+               AND revision = ?4
+               AND state = ?5",
+            params![
+                release_resolution_name(resolution),
+                revision,
+                operation_id.as_str(),
+                current.revision,
+                release_state_name(current.state),
+            ],
+        )
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    if changed != 1 {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            "release operation changed concurrently while finishing",
+        ));
+    }
+
+    if return_to_incoming {
         let changed = transaction
             .execute(
                 "UPDATE torrent_registry
@@ -3400,7 +3539,7 @@ fn transition_release(
         if changed != 1 {
             return Err(PortError::new(
                 "JOURNAL_STATE_INVALID",
-                "finished release could not return registry ownership to Incoming",
+                "preserved-incomplete release could not return registry ownership to Incoming",
             ));
         }
     }
@@ -3409,8 +3548,8 @@ fn transition_release(
         &transaction,
         operation_id.as_str(),
         revision,
-        release_state_name(next),
-        problem_code,
+        "finished",
+        None,
     )
     .map_err(map_port_error)?;
 
@@ -3419,7 +3558,7 @@ fn transition_release(
         .ok_or_else(|| {
             PortError::new(
                 "JOURNAL_STATE_INVALID",
-                "release operation disappeared after transition",
+                "release operation disappeared after finish",
             )
         })?;
     transaction
@@ -4602,6 +4741,10 @@ mod tests {
             .finish_release(&release_operation)
             .expect("finish release");
         assert_eq!(finished.state, ReleaseState::Finished);
+        assert_eq!(
+            finished.resolution,
+            Some(ReleaseResolution::PreservedIncomplete)
+        );
         assert!(reopened
             .list_recoverable_releases()
             .expect("recoverable")
