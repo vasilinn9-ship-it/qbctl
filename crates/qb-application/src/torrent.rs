@@ -94,6 +94,17 @@ pub enum TrackerStatus {
     Unknown,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct FileObservation {
+    pub index: u32,
+    pub path: String,
+    pub size: u64,
+    pub progress_ppm: u32,
+    pub selected: bool,
+    pub is_seed: bool,
+    pub availability: Option<f64>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TrackerEvidence {
     pub identity: String,
@@ -116,6 +127,7 @@ pub trait TorrentClient: Send + Sync {
     fn queue_settings(&self) -> PortFuture<'_, QueueSettings>;
     fn network_preferences(&self) -> PortFuture<'_, NetworkPreferences>;
     fn trackers<'a>(&'a self, id: &'a TorrentId) -> PortFuture<'a, Vec<TrackerEvidence>>;
+    fn files<'a>(&'a self, id: &'a TorrentId) -> PortFuture<'a, Vec<FileObservation>>;
     fn stop<'a>(&'a self, id: &'a TorrentId) -> EffectFuture<'a>;
     fn start<'a>(&'a self, id: &'a TorrentId) -> EffectFuture<'a>;
     fn set_active_downloads(&self, value: u32) -> EffectFuture<'_>;
@@ -158,6 +170,10 @@ impl TorrentService {
 
     pub async fn trackers(&self, id: &TorrentId) -> Result<Vec<TrackerEvidence>, PortError> {
         self.client.trackers(id).await
+    }
+
+    pub async fn files(&self, id: &TorrentId) -> Result<Vec<FileObservation>, PortError> {
+        self.client.files(id).await
     }
 
     pub async fn stop(&self, id: &TorrentId) -> EffectAttempt {
