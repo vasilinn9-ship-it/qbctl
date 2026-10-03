@@ -1330,7 +1330,7 @@ impl CompletionService {
         original_file: &CompletionFileRecord,
         explicit_request: bool,
     ) -> Result<HandoffProgress, PortError> {
-        let temp_relative = completion_temp_relative(&record.operation_id, original_file.index);
+        let temp_relative = Self::completion_temp_relative(&record.operation_id, original_file.index);
         let mut delete_intent_created_now = false;
 
         loop {
@@ -1340,10 +1340,7 @@ impl CompletionService {
                 .find(|file| file.index == original_file.index)
                 .cloned()
                 .ok_or_else(|| {
-                    PortError::new(
-                        "COMPLETION_FILE_NOT_FOUND",
-                        original_file.index.to_string(),
-                    )
+                    PortError::new("COMPLETION_FILE_NOT_FOUND", original_file.index.to_string())
                 })?;
 
             match file.state {
@@ -1518,11 +1515,7 @@ impl CompletionService {
                         &temp_relative,
                         &file.source_evidence,
                     ) {
-                        Ok(VerifiedCopyOutcome::Verified {
-                            temp,
-                            sha256,
-                            ..
-                        }) => (temp, sha256),
+                        Ok(VerifiedCopyOutcome::Verified { temp, sha256, .. }) => (temp, sha256),
                         Ok(VerifiedCopyOutcome::SourceMissing) => {
                             return self.block_file_handoff(
                                 record,
@@ -1721,10 +1714,9 @@ impl CompletionService {
                         }
                     }
                     let _ = sha256;
-                    record = self.journal.mark_file_source_delete_pending(
-                        &record.operation_id,
-                        file.index,
-                    )?;
+                    record = self
+                        .journal
+                        .mark_file_source_delete_pending(&record.operation_id, file.index)?;
                     delete_intent_created_now = true;
                 }
                 CompletionFileState::SourceDeletePending
@@ -1824,10 +1816,9 @@ impl CompletionService {
                         });
                     }
                     if file.state == CompletionFileState::UnknownSourceDelete {
-                        record = self.journal.mark_file_source_delete_pending(
-                            &record.operation_id,
-                            file.index,
-                        )?;
+                        record = self
+                            .journal
+                            .mark_file_source_delete_pending(&record.operation_id, file.index)?;
                     }
 
                     match self.storage.delete_managed_exact(
@@ -1918,16 +1909,16 @@ impl CompletionService {
         }
     }
 
-fn completion_temp_relative(operation_id: &OperationId, file_index: u32) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let digest = Sha256::digest(operation_id.as_str().as_bytes());
-    let mut token = String::with_capacity(32);
-    for byte in &digest[..16] {
-        token.push(char::from(HEX[usize::from(byte >> 4)]));
-        token.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    fn completion_temp_relative(operation_id: &OperationId, file_index: u32) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let digest = Sha256::digest(operation_id.as_str().as_bytes());
+        let mut token = String::with_capacity(32);
+        for byte in &digest[..16] {
+            token.push(char::from(HEX[usize::from(byte >> 4)]));
+            token.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        format!("_qbctl_tmp/{token}/{file_index}.part")
     }
-    format!("_qbctl_tmp/{token}/{file_index}.part")
-}
 
     fn observe_same_volume_handoff(
         &self,
