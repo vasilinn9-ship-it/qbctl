@@ -70,7 +70,10 @@ pub enum VerifiedCopyOutcome {
     },
     SourceMissing,
     SourceChanged { observed: FileEvidence },
-    TempConflict { observed: FileEvidence },
+    TempConflict {
+        observed: FileEvidence,
+        sha256: [u8; 32],
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
