@@ -709,10 +709,7 @@ impl IncomingCleanupJournal for Journal {
                  FROM incoming_cleanup_intents
                  WHERE fingerprint_version = ?1
                    AND cleanup_fingerprint = ?2",
-                params![
-                    INCOMING_CLEANUP_FINGERPRINT_VERSION,
-                    fingerprint.as_slice()
-                ],
+                params![INCOMING_CLEANUP_FINGERPRINT_VERSION, fingerprint.as_slice()],
                 |row| row.get(0),
             )
             .optional()
@@ -790,8 +787,18 @@ impl IncomingCleanupJournal for Journal {
                     INCOMING_CLEANUP_FINGERPRINT_VERSION,
                     fingerprint.as_slice(),
                     intent.canonical_path,
-                    intent.canonical_evidence.identity.volume_id.to_be_bytes().as_slice(),
-                    intent.canonical_evidence.identity.file_id.to_be_bytes().as_slice(),
+                    intent
+                        .canonical_evidence
+                        .identity
+                        .volume_id
+                        .to_be_bytes()
+                        .as_slice(),
+                    intent
+                        .canonical_evidence
+                        .identity
+                        .file_id
+                        .to_be_bytes()
+                        .as_slice(),
                     intent.canonical_evidence.size.to_be_bytes().as_slice(),
                     intent
                         .canonical_evidence
@@ -799,8 +806,18 @@ impl IncomingCleanupJournal for Journal {
                         .to_be_bytes()
                         .as_slice(),
                     intent.redundant_path,
-                    intent.redundant_evidence.identity.volume_id.to_be_bytes().as_slice(),
-                    intent.redundant_evidence.identity.file_id.to_be_bytes().as_slice(),
+                    intent
+                        .redundant_evidence
+                        .identity
+                        .volume_id
+                        .to_be_bytes()
+                        .as_slice(),
+                    intent
+                        .redundant_evidence
+                        .identity
+                        .file_id
+                        .to_be_bytes()
+                        .as_slice(),
                     intent.redundant_evidence.size.to_be_bytes().as_slice(),
                     intent
                         .redundant_evidence
@@ -863,10 +880,7 @@ impl IncomingCleanupJournal for Journal {
         Ok(records)
     }
 
-    fn mark_cleanup_deleted(
-        &self,
-        cleanup_id: &str,
-    ) -> Result<IncomingCleanupRecord, PortError> {
+    fn mark_cleanup_deleted(&self, cleanup_id: &str) -> Result<IncomingCleanupRecord, PortError> {
         transition_cleanup(self, cleanup_id, IncomingCleanupState::Deleted, None)
     }
 
@@ -2451,14 +2465,8 @@ fn transition_cleanup(
         ));
     }
 
-    insert_cleanup_event(
-        &transaction,
-        cleanup_id,
-        revision,
-        event_kind,
-        problem_code,
-    )
-    .map_err(map_port_error)?;
+    insert_cleanup_event(&transaction, cleanup_id, revision, event_kind, problem_code)
+        .map_err(map_port_error)?;
 
     let record = load_cleanup_record(&transaction, cleanup_id)
         .map_err(map_port_error)?
@@ -3124,9 +3132,7 @@ mod tests {
         };
 
         let reopened = Journal::open(&path).expect("reopen");
-        let deleted = reopened
-            .mark_cleanup_deleted(&cleanup_id)
-            .expect("receipt");
+        let deleted = reopened.mark_cleanup_deleted(&cleanup_id).expect("receipt");
         assert_eq!(deleted.state, IncomingCleanupState::Deleted);
         assert_eq!(deleted.revision, 2);
         assert!(reopened
