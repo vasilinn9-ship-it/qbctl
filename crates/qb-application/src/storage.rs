@@ -100,6 +100,7 @@ pub struct IncomingRejection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IncomingRedundantCopy {
     pub canonical_path: String,
+    pub canonical_evidence: FileEvidence,
     pub redundant_path: String,
     pub source_evidence: FileEvidence,
     pub source_sha256: [u8; 32],
@@ -350,6 +351,7 @@ impl IncomingScanService {
                 let candidate = &candidates[index];
                 redundant.push(IncomingRedundantCopy {
                     canonical_path: canonical.relative_path.clone(),
+                    canonical_evidence: canonical.source_evidence.clone(),
                     redundant_path: candidate.relative_path.clone(),
                     source_evidence: candidate.source_evidence.clone(),
                     source_sha256: candidate.source_sha256,
