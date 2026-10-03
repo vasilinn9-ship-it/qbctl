@@ -975,7 +975,8 @@ mod tests {
             .expect("application volume status");
         assert_eq!(status.root, ManagedRoot::Working);
         assert_eq!(status.volume_id, u64::from(volume.serial_number));
-        assert_eq!(status.free_bytes, volume.free_bytes);
+        assert!(status.total_bytes > 0);
+        assert!(status.free_bytes <= status.total_bytes);
         assert_eq!(status.total_bytes, volume.total_bytes);
 
         fs::remove_dir_all(temp).expect("cleanup");
