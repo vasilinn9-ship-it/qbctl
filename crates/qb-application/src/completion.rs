@@ -1692,7 +1692,15 @@ impl CompletionService {
         }
 
         let ready = self.journal.mark_payload_handed_off(&record.operation_id)?;
-        Ok(HandoffProgress::Continue(ready))
+        if explicit_request {
+            Ok(HandoffProgress::Continue(ready))
+        } else {
+            Ok(HandoffProgress::Halt {
+                status: CompletionExecutionStatus::RemoveRecordPending,
+                record: ready,
+                problem: None,
+            })
+        }
     }
 
     fn advance_cross_volume_file(
