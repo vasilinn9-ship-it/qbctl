@@ -46,6 +46,13 @@ pub struct StorageVolumeStatus {
     pub total_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IncomingDeleteOutcome {
+    Deleted,
+    Missing,
+    Changed,
+}
+
 pub trait Storage: Send + Sync {
     fn volume_status(&self, root: ManagedRoot) -> Result<StorageVolumeStatus, PortError>;
 
@@ -60,6 +67,19 @@ pub trait Storage: Send + Sync {
         relative_path: &str,
         max_bytes: usize,
     ) -> Result<IncomingFileSnapshot, PortError>;
+
+    fn delete_incoming_exact(
+        &self,
+        _relative_path: &str,
+        _expected_evidence: &FileEvidence,
+        _expected_sha256: &[u8; 32],
+        _max_bytes: usize,
+    ) -> Result<IncomingDeleteOutcome, PortError> {
+        Err(PortError::new(
+            "STORAGE_DELETE_UNSUPPORTED",
+            "exact Incoming deletion is not supported by this storage adapter",
+        ))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -82,6 +102,7 @@ pub struct IncomingRedundantCopy {
     pub canonical_path: String,
     pub redundant_path: String,
     pub source_evidence: FileEvidence,
+    pub source_sha256: [u8; 32],
     pub torrent_identity: qb_domain::torrent::TorrentIdentity,
 }
 
@@ -331,6 +352,7 @@ impl IncomingScanService {
                     canonical_path: canonical.relative_path.clone(),
                     redundant_path: candidate.relative_path.clone(),
                     source_evidence: candidate.source_evidence.clone(),
+                    source_sha256: candidate.source_sha256,
                     torrent_identity: candidate.metainfo.identity.clone(),
                 });
             }
