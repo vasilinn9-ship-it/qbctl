@@ -1029,6 +1029,7 @@ impl CompletionService {
 
         match self.storage.move_same_volume_no_replace(
             ManagedRoot::Incoming,
+            &record.source_relative,
             ManagedRoot::Archive,
             &record.source_relative,
             &record.source_evidence,
@@ -1211,6 +1212,7 @@ impl CompletionService {
 
             match self.storage.move_same_volume_no_replace(
                 ManagedRoot::Working,
+                &file.relative_path,
                 ManagedRoot::Completed,
                 &file.relative_path,
                 &file.source_evidence,
@@ -1609,7 +1611,7 @@ mod tests {
                 .expect("files mutex")
                 .iter()
                 .find(|(candidate_root, candidate_path, _)| {
-                    *candidate_root == root && candidate_path == relative_path
+                    *candidate_root == root && candidate_path == source_relative
                 })
                 .map(|(_, _, evidence)| evidence.clone()))
         }
@@ -1617,14 +1619,15 @@ mod tests {
         fn move_same_volume_no_replace(
             &self,
             source_root: ManagedRoot,
+            source_relative: &str,
             destination_root: ManagedRoot,
-            relative_path: &str,
+            destination_relative: &str,
             expected_source: &FileEvidence,
         ) -> Result<SameVolumeMoveOutcome, PortError> {
             let mut files = self.files.lock().expect("files mutex");
             let Some(source_index) = files
                 .iter()
-                .position(|(root, path, _)| *root == source_root && path == relative_path)
+                .position(|(root, path, _)| *root == source_root && path == source_relative)
             else {
                 return Ok(SameVolumeMoveOutcome::SourceMissing);
             };
@@ -1636,7 +1639,7 @@ mod tests {
             }
             if let Some((_, _, observed)) = files
                 .iter()
-                .find(|(root, path, _)| *root == destination_root && path == relative_path)
+                .find(|(root, path, _)| *root == destination_root && path == destination_relative)
             {
                 return Ok(SameVolumeMoveOutcome::DestinationExists {
                     observed: observed.clone(),
@@ -1645,7 +1648,7 @@ mod tests {
             files.remove(source_index);
             files.push((
                 destination_root,
-                relative_path.to_owned(),
+                destination_relative.to_owned(),
                 source_evidence.clone(),
             ));
             Ok(SameVolumeMoveOutcome::Moved {
