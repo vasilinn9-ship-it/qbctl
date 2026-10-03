@@ -120,8 +120,10 @@ pub async fn run(runtime_override: Option<PathBuf>) -> Result<()> {
                                 system,
                                 storage,
                                 torrents,
-                                mutations,
-                                completion,
+                                protocol::OperationServices {
+                                    mutations,
+                                    completion,
+                                },
                                 qbit_startup_problem,
                             )
                             .await
