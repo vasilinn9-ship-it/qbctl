@@ -823,6 +823,7 @@ mod tests {
             &system(),
             None,
             None,
+            None,
             false,
             None,
         )
@@ -853,6 +854,7 @@ mod tests {
             &system(),
             None,
             None,
+            None,
             false,
             None,
         )
@@ -874,6 +876,7 @@ mod tests {
                 command: None,
             },
             &system(),
+            None,
             None,
             None,
             false,
