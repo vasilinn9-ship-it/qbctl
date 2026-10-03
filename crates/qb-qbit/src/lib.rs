@@ -894,6 +894,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_observation_preserves_selection_and_incomplete_name() {
+        let server = FakeHttpServer::spawn(vec![
+            FakeResponse::ok("Ok.").with_header("Set-Cookie", "SID=test; HttpOnly"),
+            FakeResponse::ok(
+                r#"[{"index":0,"name":"dir/file.bin.!qB","size":100,"progress":0.5,"priority":0,"is_seed":false,"availability":0.75},{"index":1,"name":"dir/ready.bin","size":200,"progress":1.0,"priority":1,"is_seed":true,"availability":1.0}]"#,
+            ),
+        ])
+        .await;
+        let client = QbitClient::new(
+            &server.url,
+            QbitCredentials::new("admin", "secret"),
+            Duration::from_secs(2),
+        )
+        .expect("client");
+        let id = TorrentId::new("abcdef0123456789abcdef0123456789abcdef01").expect("torrent id");
+
+        let files = client.files_inner(&id).await.expect("files");
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "dir/file.bin.!qB");
+        assert_eq!(files[0].progress_ppm, 500_000);
+        assert!(!files[0].selected);
+        assert!(files[1].selected);
+        assert!(files[1].is_seed);
+
+        let requests = server.finish().await;
+        assert!(requests[1].starts_with(
+            "get /api/v2/torrents/files?hash=abcdef0123456789abcdef0123456789abcdef01 http/1.1"
+        ));
+    }
+
+    #[tokio::test]
     async fn stop_posts_exact_hash_once() {
         let server = FakeHttpServer::spawn(vec![
             FakeResponse::ok("Ok.").with_header("Set-Cookie", "SID=test; HttpOnly"),
