@@ -54,8 +54,7 @@ mod tests {
     #[test]
     fn registry_state_is_explicit_and_transport_independent() {
         let input = RegisterIncoming {
-            identity: TorrentIdentity::new(Some([0x11; 20]), Some([0x22; 32]))
-                .expect("identity"),
+            identity: TorrentIdentity::new(Some([0x11; 20]), Some([0x22; 32])).expect("identity"),
             source_relative: "sample.torrent".into(),
             source_metainfo_digest: [0x33; 32],
         };
