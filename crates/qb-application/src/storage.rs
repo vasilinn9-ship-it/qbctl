@@ -129,6 +129,70 @@ pub struct IncomingScanService {
     registry: Arc<dyn TorrentRegistry>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedRootStatus {
+    pub root: ManagedRoot,
+    pub path: String,
+    pub volume_id: u64,
+    pub free_bytes: u64,
+    pub total_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageStatusSnapshot {
+    pub roots: Vec<ManagedRootStatus>,
+    pub incoming: IncomingScan,
+}
+
+pub struct StorageStatusService {
+    storage: Arc<dyn Storage>,
+    scan: IncomingScanService,
+    max_metainfo_bytes: usize,
+}
+
+impl StorageStatusService {
+    pub fn new(
+        storage: Arc<dyn Storage>,
+        scan: IncomingScanService,
+        max_metainfo_bytes: usize,
+    ) -> Self {
+        Self {
+            storage,
+            scan,
+            max_metainfo_bytes,
+        }
+    }
+
+    pub fn list(&self) -> Result<Vec<ManagedRootStatus>, PortError> {
+        [
+            ManagedRoot::Incoming,
+            ManagedRoot::Archive,
+            ManagedRoot::Working,
+            ManagedRoot::Completed,
+        ]
+        .into_iter()
+        .map(|root| {
+            let path = self.storage.root_path(root)?;
+            let volume = self.storage.volume_status(root)?;
+            Ok(ManagedRootStatus {
+                root,
+                path,
+                volume_id: volume.volume_id,
+                free_bytes: volume.free_bytes,
+                total_bytes: volume.total_bytes,
+            })
+        })
+        .collect()
+    }
+
+    pub fn status(&self) -> Result<StorageStatusSnapshot, PortError> {
+        Ok(StorageStatusSnapshot {
+            roots: self.list()?,
+            incoming: self.scan.scan(self.max_metainfo_bytes)?,
+        })
+    }
+}
+
 impl IncomingScanService {
     pub fn new(
         storage: Arc<dyn Storage>,
