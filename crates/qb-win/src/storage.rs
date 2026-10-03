@@ -58,6 +58,15 @@ pub struct ValidatedManagedRootLayout {
     pub runtime: PathBuf,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VolumeObservation {
+    pub role: ManagedRootRole,
+    pub volume_root: PathBuf,
+    pub serial_number: u32,
+    pub free_bytes: u64,
+    pub total_bytes: u64,
+}
+
 impl ManagedRootLayout {
     pub fn validate(&self) -> Result<ValidatedManagedRootLayout, StorageError> {
         let roots = [
@@ -106,6 +115,25 @@ impl ManagedRootLayout {
     }
 }
 
+impl ValidatedManagedRootLayout {
+    pub fn path(&self, role: ManagedRootRole) -> &Path {
+        match role {
+            ManagedRootRole::Incoming => &self.incoming,
+            ManagedRootRole::Archive => &self.archive,
+            ManagedRootRole::Working => &self.working,
+            ManagedRootRole::Completed => &self.completed,
+            ManagedRootRole::Runtime => &self.runtime,
+        }
+    }
+
+    pub fn observe_volume(
+        &self,
+        role: ManagedRootRole,
+    ) -> Result<VolumeObservation, StorageError> {
+        observe_volume(role, self.path(role))
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("managed relative path is empty")]
@@ -140,6 +168,8 @@ pub enum StorageError {
         first: ManagedRootRole,
         second: ManagedRootRole,
     },
+    #[error("Windows volume observation is unavailable on this platform")]
+    VolumeObservationUnsupported,
     #[error("{role:?} root I/O error at {path}: {source}")]
     RootIo {
         role: ManagedRootRole,
@@ -273,15 +303,30 @@ fn is_reparse_metadata(metadata: &fs::Metadata) -> bool {
 
 #[cfg(windows)]
 fn ensure_local_fixed_volume(role: ManagedRootRole, path: &Path) -> Result<(), StorageError> {
-    use std::path::Prefix;
-
     use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
 
     // GetDriveTypeW: DRIVE_FIXED is the documented value 3.
     const DRIVE_TYPE_FIXED: u32 = 3;
 
-    let prefix = path.components().next();
-    let letter = match prefix {
+    let (_, wide) = fixed_drive_root(role, path)?;
+    let drive_type = unsafe { GetDriveTypeW(wide.as_ptr()) };
+    if drive_type != DRIVE_TYPE_FIXED {
+        return Err(StorageError::RootNotLocalFixedVolume {
+            role,
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn fixed_drive_root(
+    role: ManagedRootRole,
+    path: &Path,
+) -> Result<(PathBuf, [u16; 4]), StorageError> {
+    use std::path::Prefix;
+
+    let letter = match path.components().next() {
         Some(Component::Prefix(prefix)) => match prefix.kind() {
             Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => letter,
             _ => {
@@ -300,19 +345,72 @@ fn ensure_local_fixed_volume(role: ManagedRootRole, path: &Path) -> Result<(), S
     };
 
     let wide = [u16::from(letter), b':' as u16, b'\\' as u16, 0];
-    let drive_type = unsafe { GetDriveTypeW(wide.as_ptr()) };
-    if drive_type != DRIVE_TYPE_FIXED {
-        return Err(StorageError::RootNotLocalFixedVolume {
-            role,
-            path: path.to_path_buf(),
-        });
-    }
-    Ok(())
+    let root = PathBuf::from(format!("{}:\\", char::from(letter)));
+    Ok((root, wide))
 }
 
 #[cfg(not(windows))]
 fn ensure_local_fixed_volume(_role: ManagedRootRole, _path: &Path) -> Result<(), StorageError> {
     Ok(())
+}
+
+#[cfg(windows)]
+fn observe_volume(
+    role: ManagedRootRole,
+    path: &Path,
+) -> Result<VolumeObservation, StorageError> {
+    use std::ptr;
+
+    use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationW;
+
+    let (volume_root, wide_root) = fixed_drive_root(role, path)?;
+    let mut serial_number = 0_u32;
+    let ok = unsafe {
+        GetVolumeInformationW(
+            wide_root.as_ptr(),
+            ptr::null_mut(),
+            0,
+            &mut serial_number,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if ok == 0 {
+        return Err(StorageError::RootIo {
+            role,
+            path: volume_root,
+            source: io::Error::last_os_error(),
+        });
+    }
+
+    let free_bytes = fs2::available_space(path).map_err(|source| StorageError::RootIo {
+        role,
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let total_bytes = fs2::total_space(path).map_err(|source| StorageError::RootIo {
+        role,
+        path: path.to_path_buf(),
+        source,
+    })?;
+
+    Ok(VolumeObservation {
+        role,
+        volume_root,
+        serial_number,
+        free_bytes,
+        total_bytes,
+    })
+}
+
+#[cfg(not(windows))]
+fn observe_volume(
+    _role: ManagedRootRole,
+    _path: &Path,
+) -> Result<VolumeObservation, StorageError> {
+    Err(StorageError::VolumeObservationUnsupported)
 }
 
 #[cfg(windows)]
@@ -445,6 +543,40 @@ mod tests {
         assert!(validated.working.is_absolute());
         assert!(validated.completed.is_absolute());
         assert!(validated.runtime.is_absolute());
+        fs::remove_dir_all(temp).expect("cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn validated_root_exposes_volume_identity_and_capacity() {
+        let temp = temp_root("volume");
+        let incoming = temp.join("incoming");
+        let archive = temp.join("archive");
+        let working = temp.join("working");
+        let completed = temp.join("completed");
+        let runtime = temp.join("runtime");
+        for path in [&incoming, &archive, &working, &completed, &runtime] {
+            fs::create_dir_all(path).expect("create root");
+        }
+
+        let roots = ManagedRootLayout {
+            incoming,
+            archive,
+            working,
+            completed,
+            runtime,
+        }
+        .validate()
+        .expect("valid roots");
+
+        let volume = roots
+            .observe_volume(ManagedRootRole::Working)
+            .expect("volume observation");
+        assert_eq!(volume.role, ManagedRootRole::Working);
+        assert!(volume.volume_root.is_absolute());
+        assert!(volume.total_bytes > 0);
+        assert!(volume.free_bytes <= volume.total_bytes);
+
         fs::remove_dir_all(temp).expect("cleanup");
     }
 
