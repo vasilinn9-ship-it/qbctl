@@ -1117,7 +1117,12 @@ mod tests {
         assert!(!roots.incoming.join("duplicate.torrent").exists());
         assert_eq!(
             storage
-                .delete_incoming_exact("duplicate.torrent", &snapshot.evidence, &snapshot.bytes, 1024)
+                .delete_incoming_exact(
+                    "duplicate.torrent",
+                    &snapshot.evidence,
+                    &snapshot.bytes,
+                    1024,
+                )
                 .expect("observe absent"),
             IncomingDeleteOutcome::Missing
         );
@@ -1141,7 +1146,12 @@ mod tests {
 
         assert_eq!(
             storage
-                .delete_incoming_exact("duplicate.torrent", &snapshot.evidence, &snapshot.bytes, 1024)
+                .delete_incoming_exact(
+                    "duplicate.torrent",
+                    &snapshot.evidence,
+                    &snapshot.bytes,
+                    1024,
+                )
                 .expect("changed"),
             IncomingDeleteOutcome::Changed
         );
