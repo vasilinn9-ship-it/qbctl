@@ -17,13 +17,17 @@ pub enum MutationCommand {
         torrent_id: TorrentId,
         action: TorrentControlAction,
     },
-    QueueSet {
-        target_client_count: Option<u32>,
-        max_active_downloads: Option<u32>,
+    SetQueueTarget {
+        target_client_count: u32,
     },
-    TransferLimitsSet {
-        download_limit_bps: Option<u64>,
-        upload_limit_bps: Option<u64>,
+    SetActiveDownloads {
+        max_active_downloads: u32,
+    },
+    SetDownloadLimit {
+        bytes_per_sec: u64,
+    },
+    SetUploadLimit {
+        bytes_per_sec: u64,
     },
 }
 
@@ -38,8 +42,10 @@ impl MutationCommand {
                 action: TorrentControlAction::Start,
                 ..
             } => "torrent.start",
-            Self::QueueSet { .. } => "queue.set",
-            Self::TransferLimitsSet { .. } => "transfer.limits.set",
+            Self::SetQueueTarget { .. } => "queue.target.set",
+            Self::SetActiveDownloads { .. } => "queue.downloads.set",
+            Self::SetDownloadLimit { .. } => "transfer.download_limit.set",
+            Self::SetUploadLimit { .. } => "transfer.upload_limit.set",
         }
     }
 
@@ -58,33 +64,19 @@ impl MutationCommand {
                     TorrentControlAction::Start => b"start".as_slice(),
                 });
             }
-            Self::QueueSet {
+            Self::SetQueueTarget {
                 target_client_count,
+            } => digest.update(target_client_count.to_be_bytes()),
+            Self::SetActiveDownloads {
                 max_active_downloads,
-            } => {
-                update_optional_u64(&mut digest, target_client_count.map(u64::from));
-                update_optional_u64(&mut digest, max_active_downloads.map(u64::from));
-            }
-            Self::TransferLimitsSet {
-                download_limit_bps,
-                upload_limit_bps,
-            } => {
-                update_optional_u64(&mut digest, *download_limit_bps);
-                update_optional_u64(&mut digest, *upload_limit_bps);
+            } => digest.update(max_active_downloads.to_be_bytes()),
+            Self::SetDownloadLimit { bytes_per_sec }
+            | Self::SetUploadLimit { bytes_per_sec } => {
+                digest.update(bytes_per_sec.to_be_bytes());
             }
         }
 
         digest.finalize().into()
-    }
-}
-
-fn update_optional_u64(digest: &mut Sha256, value: Option<u64>) {
-    match value {
-        Some(value) => {
-            digest.update([1]);
-            digest.update(value.to_be_bytes());
-        }
-        None => digest.update([0]),
     }
 }
 
@@ -173,25 +165,28 @@ mod tests {
         assert_eq!(command.fingerprint(), command.fingerprint());
         assert_ne!(
             command.fingerprint(),
-            MutationCommand::QueueSet {
-                target_client_count: Some(10),
-                max_active_downloads: None,
+            MutationCommand::SetQueueTarget {
+                target_client_count: 10,
             }
             .fingerprint()
         );
     }
 
     #[test]
-    fn optional_fields_affect_fingerprint() {
-        let first = MutationCommand::TransferLimitsSet {
-            download_limit_bps: Some(24_000_000),
-            upload_limit_bps: None,
-        };
-        let second = MutationCommand::TransferLimitsSet {
-            download_limit_bps: Some(24_000_000),
-            upload_limit_bps: Some(0),
-        };
-
-        assert_ne!(first.fingerprint(), second.fingerprint());
+    fn command_values_affect_fingerprint() {
+        assert_ne!(
+            MutationCommand::SetDownloadLimit {
+                bytes_per_sec: 24_000_000,
+            }
+            .fingerprint(),
+            MutationCommand::SetDownloadLimit {
+                bytes_per_sec: 23_999_488,
+            }
+            .fingerprint()
+        );
+        assert_ne!(
+            MutationCommand::SetDownloadLimit { bytes_per_sec: 0 }.fingerprint(),
+            MutationCommand::SetUploadLimit { bytes_per_sec: 0 }.fingerprint()
+        );
     }
 }
