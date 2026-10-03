@@ -5,11 +5,21 @@ use std::{
     time::Duration,
 };
 
-use qb_application::{JournalHealthPort, PortError};
-use rusqlite::{Connection, OptionalExtension};
+use qb_application::{
+    mutation::{
+        MutationDisposition, MutationJournal, MutationRecord, RequestReservation,
+        FINGERPRINT_VERSION,
+    },
+    JournalHealthPort, PortError,
+};
+use qb_domain::{OperationId, RequestId};
+use rusqlite::{
+    params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior,
+};
 use thiserror::Error;
+use uuid::Uuid;
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Error)]
 pub enum JournalError {
@@ -23,6 +33,10 @@ pub enum JournalError {
     MigrationRequired,
     #[error("SQLite quick_check failed: {0}")]
     Integrity(String),
+    #[error("journal state is invalid: {0}")]
+    InvalidState(String),
+    #[error("operation transition is invalid: {0}")]
+    InvalidTransition(String),
 }
 
 pub struct Journal {
@@ -37,9 +51,9 @@ impl Journal {
             fs::create_dir_all(parent)?;
         }
 
-        let connection = Connection::open(&path)?;
+        let mut connection = Connection::open(&path)?;
         configure(&connection)?;
-        migrate(&connection)?;
+        migrate(&mut connection)?;
 
         Ok(Self {
             path,
@@ -66,17 +80,301 @@ impl Journal {
             Err(JournalError::Integrity(value))
         }
     }
+
+    fn reserve_request_inner(
+        &self,
+        request_id: &RequestId,
+        command_kind: &str,
+        fingerprint: [u8; 32],
+    ) -> Result<RequestReservation, JournalError> {
+        if command_kind.is_empty() {
+            return Err(JournalError::InvalidState(
+                "command kind must not be empty".into(),
+            ));
+        }
+
+        let mut connection = self.connection.lock().expect("journal mutex poisoned");
+        let transaction =
+            connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        if let Some(existing) = load_request(&transaction, request_id.as_str())? {
+            let operation_id = OperationId::new(existing.operation_id.clone())
+                .map_err(|error| JournalError::InvalidState(error.to_string()))?;
+
+            if existing.fingerprint_version != FINGERPRINT_VERSION
+                || existing.command_kind != command_kind
+                || existing.command_fingerprint.as_slice() != fingerprint
+            {
+                return Ok(RequestReservation::Conflict { operation_id });
+            }
+
+            let record = load_operation(&transaction, operation_id.as_str())?
+                .ok_or_else(|| {
+                    JournalError::InvalidState(format!(
+                        "request {} references missing operation {}",
+                        request_id, operation_id
+                    ))
+                })?;
+            transaction.commit()?;
+            return Ok(RequestReservation::Replay(record));
+        }
+
+        let operation_id = OperationId::new(Uuid::new_v4().to_string())
+            .map_err(|error| JournalError::InvalidState(error.to_string()))?;
+        let now = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
+
+        transaction.execute(
+            &format!(
+                "INSERT INTO requests(
+                    request_id, fingerprint_version, command_kind, command_fingerprint,
+                    operation_id, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, {now})"
+            ),
+            params![
+                request_id.as_str(),
+                FINGERPRINT_VERSION,
+                command_kind,
+                fingerprint.as_slice(),
+                operation_id.as_str(),
+            ],
+        )?;
+
+        transaction.execute(
+            &format!(
+                "INSERT INTO operations(
+                    operation_id, request_id, command_kind, checkpoint, disposition,
+                    pending_effect_kind, problem_code, revision, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, 'prepared', 'prepared', NULL, NULL, 1, {now}, {now})"
+            ),
+            params![operation_id.as_str(), request_id.as_str(), command_kind],
+        )?;
+
+        insert_event(
+            &transaction,
+            operation_id.as_str(),
+            1,
+            "prepared",
+            "prepared",
+            MutationDisposition::Prepared,
+            None,
+            None,
+        )?;
+
+        let record = load_operation(&transaction, operation_id.as_str())?
+            .ok_or_else(|| JournalError::InvalidState("new operation was not persisted".into()))?;
+        transaction.commit()?;
+        Ok(RequestReservation::New(record))
+    }
+
+    fn transition(
+        &self,
+        operation_id: &OperationId,
+        expected: MutationDisposition,
+        next: MutationDisposition,
+        checkpoint: &str,
+        event_kind: &str,
+        pending_effect_kind: Option<&str>,
+        problem_code: Option<&str>,
+        finished: bool,
+    ) -> Result<MutationRecord, JournalError> {
+        let mut connection = self.connection.lock().expect("journal mutex poisoned");
+        let transaction =
+            connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let current = load_operation(&transaction, operation_id.as_str())?
+            .ok_or_else(|| JournalError::InvalidState(format!(
+                "operation {} does not exist",
+                operation_id
+            )))?;
+
+        if current.disposition == next
+            && current.checkpoint == checkpoint
+            && current.pending_effect_kind.as_deref() == pending_effect_kind
+            && current.problem_code.as_deref() == problem_code
+        {
+            transaction.commit()?;
+            return Ok(current);
+        }
+
+        if current.disposition != expected {
+            return Err(JournalError::InvalidTransition(format!(
+                "{} cannot move from {} to {}",
+                operation_id,
+                disposition_name(current.disposition),
+                disposition_name(next)
+            )));
+        }
+
+        let next_revision = current
+            .revision()
+            .checked_add(1)
+            .ok_or_else(|| JournalError::InvalidState("operation revision overflow".into()))?;
+
+        let finished_sql = if finished {
+            "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+        } else {
+            "NULL"
+        };
+
+        let changed = transaction.execute(
+            &format!(
+                "UPDATE operations
+                 SET checkpoint = ?1,
+                     disposition = ?2,
+                     pending_effect_kind = ?3,
+                     problem_code = ?4,
+                     revision = ?5,
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                     finished_at = {finished_sql}
+                 WHERE operation_id = ?6 AND revision = ?7 AND disposition = ?8"
+            ),
+            params![
+                checkpoint,
+                disposition_name(next),
+                pending_effect_kind,
+                problem_code,
+                next_revision,
+                operation_id.as_str(),
+                current.revision(),
+                disposition_name(expected),
+            ],
+        )?;
+
+        if changed != 1 {
+            return Err(JournalError::InvalidTransition(format!(
+                "{} changed while transition was being committed",
+                operation_id
+            )));
+        }
+
+        insert_event(
+            &transaction,
+            operation_id.as_str(),
+            next_revision,
+            event_kind,
+            checkpoint,
+            next,
+            pending_effect_kind,
+            problem_code,
+        )?;
+
+        let record = load_operation(&transaction, operation_id.as_str())?
+            .ok_or_else(|| JournalError::InvalidState("updated operation disappeared".into()))?;
+        transaction.commit()?;
+        Ok(record)
+    }
 }
 
 impl JournalHealthPort for Journal {
     fn schema_version(&self) -> Result<u32, PortError> {
-        Journal::schema_version(self)
-            .map_err(|error| PortError::new("JOURNAL_UNAVAILABLE", error.to_string()))
+        Journal::schema_version(self).map_err(map_port_error)
     }
 
     fn quick_check(&self) -> Result<(), PortError> {
-        Journal::quick_check(self)
-            .map_err(|error| PortError::new("JOURNAL_UNAVAILABLE", error.to_string()))
+        Journal::quick_check(self).map_err(map_port_error)
+    }
+}
+
+impl MutationJournal for Journal {
+    fn reserve_request(
+        &self,
+        request_id: &RequestId,
+        command_kind: &str,
+        fingerprint: [u8; 32],
+    ) -> Result<RequestReservation, PortError> {
+        self.reserve_request_inner(request_id, command_kind, fingerprint)
+            .map_err(map_port_error)
+    }
+
+    fn mark_effect_pending(
+        &self,
+        operation_id: &OperationId,
+        effect_kind: &str,
+    ) -> Result<MutationRecord, PortError> {
+        if effect_kind.is_empty() {
+            return Err(PortError::new(
+                "JOURNAL_STATE_INVALID",
+                "effect kind must not be empty",
+            ));
+        }
+        self.transition(
+            operation_id,
+            MutationDisposition::Prepared,
+            MutationDisposition::EffectPending,
+            "effect_pending",
+            "effect_pending",
+            Some(effect_kind),
+            None,
+            false,
+        )
+        .map_err(map_port_error)
+    }
+
+    fn mark_observed_applied(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<MutationRecord, PortError> {
+        let current = self
+            .get_operation(operation_id)?
+            .ok_or_else(|| PortError::new("OPERATION_NOT_FOUND", operation_id.to_string()))?;
+        let effect = current.pending_effect_kind.clone();
+
+        self.transition(
+            operation_id,
+            MutationDisposition::EffectPending,
+            MutationDisposition::ObservedApplied,
+            "observed_applied",
+            "observed_applied",
+            effect.as_deref(),
+            None,
+            false,
+        )
+        .map_err(map_port_error)
+    }
+
+    fn finish(&self, operation_id: &OperationId) -> Result<MutationRecord, PortError> {
+        self.transition(
+            operation_id,
+            MutationDisposition::ObservedApplied,
+            MutationDisposition::Finished,
+            "finished",
+            "finished",
+            None,
+            None,
+            true,
+        )
+        .map_err(map_port_error)
+    }
+
+    fn mark_unknown(
+        &self,
+        operation_id: &OperationId,
+        problem_code: &str,
+    ) -> Result<MutationRecord, PortError> {
+        let current = self
+            .get_operation(operation_id)?
+            .ok_or_else(|| PortError::new("OPERATION_NOT_FOUND", operation_id.to_string()))?;
+        let effect = current.pending_effect_kind.clone();
+
+        self.transition(
+            operation_id,
+            MutationDisposition::EffectPending,
+            MutationDisposition::Unknown,
+            "unknown",
+            "unknown",
+            effect.as_deref(),
+            Some(problem_code),
+            false,
+        )
+        .map_err(map_port_error)
+    }
+
+    fn get_operation(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<MutationRecord>, PortError> {
+        let connection = self.connection.lock().expect("journal mutex poisoned");
+        load_operation(&connection, operation_id.as_str()).map_err(map_port_error)
     }
 }
 
@@ -88,8 +386,8 @@ fn configure(connection: &Connection) -> Result<(), JournalError> {
     Ok(())
 }
 
-fn migrate(connection: &Connection) -> Result<(), JournalError> {
-    let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+fn migrate(connection: &mut Connection) -> Result<(), JournalError> {
+    let mut version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
 
     if version > SCHEMA_VERSION {
         return Err(JournalError::StateVersionUnsupported {
@@ -98,18 +396,33 @@ fn migrate(connection: &Connection) -> Result<(), JournalError> {
         });
     }
 
-    if version == SCHEMA_VERSION {
-        return Ok(());
+    if version == 0 {
+        if has_user_tables(connection)? {
+            return Err(JournalError::MigrationRequired);
+        }
+        create_schema_v1(connection)?;
+        version = 1;
     }
 
-    if version == 0 && has_user_tables(connection)? {
-        return Err(JournalError::MigrationRequired);
+    if version == 1 {
+        migrate_v1_to_v2(connection)?;
+        version = 2;
     }
 
-    connection.execute_batch(
+    if version != SCHEMA_VERSION {
+        return Err(JournalError::InvalidState(format!(
+            "migration stopped at schema {version}"
+        )));
+    }
+
+    Ok(())
+}
+
+fn create_schema_v1(connection: &mut Connection) -> Result<(), JournalError> {
+    let transaction =
+        connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
         r#"
-        BEGIN IMMEDIATE;
-
         CREATE TABLE schema_meta (
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             schema_version INTEGER NOT NULL,
@@ -121,10 +434,73 @@ fn migrate(connection: &Connection) -> Result<(), JournalError> {
         VALUES (1, 1, '0.1.0', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
 
         PRAGMA user_version = 1;
-        COMMIT;
         "#,
     )?;
+    transaction.commit()?;
+    Ok(())
+}
 
+fn migrate_v1_to_v2(connection: &mut Connection) -> Result<(), JournalError> {
+    let transaction =
+        connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE requests (
+            request_id TEXT PRIMARY KEY,
+            fingerprint_version INTEGER NOT NULL,
+            command_kind TEXT NOT NULL,
+            command_fingerprint BLOB NOT NULL CHECK(length(command_fingerprint) = 32),
+            operation_id TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE operations (
+            operation_id TEXT PRIMARY KEY,
+            request_id TEXT NOT NULL UNIQUE REFERENCES requests(request_id),
+            command_kind TEXT NOT NULL,
+            checkpoint TEXT NOT NULL,
+            disposition TEXT NOT NULL,
+            pending_effect_kind TEXT,
+            problem_code TEXT,
+            revision INTEGER NOT NULL CHECK(revision > 0),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            finished_at TEXT
+        );
+
+        CREATE TABLE operation_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operation_id TEXT NOT NULL REFERENCES operations(operation_id),
+            revision INTEGER NOT NULL CHECK(revision > 0),
+            event_kind TEXT NOT NULL,
+            checkpoint TEXT NOT NULL,
+            disposition TEXT NOT NULL,
+            pending_effect_kind TEXT,
+            problem_code TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(operation_id, revision)
+        );
+
+        CREATE TABLE controller_policy (
+            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+            revision INTEGER NOT NULL CHECK(revision > 0),
+            target_client_count INTEGER CHECK(target_client_count >= 0),
+            updated_at TEXT NOT NULL
+        );
+
+        INSERT INTO controller_policy(singleton, revision, target_client_count, updated_at)
+        VALUES (1, 1, NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+
+        UPDATE schema_meta
+        SET schema_version = 2,
+            application_min_version = '0.1.0',
+            migrated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE singleton = 1;
+
+        PRAGMA user_version = 2;
+        "#,
+    )?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -139,12 +515,211 @@ fn has_user_tables(connection: &Connection) -> Result<bool, JournalError> {
     Ok(table.is_some())
 }
 
+struct StoredRequest {
+    fingerprint_version: u32,
+    command_kind: String,
+    command_fingerprint: Vec<u8>,
+    operation_id: String,
+}
+
+fn load_request(
+    transaction: &Transaction<'_>,
+    request_id: &str,
+) -> Result<Option<StoredRequest>, JournalError> {
+    transaction
+        .query_row(
+            "SELECT fingerprint_version, command_kind, command_fingerprint, operation_id
+             FROM requests WHERE request_id = ?1",
+            [request_id],
+            |row| {
+                Ok(StoredRequest {
+                    fingerprint_version: row.get(0)?,
+                    command_kind: row.get(1)?,
+                    command_fingerprint: row.get(2)?,
+                    operation_id: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(JournalError::from)
+}
+
+trait QueryOperation {
+    fn query_operation(&self, operation_id: &str) -> Result<Option<MutationRecord>, JournalError>;
+}
+
+impl QueryOperation for Connection {
+    fn query_operation(&self, operation_id: &str) -> Result<Option<MutationRecord>, JournalError> {
+        self.query_row(
+            operation_select_sql(),
+            [operation_id],
+            map_operation_row,
+        )
+        .optional()
+        .map_err(JournalError::from)
+    }
+}
+
+impl QueryOperation for Transaction<'_> {
+    fn query_operation(&self, operation_id: &str) -> Result<Option<MutationRecord>, JournalError> {
+        self.query_row(
+            operation_select_sql(),
+            [operation_id],
+            map_operation_row,
+        )
+        .optional()
+        .map_err(JournalError::from)
+    }
+}
+
+fn load_operation(
+    query: &impl QueryOperation,
+    operation_id: &str,
+) -> Result<Option<MutationRecord>, JournalError> {
+    query.query_operation(operation_id)
+}
+
+fn operation_select_sql() -> &'static str {
+    "SELECT request_id, operation_id, command_kind, fingerprint_version,
+            command_fingerprint, checkpoint, disposition, pending_effect_kind,
+            problem_code, revision
+     FROM operations
+     JOIN requests USING(request_id)
+     WHERE operation_id = ?1"
+}
+
+fn map_operation_row(row: &Row<'_>) -> rusqlite::Result<MutationRecord> {
+    let request_id: String = row.get(0)?;
+    let operation_id: String = row.get(1)?;
+    let fingerprint: Vec<u8> = row.get(4)?;
+
+    let request_id = RequestId::new(request_id).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })?;
+    let operation_id = OperationId::new(operation_id).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            1,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })?;
+    let command_fingerprint: [u8; 32] = fingerprint.try_into().map_err(|value: Vec<u8>| {
+        rusqlite::Error::FromSqlConversionFailure(
+            value.len(),
+            rusqlite::types::Type::Blob,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "command fingerprint must contain 32 bytes",
+            )),
+        )
+    })?;
+
+    let disposition_text: String = row.get(6)?;
+    let disposition = parse_disposition(&disposition_text).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            6,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown mutation disposition '{disposition_text}'"),
+            )),
+        )
+    })?;
+    let revision: u64 = row.get(9)?;
+
+    Ok(MutationRecord {
+        request_id,
+        operation_id,
+        command_kind: row.get(2)?,
+        fingerprint_version: row.get(3)?,
+        command_fingerprint,
+        checkpoint: row.get(5)?,
+        disposition,
+        pending_effect_kind: row.get(7)?,
+        problem_code: row.get(8)?,
+        revision,
+    })
+}
+
+fn insert_event(
+    transaction: &Transaction<'_>,
+    operation_id: &str,
+    revision: u64,
+    event_kind: &str,
+    checkpoint: &str,
+    disposition: MutationDisposition,
+    pending_effect_kind: Option<&str>,
+    problem_code: Option<&str>,
+) -> Result<(), JournalError> {
+    transaction.execute(
+        "INSERT INTO operation_events(
+            operation_id, revision, event_kind, checkpoint, disposition,
+            pending_effect_kind, problem_code, created_at
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        params![
+            operation_id,
+            revision,
+            event_kind,
+            checkpoint,
+            disposition_name(disposition),
+            pending_effect_kind,
+            problem_code,
+        ],
+    )?;
+    Ok(())
+}
+
+fn disposition_name(value: MutationDisposition) -> &'static str {
+    match value {
+        MutationDisposition::Prepared => "prepared",
+        MutationDisposition::EffectPending => "effect_pending",
+        MutationDisposition::ObservedApplied => "observed_applied",
+        MutationDisposition::Finished => "finished",
+        MutationDisposition::Blocked => "blocked",
+        MutationDisposition::Unknown => "unknown",
+        MutationDisposition::Failed => "failed",
+    }
+}
+
+fn parse_disposition(value: &str) -> Option<MutationDisposition> {
+    match value {
+        "prepared" => Some(MutationDisposition::Prepared),
+        "effect_pending" => Some(MutationDisposition::EffectPending),
+        "observed_applied" => Some(MutationDisposition::ObservedApplied),
+        "finished" => Some(MutationDisposition::Finished),
+        "blocked" => Some(MutationDisposition::Blocked),
+        "unknown" => Some(MutationDisposition::Unknown),
+        "failed" => Some(MutationDisposition::Failed),
+        _ => None,
+    }
+}
+
+fn map_port_error(error: JournalError) -> PortError {
+    let code = match error {
+        JournalError::InvalidTransition(_) => "OPERATION_TRANSITION_INVALID",
+        JournalError::InvalidState(_) => "JOURNAL_STATE_INVALID",
+        _ => "JOURNAL_UNAVAILABLE",
+    };
+    PortError::new(code, error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn request_id(value: &str) -> RequestId {
+        RequestId::new(value).expect("request id")
+    }
+
     #[test]
-    fn creates_and_reopens_schema() {
+    fn creates_schema_v2_and_reopens() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("state.sqlite");
 
@@ -155,6 +730,130 @@ mod tests {
 
         let reopened = Journal::open(&path).expect("reopen");
         assert_eq!(reopened.schema_version().expect("version"), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migrates_v1_to_v2_additively() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.sqlite");
+        let mut connection = Connection::open(&path).expect("sqlite");
+        configure(&connection).expect("configure");
+        create_schema_v1(&mut connection).expect("v1 schema");
+        drop(connection);
+
+        let journal = Journal::open(&path).expect("migrate");
+        assert_eq!(journal.schema_version().expect("version"), 2);
+
+        let connection = journal.connection.lock().expect("journal mutex");
+        let table_count: u32 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type='table' AND name IN ('requests','operations','operation_events','controller_policy')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("table count");
+        assert_eq!(table_count, 4);
+    }
+
+    #[test]
+    fn request_reservation_replays_and_conflicts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path().join("state.sqlite")).expect("journal");
+        let request = request_id("pause-1");
+        let fingerprint = [7_u8; 32];
+
+        let first = journal
+            .reserve_request_inner(&request, "torrent.pause", fingerprint)
+            .expect("reserve");
+        let first_operation = match first {
+            RequestReservation::New(record) => record.operation_id,
+            other => panic!("unexpected reservation: {other:?}"),
+        };
+
+        let replay = journal
+            .reserve_request_inner(&request, "torrent.pause", fingerprint)
+            .expect("replay");
+        match replay {
+            RequestReservation::Replay(record) => {
+                assert_eq!(record.operation_id, first_operation);
+                assert_eq!(record.disposition, MutationDisposition::Prepared);
+            }
+            other => panic!("unexpected replay: {other:?}"),
+        }
+
+        let conflict = journal
+            .reserve_request_inner(&request, "torrent.pause", [8_u8; 32])
+            .expect("conflict");
+        assert_eq!(
+            conflict,
+            RequestReservation::Conflict {
+                operation_id: first_operation
+            }
+        );
+    }
+
+    #[test]
+    fn mutation_checkpoint_progress_is_monotonic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path().join("state.sqlite")).expect("journal");
+        let request = request_id("resume-1");
+
+        let reservation = journal
+            .reserve_request_inner(&request, "torrent.resume", [1_u8; 32])
+            .expect("reserve");
+        let operation_id = match reservation {
+            RequestReservation::New(record) => record.operation_id,
+            other => panic!("unexpected reservation: {other:?}"),
+        };
+
+        let pending = journal
+            .mark_effect_pending(&operation_id, "qbit.start")
+            .expect("pending");
+        assert_eq!(pending.disposition, MutationDisposition::EffectPending);
+
+        let observed = journal
+            .mark_observed_applied(&operation_id)
+            .expect("observed");
+        assert_eq!(
+            observed.disposition,
+            MutationDisposition::ObservedApplied
+        );
+
+        let finished = journal.finish(&operation_id).expect("finish");
+        assert_eq!(finished.disposition, MutationDisposition::Finished);
+
+        let backwards = journal.mark_effect_pending(&operation_id, "qbit.start");
+        assert!(backwards.is_err());
+    }
+
+    #[test]
+    fn unknown_preserves_pending_effect_for_recovery() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path().join("state.sqlite")).expect("journal");
+        let request = request_id("pause-unknown");
+
+        let reservation = journal
+            .reserve_request_inner(&request, "torrent.pause", [2_u8; 32])
+            .expect("reserve");
+        let operation_id = match reservation {
+            RequestReservation::New(record) => record.operation_id,
+            other => panic!("unexpected reservation: {other:?}"),
+        };
+
+        journal
+            .mark_effect_pending(&operation_id, "qbit.stop")
+            .expect("pending");
+        let unknown = journal
+            .mark_unknown(&operation_id, "QBIT_MUTATION_UNCERTAIN")
+            .expect("unknown");
+
+        assert_eq!(unknown.disposition, MutationDisposition::Unknown);
+        assert_eq!(unknown.pending_effect_kind.as_deref(), Some("qbit.stop"));
+        assert_eq!(
+            unknown.problem_code.as_deref(),
+            Some("QBIT_MUTATION_UNCERTAIN")
+        );
     }
 
     #[test]
