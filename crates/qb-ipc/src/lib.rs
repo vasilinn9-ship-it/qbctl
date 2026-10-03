@@ -26,7 +26,7 @@ fn checked_frame(frame: impl Into<Bytes>) -> Result<Bytes, IpcError> {
 
 #[cfg(windows)]
 mod platform {
-    use std::{ffi::c_void, mem::size_of, ptr};
+    use std::{ffi::c_void, io, mem::size_of, ptr};
 
     use bytes::Bytes;
     use futures_util::{SinkExt, StreamExt};
