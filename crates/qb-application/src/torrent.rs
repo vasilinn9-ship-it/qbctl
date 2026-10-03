@@ -1,6 +1,6 @@
 use std::{future::Future, pin::Pin};
 
-use qb_domain::torrent::{TorrentId, TorrentState};
+use qb_domain::torrent::{TorrentId, TorrentMetainfo, TorrentState};
 
 use crate::PortError;
 
@@ -93,6 +93,10 @@ pub struct TrackerEvidence {
     pub seeds: i64,
     pub leeches: i64,
     pub message: String,
+}
+
+pub trait MetainfoReader: Send + Sync {
+    fn parse(&self, bytes: &[u8]) -> Result<TorrentMetainfo, PortError>;
 }
 
 pub trait TorrentClient: Send + Sync {
