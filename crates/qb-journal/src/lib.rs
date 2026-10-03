@@ -1087,20 +1087,22 @@ fn insert_identity_aliases(
     Ok(())
 }
 
+struct StoredRegistryRow {
+    registry_id: String,
+    state: String,
+    source_relative: String,
+    source_metainfo_digest: Vec<u8>,
+    operation_id: Option<String>,
+    archive_ref: Option<String>,
+    handoff_file_count: i64,
+    handoff_receipt_count: i64,
+}
+
 fn load_registry_record(
     connection: &Connection,
     registry_id: &str,
 ) -> Result<Option<RegistryRecord>, JournalError> {
-    let row: Option<(
-        String,
-        String,
-        String,
-        Vec<u8>,
-        Option<String>,
-        Option<String>,
-        i64,
-        i64,
-    )> = connection
+    let row: Option<StoredRegistryRow> = connection
         .query_row(
             "SELECT registry_id,
                         state,
@@ -1114,30 +1116,30 @@ fn load_registry_record(
                  WHERE registry_id = ?1",
             [registry_id],
             |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                ))
+                Ok(StoredRegistryRow {
+                    registry_id: row.get(0)?,
+                    state: row.get(1)?,
+                    source_relative: row.get(2)?,
+                    source_metainfo_digest: row.get(3)?,
+                    operation_id: row.get(4)?,
+                    archive_ref: row.get(5)?,
+                    handoff_file_count: row.get(6)?,
+                    handoff_receipt_count: row.get(7)?,
+                })
             },
         )
         .optional()?;
 
-    let Some((
+    let Some(StoredRegistryRow {
         registry_id,
         state,
         source_relative,
-        digest,
+        source_metainfo_digest: digest,
         operation_id,
         archive_ref,
         handoff_file_count,
         handoff_receipt_count,
-    )) = row
+    }) = row
     else {
         return Ok(None);
     };
