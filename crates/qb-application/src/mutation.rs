@@ -212,6 +212,15 @@ mod tests {
             MutationCommand::SetUploadLimit { bytes_per_sec: 0 }.fingerprint()
         );
     }
+
+    #[test]
+    fn transfer_limit_postcondition_allows_kib_quantization() {
+        assert!(limit_matches_requested(24_000_000, 23_999_488));
+        assert!(limit_matches_requested(24_000_000, 24_000_512));
+        assert!(limit_matches_requested(0, 0));
+        assert!(!limit_matches_requested(0, 512));
+        assert!(!limit_matches_requested(24_000_000, 23_998_976));
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -592,12 +601,14 @@ impl MutationService {
                 }
                 Ok(queue.max_active_downloads == i64::from(*max_active_downloads))
             }
-            MutationCommand::SetDownloadLimit { bytes_per_sec } => {
-                Ok(client.transfer_info().await?.download_limit_bps == *bytes_per_sec)
-            }
-            MutationCommand::SetUploadLimit { bytes_per_sec } => {
-                Ok(client.transfer_info().await?.upload_limit_bps == *bytes_per_sec)
-            }
+            MutationCommand::SetDownloadLimit { bytes_per_sec } => Ok(limit_matches_requested(
+                *bytes_per_sec,
+                client.transfer_info().await?.download_limit_bps,
+            )),
+            MutationCommand::SetUploadLimit { bytes_per_sec } => Ok(limit_matches_requested(
+                *bytes_per_sec,
+                client.transfer_info().await?.upload_limit_bps,
+            )),
             MutationCommand::SetQueueTarget {
                 target_client_count,
             } => Ok(
@@ -629,6 +640,14 @@ impl MutationService {
             MutationCommand::SetQueueTarget { .. } => unreachable!("handled locally"),
         }
     }
+}
+
+fn limit_matches_requested(requested: u64, effective: u64) -> bool {
+    if requested == 0 || effective == 0 {
+        return requested == effective;
+    }
+
+    requested.abs_diff(effective) < 1024
 }
 
 fn execution(
