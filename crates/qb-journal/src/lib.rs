@@ -352,7 +352,6 @@ impl Journal {
         transaction.commit()?;
         Ok(record)
     }
-
 }
 
 impl JournalHealthPort for Journal {
@@ -436,10 +435,7 @@ impl MutationJournal for Journal {
         .map_err(map_port_error)
     }
 
-    fn mark_retry_ready(
-        &self,
-        operation_id: &OperationId,
-    ) -> Result<MutationRecord, PortError> {
+    fn mark_retry_ready(&self, operation_id: &OperationId) -> Result<MutationRecord, PortError> {
         let current = self
             .get_operation(operation_id)?
             .ok_or_else(|| PortError::new("OPERATION_NOT_FOUND", operation_id.to_string()))?;
