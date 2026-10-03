@@ -212,7 +212,7 @@ impl Journal {
         }
 
         let next_revision = current
-            .revision()
+            .revision
             .checked_add(1)
             .ok_or_else(|| JournalError::InvalidState("operation revision overflow".into()))?;
 
@@ -533,7 +533,7 @@ impl MutationJournal for Journal {
         operation_id: &OperationId,
     ) -> Result<Option<MutationRecord>, PortError> {
         let connection = self.connection.lock().expect("journal mutex poisoned");
-        load_operation(&connection, operation_id.as_str()).map_err(map_port_error)
+        load_operation(&*connection, operation_id.as_str()).map_err(map_port_error)
     }
 
     fn list_recoverable(&self) -> Result<Vec<MutationRecord>, PortError> {
