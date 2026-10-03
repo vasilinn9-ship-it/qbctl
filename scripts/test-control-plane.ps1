@@ -204,6 +204,65 @@ try {
     Assert-Exit 0 (Invoke-CliText @("capabilities")) "capabilities"
     Assert-Exit 0 (Invoke-CliText @("doctor")) "doctor"
 
+    $torrentUnavailable = Invoke-CliText @("--output", "fields", "torrent", "list")
+    Assert-Exit 6 $torrentUnavailable "torrent list without qBittorrent"
+    if ($torrentUnavailable.Stdout -notmatch "(?m)^problem\.0\.code=QBIT_UNAVAILABLE\r?$") {
+        throw "torrent list did not report QBIT_UNAVAILABLE"
+    }
+
+    $blockedPause = Invoke-CliText @(
+        "--output", "fields",
+        "torrent", "pause", "abcdef0123456789abcdef0123456789abcdef01",
+        "--request-id", "acceptance-blocked-pause"
+    )
+    Assert-Exit 3 $blockedPause "torrent pause while daemon is degraded"
+    if ($blockedPause.Stdout -notmatch "(?m)^problem\.0\.code=MUTATION_ADMISSION_DISABLED\r?$") {
+        throw "degraded torrent pause did not fail closed"
+    }
+
+    $initialTarget = Invoke-CliText @("--output", "fields", "queue", "target", "get")
+    Assert-Exit 0 $initialTarget "initial queue target"
+    if ($initialTarget.Stdout -notmatch "(?m)^policy_revision=1\r?$") {
+        throw "initial queue target revision is not 1"
+    }
+
+    $setTarget = Invoke-CliText @(
+        "--output", "fields",
+        "queue", "target", "set", "7",
+        "--request-id", "acceptance-queue-target"
+    )
+    Assert-Exit 0 $setTarget "queue target set"
+    if ($setTarget.Stdout -notmatch "(?m)^replayed=false\r?$") {
+        throw "new queue target mutation was not reported as new"
+    }
+
+    $target = Invoke-CliText @("--output", "fields", "queue", "target", "get")
+    Assert-Exit 0 $target "queue target get after set"
+    if ($target.Stdout -notmatch "(?m)^policy_revision=2\r?$" -or
+        $target.Stdout -notmatch "(?m)^target_client_count=7\r?$") {
+        throw "queue target policy did not persist the requested value/revision"
+    }
+
+    $replayTarget = Invoke-CliText @(
+        "--output", "fields",
+        "queue", "target", "set", "7",
+        "--request-id", "acceptance-queue-target"
+    )
+    Assert-Exit 0 $replayTarget "queue target replay"
+    if ($replayTarget.Stdout -notmatch "(?m)^replayed=true\r?$") {
+        throw "same RequestId/same queue target did not replay"
+    }
+
+    $conflictTarget = Invoke-CliText @(
+        "--output", "fields",
+        "queue", "target", "set", "8",
+        "--request-id", "acceptance-queue-target"
+    )
+    Assert-Exit 3 $conflictTarget "queue target RequestId conflict"
+    if ($conflictTarget.Stdout -notmatch "(?m)^problem\.0\.code=REQUEST_ID_CONFLICT\r?$") {
+        throw "same RequestId/different queue target did not conflict"
+    }
+
     $fields = Invoke-CliText @("--output", "fields", "status")
     Assert-Exit 0 $fields "fields status"
     if ($fields.Stdout -notmatch "(?m)^status=STATUS_OK\r?$") {
@@ -285,6 +344,13 @@ try {
     $daemon = Start-Daemon
     Wait-DaemonReady
     Assert-Exit 0 (Invoke-CliText @("doctor")) "doctor after restart"
+
+    $targetAfterRestart = Invoke-CliText @("--output", "fields", "queue", "target", "get")
+    Assert-Exit 0 $targetAfterRestart "queue target after restart"
+    if ($targetAfterRestart.Stdout -notmatch "(?m)^policy_revision=2\r?$" -or
+        $targetAfterRestart.Stdout -notmatch "(?m)^target_client_count=7\r?$") {
+        throw "queue target policy/revision did not survive daemon restart"
+    }
 
     if (-not (Test-Path (Join-Path $runtimeRoot "state.sqlite"))) {
         throw "state.sqlite missing from configured runtime root"
