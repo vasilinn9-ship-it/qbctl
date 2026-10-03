@@ -6780,6 +6780,94 @@ mod tests {
     }
 
     #[test]
+    fn completion_finish_atomically_closes_registry_and_capacity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.sqlite");
+        let admission = {
+            let journal = Journal::open(&path).expect("journal");
+            finished_admission(&journal, "completion-finish-admission")
+        };
+        let preflight = completion_preflight(&admission, "completion-finish-request");
+
+        let operation_id = {
+            let journal = Journal::open(&path).expect("reopen");
+            let record = match CompletionJournal::reserve_completion(&journal, &preflight)
+                .expect("reserve completion")
+            {
+                CompletionReservation::New(record) => record,
+                other => panic!("unexpected completion reservation: {other:?}"),
+            };
+
+            CompletionJournal::mark_stop_pending(&journal, &record.operation_id)
+                .expect("stop pending");
+            CompletionJournal::mark_stopped(&journal, &record.operation_id)
+                .expect("stopped");
+            CompletionJournal::mark_archive_pending(&journal, &record.operation_id)
+                .expect("archive pending");
+            CompletionJournal::mark_archive_receipted(
+                &journal,
+                &record.operation_id,
+                &record.source_evidence,
+                record.source_metainfo_digest,
+            )
+            .expect("archive receipted");
+
+            for file in &record.files {
+                CompletionJournal::mark_file_move_pending(
+                    &journal,
+                    &record.operation_id,
+                    file.index,
+                )
+                .expect("file pending");
+                CompletionJournal::mark_file_handed_off(
+                    &journal,
+                    &record.operation_id,
+                    file.index,
+                    &file.source_evidence,
+                    None,
+                )
+                .expect("file handed off");
+            }
+            let remove_pending =
+                CompletionJournal::mark_payload_handed_off(&journal, &record.operation_id)
+                    .expect("payload handed off");
+            assert_eq!(
+                remove_pending.state,
+                CompletionState::RemoveRecordPending
+            );
+
+            let finished = CompletionJournal::finish_completion(&journal, &record.operation_id)
+                .expect("finish completion");
+            assert_eq!(finished.state, CompletionState::Finished);
+            record.operation_id
+        };
+
+        let reopened = Journal::open(&path).expect("reopen finished");
+        let completion = CompletionJournal::get_completion(&reopened, &operation_id)
+            .expect("completion lookup")
+            .expect("completion record");
+        assert_eq!(completion.state, CompletionState::Finished);
+
+        let registry = reopened
+            .find_by_identity(&admission.identity)
+            .expect("registry")
+            .expect("registry record");
+        assert_eq!(registry.state, RegistryState::Finished);
+        assert!(registry.operation_id.is_none());
+        assert_eq!(registry.archive_ref.as_deref(), Some(admission.source_relative.as_str()));
+        assert_eq!(registry.handoff_file_count, 2);
+        assert_eq!(registry.handoff_receipt_count, 2);
+
+        assert!(reopened
+            .capacity_reservations(admission.working_volume_id)
+            .expect("capacity")
+            .is_empty());
+        assert!(CompletionJournal::list_recoverable_completions(&reopened)
+            .expect("recoverable completions")
+            .is_empty());
+    }
+
+    #[test]
     fn completion_stop_transitions_are_durable_and_observation_driven() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("state.sqlite");
