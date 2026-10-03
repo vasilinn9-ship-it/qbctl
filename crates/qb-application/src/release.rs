@@ -260,8 +260,8 @@ impl ReleaseService {
                             record = self.journal.mark_stopped(&record.operation_id)?;
                             continue;
                         }
-                        TargetObservation::Present(_) if explicit_request
-                            && record.state == ReleaseState::UnknownStop =>
+                        TargetObservation::Present(_)
+                            if explicit_request && record.state == ReleaseState::UnknownStop =>
                         {
                             record = self.journal.retry_stop(&record.operation_id)?;
                             continue;
@@ -323,8 +323,8 @@ impl ReleaseService {
                         TargetObservation::Present(torrent) if torrent.is_complete() => {
                             return self.block(record, complete_problem(), replayed);
                         }
-                        TargetObservation::Present(_) if explicit_request
-                            && record.state == ReleaseState::UnknownDelete =>
+                        TargetObservation::Present(_)
+                            if explicit_request && record.state == ReleaseState::UnknownDelete =>
                         {
                             record = self.journal.retry_delete(&record.operation_id)?;
                             continue;
@@ -377,10 +377,9 @@ impl ReleaseService {
                             ));
                         }
                         EffectAttempt::Uncertain(problem) => {
-                            let unknown = self.journal.mark_unknown_stop(
-                                &pending.operation_id,
-                                "QBIT_STOP_UNCERTAIN",
-                            )?;
+                            let unknown = self
+                                .journal
+                                .mark_unknown_stop(&pending.operation_id, "QBIT_STOP_UNCERTAIN")?;
                             return Ok(execution(
                                 ReleaseExecutionStatus::UnknownStop,
                                 unknown,
