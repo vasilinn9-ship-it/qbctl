@@ -7,6 +7,7 @@ use std::{
 use anyhow::{anyhow, Context as _, Result};
 use qb_application::{
     cleanup::{IncomingCleanupJournal, IncomingCleanupService},
+    completion::{CompletionJournal, CompletionService},
     incoming::IncomingService,
     mutation::{MutationJournal, MutationService},
     registry::TorrentRegistry,
@@ -40,6 +41,7 @@ pub struct Bootstrap {
     pub incoming: Option<Arc<IncomingService>>,
     pub storage_status: Option<Arc<StorageStatusService>>,
     pub release: Option<Arc<ReleaseService>>,
+    pub completion: Option<Arc<CompletionService>>,
     pub qbit_startup_problem: Option<String>,
     _instance_guard: InstanceGuard,
 }
@@ -62,6 +64,7 @@ pub fn build(runtime_override: Option<PathBuf>) -> Result<Bootstrap> {
     let registry: Arc<dyn TorrentRegistry> = journal.clone();
     let cleanup_journal: Arc<dyn IncomingCleanupJournal> = journal.clone();
     let release_journal: Arc<dyn ReleaseJournal> = journal.clone();
+    let completion_journal: Arc<dyn CompletionJournal> = journal.clone();
 
     let runtime = Arc::new(RuntimeContext::new(
         Uuid::new_v4().to_string(),
@@ -82,23 +85,31 @@ pub fn build(runtime_override: Option<PathBuf>) -> Result<Bootstrap> {
         .as_ref()
         .map(|storage| build_storage_status_service(storage.clone(), registry.clone()));
 
-    let (torrents, mutation_client, release_client, qbit_startup_problem) =
-        match config.qbittorrent.as_ref() {
+    let (
+        torrents,
+        mutation_client,
+        release_client,
+        completion_client,
+        qbit_startup_problem,
+    ) = match config.qbittorrent.as_ref() {
             Some(qbit) => match build_qbit_client(qbit) {
                 Ok(client) => {
                     let torrent_port: Arc<dyn TorrentClient> = client.clone();
                     let mutation_port: Arc<dyn TorrentClient> = client.clone();
-                    let release_port: Arc<dyn TorrentClient> = client;
+                    let release_port: Arc<dyn TorrentClient> = client.clone();
+                    let completion_port: Arc<dyn TorrentClient> = client;
                     (
                         Some(Arc::new(TorrentService::new(torrent_port))),
                         Some(mutation_port),
                         Some(release_port),
+                        Some(completion_port),
                         None,
                     )
                 }
-                Err(error) => (None, None, None, Some(error.to_string())),
+                Err(error) => (None, None, None, None, Some(error.to_string())),
             },
             None => (
+                None,
                 None,
                 None,
                 None,
@@ -118,6 +129,21 @@ pub fn build(runtime_override: Option<PathBuf>) -> Result<Bootstrap> {
             ))
         });
 
+    let completion = storage
+        .as_ref()
+        .zip(completion_client)
+        .map(|(storage, client)| {
+            let metainfo: Arc<dyn MetainfoReader> = Arc::new(LocalMetainfoReader);
+            Arc::new(CompletionService::new(
+                completion_journal.clone(),
+                registry.clone(),
+                storage.clone(),
+                metainfo,
+                client,
+                MAX_METAINFO_BYTES,
+            ))
+        });
+
     if release.is_none() {
         let recoverable = release_journal
             .list_recoverable_releases()
@@ -125,6 +151,18 @@ pub fn build(runtime_override: Option<PathBuf>) -> Result<Bootstrap> {
         if !recoverable.is_empty() {
             return Err(anyhow!(
                 "{} durable queue release operation(s) require both managed storage and qBittorrent configuration",
+                recoverable.len()
+            ));
+        }
+    }
+
+    if completion.is_none() {
+        let recoverable = completion_journal
+            .list_recoverable_completions()
+            .map_err(|error| anyhow!("inspect durable completion recovery state: {error}"))?;
+        if !recoverable.is_empty() {
+            return Err(anyhow!(
+                "{} durable completion operation(s) require both managed storage and qBittorrent configuration",
                 recoverable.len()
             ));
         }
@@ -139,6 +177,7 @@ pub fn build(runtime_override: Option<PathBuf>) -> Result<Bootstrap> {
         incoming,
         storage_status,
         release,
+        completion,
         qbit_startup_problem,
         _instance_guard: instance_guard,
     })
