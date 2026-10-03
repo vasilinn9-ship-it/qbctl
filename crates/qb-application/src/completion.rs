@@ -924,7 +924,10 @@ fn completion_execution(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
 
     use qb_domain::torrent::{ManifestFile, TorrentManifest, TorrentState};
 
@@ -1084,15 +1087,24 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum FakeStopEffect {
+        NotSent,
+        Uncertain,
+        AcceptedAndStop,
+    }
+
     struct FakeClient {
-        torrent: TorrentView,
+        torrent: Mutex<TorrentView>,
         files: Mutex<Vec<FileObservation>>,
+        stop_effects: Mutex<Vec<FakeStopEffect>>,
+        stop_calls: AtomicUsize,
     }
 
     impl FakeClient {
         fn complete() -> Arc<Self> {
             Arc::new(Self {
-                torrent: TorrentView {
+                torrent: Mutex::new(TorrentView {
                     id: TorrentId::new("1111111111111111111111111111111111111111").expect("id"),
                     name: "sample".into(),
                     save_path: "Working".into(),
@@ -1107,7 +1119,7 @@ mod tests {
                     peers_known: 0,
                     seeds_connected: 0,
                     seeds_known: 0,
-                },
+                }),
                 files: Mutex::new(vec![
                     FileObservation {
                         index: 0,
@@ -1128,7 +1140,17 @@ mod tests {
                         availability: Some(1.0),
                     },
                 ]),
+                stop_effects: Mutex::new(vec![FakeStopEffect::NotSent]),
+                stop_calls: AtomicUsize::new(0),
             })
+        }
+
+        fn with_stop_effects(self: &Arc<Self>, effects: Vec<FakeStopEffect>) {
+            *self.stop_effects.lock().expect("stop effects mutex") = effects;
+        }
+
+        fn set_state(&self, state: TorrentState) {
+            self.torrent.lock().expect("torrent mutex").state = state;
         }
     }
 
@@ -1142,7 +1164,10 @@ mod tests {
         }
 
         fn get<'a>(&'a self, id: &'a TorrentId) -> PortFuture<'a, Option<TorrentView>> {
-            Box::pin(async move { Ok((id == &self.torrent.id).then(|| self.torrent.clone())) })
+            Box::pin(async move {
+                let torrent = self.torrent.lock().expect("torrent mutex").clone();
+                Ok((id == &torrent.id).then_some(torrent))
+            })
         }
 
         fn transfer_info(&self) -> PortFuture<'_, TransferInfo> {
@@ -1182,7 +1207,28 @@ mod tests {
         }
 
         fn stop<'a>(&'a self, _id: &'a TorrentId) -> EffectFuture<'a> {
-            Box::pin(async { EffectAttempt::NotSent(unused()) })
+            Box::pin(async move {
+                self.stop_calls.fetch_add(1, Ordering::SeqCst);
+                let effect = {
+                    let mut effects = self.stop_effects.lock().expect("stop effects mutex");
+                    if effects.is_empty() {
+                        FakeStopEffect::NotSent
+                    } else {
+                        effects.remove(0)
+                    }
+                };
+                match effect {
+                    FakeStopEffect::NotSent => EffectAttempt::NotSent(unused()),
+                    FakeStopEffect::Uncertain => EffectAttempt::Uncertain(PortError::new(
+                        "QBIT_MUTATION_UNCERTAIN",
+                        "simulated stop timeout after send",
+                    )),
+                    FakeStopEffect::AcceptedAndStop => {
+                        self.set_state(TorrentState::Stopped);
+                        EffectAttempt::Accepted
+                    }
+                }
+            })
         }
 
         fn start<'a>(&'a self, _id: &'a TorrentId) -> EffectFuture<'a> {
@@ -1199,6 +1245,210 @@ mod tests {
 
         fn set_upload_limit(&self, _bytes_per_sec: u64) -> EffectFuture<'_> {
             Box::pin(async { EffectAttempt::NotSent(unused()) })
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeCompletionJournal {
+        record: Mutex<Option<CompletionRecord>>,
+    }
+
+    impl FakeCompletionJournal {
+        fn transition(
+            &self,
+            operation_id: &OperationId,
+            expected: &[CompletionState],
+            next: CompletionState,
+            problem_code: Option<&str>,
+        ) -> Result<CompletionRecord, PortError> {
+            let mut state = self.record.lock().expect("completion journal mutex");
+            let record = state
+                .as_mut()
+                .ok_or_else(|| PortError::new("COMPLETION_NOT_FOUND", operation_id.to_string()))?;
+            if &record.operation_id != operation_id || !expected.contains(&record.state) {
+                return Err(PortError::new(
+                    "OPERATION_TRANSITION_INVALID",
+                    "invalid fake completion transition",
+                ));
+            }
+            record.state = next;
+            record.problem_code = problem_code.map(str::to_owned);
+            record.revision += 1;
+            Ok(record.clone())
+        }
+    }
+
+    impl CompletionJournal for FakeCompletionJournal {
+        fn lookup_completion_request(
+            &self,
+            request: &CompletionRequest,
+        ) -> Result<Option<CompletionReservation>, PortError> {
+            Ok(self
+                .record
+                .lock()
+                .expect("completion journal mutex")
+                .as_ref()
+                .filter(|record| record.request_id == request.request_id)
+                .cloned()
+                .map(CompletionReservation::Replay))
+        }
+
+        fn reserve_completion(
+            &self,
+            preflight: &CompletionPreflight,
+        ) -> Result<CompletionReservation, PortError> {
+            let mut state = self.record.lock().expect("completion journal mutex");
+            if let Some(record) = state.as_ref() {
+                return Ok(CompletionReservation::ActiveConflict {
+                    operation_id: record.operation_id.clone(),
+                });
+            }
+            let record = CompletionRecord {
+                request_id: preflight.request_id.clone(),
+                operation_id: OperationId::new("completion-operation-1").expect("operation id"),
+                registry_id: preflight.registry_id.clone(),
+                torrent_id: preflight.torrent_id.clone(),
+                identity: preflight.identity.clone(),
+                source_relative: preflight.source_relative.clone(),
+                source_evidence: preflight.source_evidence.clone(),
+                source_metainfo_digest: preflight.source_metainfo_digest,
+                working_volume_id: preflight.working_volume_id,
+                completed_volume_id: preflight.completed_volume_id,
+                archive_volume_id: preflight.archive_volume_id,
+                working_save_path: preflight.working_save_path.clone(),
+                total_bytes: preflight.total_bytes,
+                state: CompletionState::Prepared,
+                problem_code: None,
+                revision: 1,
+                files: preflight
+                    .files
+                    .iter()
+                    .enumerate()
+                    .map(|(index, file)| CompletionFileRecord {
+                        index: u32::try_from(index).expect("file index"),
+                        relative_path: file.relative_path.clone(),
+                        size: file.size,
+                        source_evidence: file.source_evidence.clone(),
+                        strategy: preflight.payload_strategy(),
+                        state: CompletionFileState::Prepared,
+                        revision: 1,
+                    })
+                    .collect(),
+            };
+            *state = Some(record.clone());
+            Ok(CompletionReservation::New(record))
+        }
+
+        fn get_completion(
+            &self,
+            operation_id: &OperationId,
+        ) -> Result<Option<CompletionRecord>, PortError> {
+            Ok(self
+                .record
+                .lock()
+                .expect("completion journal mutex")
+                .as_ref()
+                .filter(|record| &record.operation_id == operation_id)
+                .cloned())
+        }
+
+        fn list_recoverable_completions(&self) -> Result<Vec<CompletionRecord>, PortError> {
+            Ok(self
+                .record
+                .lock()
+                .expect("completion journal mutex")
+                .as_ref()
+                .filter(|record| {
+                    !matches!(
+                        record.state,
+                        CompletionState::Finished
+                            | CompletionState::Blocked
+                            | CompletionState::Failed
+                    )
+                })
+                .cloned()
+                .into_iter()
+                .collect())
+        }
+
+        fn mark_stop_pending(
+            &self,
+            operation_id: &OperationId,
+        ) -> Result<CompletionRecord, PortError> {
+            self.transition(
+                operation_id,
+                &[CompletionState::Prepared],
+                CompletionState::StopPending,
+                None,
+            )
+        }
+
+        fn mark_unknown_stop(
+            &self,
+            operation_id: &OperationId,
+            problem_code: &str,
+        ) -> Result<CompletionRecord, PortError> {
+            self.transition(
+                operation_id,
+                &[CompletionState::StopPending],
+                CompletionState::UnknownStop,
+                Some(problem_code),
+            )
+        }
+
+        fn retry_stop(
+            &self,
+            operation_id: &OperationId,
+        ) -> Result<CompletionRecord, PortError> {
+            self.transition(
+                operation_id,
+                &[CompletionState::UnknownStop, CompletionState::StopPending],
+                CompletionState::Prepared,
+                None,
+            )
+        }
+
+        fn mark_stopped(
+            &self,
+            operation_id: &OperationId,
+        ) -> Result<CompletionRecord, PortError> {
+            self.transition(
+                operation_id,
+                &[CompletionState::StopPending, CompletionState::UnknownStop],
+                CompletionState::Stopped,
+                None,
+            )
+        }
+
+        fn mark_completion_blocked(
+            &self,
+            operation_id: &OperationId,
+            problem_code: &str,
+        ) -> Result<CompletionRecord, PortError> {
+            self.transition(
+                operation_id,
+                &[
+                    CompletionState::Prepared,
+                    CompletionState::StopPending,
+                    CompletionState::UnknownStop,
+                    CompletionState::Stopped,
+                ],
+                CompletionState::Blocked,
+                Some(problem_code),
+            )
+        }
+
+        fn mark_completion_failed(
+            &self,
+            operation_id: &OperationId,
+            problem_code: &str,
+        ) -> Result<CompletionRecord, PortError> {
+            self.transition(
+                operation_id,
+                &[CompletionState::StopPending],
+                CompletionState::Failed,
+                Some(problem_code),
+            )
         }
     }
 
@@ -1224,6 +1474,29 @@ mod tests {
         CompletionRequest {
             request_id: RequestId::new("completion-request-1").expect("request id"),
             registry_id: "registry-1".into(),
+        }
+    }
+
+    fn completion_service(
+        journal: Arc<FakeCompletionJournal>,
+        storage: Arc<FakeStorage>,
+        client: Arc<FakeClient>,
+    ) -> CompletionService {
+        CompletionService::new(
+            journal,
+            Arc::new(FakeRegistry(registry())),
+            storage,
+            Arc::new(FakeMetainfo),
+            client,
+            1024,
+        )
+        .with_observation_policy(1, Duration::ZERO)
+    }
+
+    fn execution(result: CompletionExecutionResult) -> CompletionExecution {
+        match result {
+            CompletionExecutionResult::Execution(execution) => *execution,
+            other => panic!("unexpected completion result: {other:?}"),
         }
     }
 
@@ -1268,6 +1541,65 @@ mod tests {
             .expect_err("must reject destination conflict");
 
         assert_eq!(error.code, "DESTINATION_CONFLICT");
+    }
+
+    #[tokio::test]
+    async fn stop_uncertainty_recovers_by_observation_without_duplicate_stop() {
+        let journal = Arc::new(FakeCompletionJournal::default());
+        let storage = FakeStorage::populated();
+        let client = FakeClient::complete();
+        client.with_stop_effects(vec![FakeStopEffect::Uncertain]);
+
+        let first = execution(
+            completion_service(journal.clone(), storage.clone(), client.clone())
+                .execute(&request())
+                .await
+                .expect("execute completion"),
+        );
+        assert_eq!(first.status, CompletionExecutionStatus::UnknownStop);
+        assert_eq!(first.record.state, CompletionState::UnknownStop);
+        assert_eq!(client.stop_calls.load(Ordering::SeqCst), 1);
+
+        client.set_state(TorrentState::Stopped);
+        let recovered = completion_service(journal, storage, client.clone())
+            .recover_all()
+            .await
+            .expect("recover completion");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].status, CompletionExecutionStatus::Stopped);
+        assert_eq!(recovered[0].record.state, CompletionState::Stopped);
+        assert_eq!(client.stop_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_replay_retries_unknown_stop_only_after_running_observation() {
+        let journal = Arc::new(FakeCompletionJournal::default());
+        let storage = FakeStorage::populated();
+        let client = FakeClient::complete();
+        client.with_stop_effects(vec![
+            FakeStopEffect::Uncertain,
+            FakeStopEffect::AcceptedAndStop,
+        ]);
+
+        let first = execution(
+            completion_service(journal.clone(), storage.clone(), client.clone())
+                .execute(&request())
+                .await
+                .expect("first completion"),
+        );
+        assert_eq!(first.status, CompletionExecutionStatus::UnknownStop);
+        assert_eq!(client.stop_calls.load(Ordering::SeqCst), 1);
+
+        let replay = execution(
+            completion_service(journal, storage, client.clone())
+                .execute(&request())
+                .await
+                .expect("explicit replay"),
+        );
+        assert!(replay.replayed);
+        assert_eq!(replay.status, CompletionExecutionStatus::Stopped);
+        assert_eq!(replay.record.state, CompletionState::Stopped);
+        assert_eq!(client.stop_calls.load(Ordering::SeqCst), 2);
     }
 
     fn unused() -> PortError {
