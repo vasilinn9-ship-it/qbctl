@@ -479,8 +479,14 @@ fn render_human(response: &Response) -> Result<(), CliError> {
             );
         }
         Some(response::Payload::QueueTarget(value)) => match value.target_client_count {
-            Some(target) => println!("target clients {target} · policy revision {}", value.revision),
-            None => println!("target clients not configured · policy revision {}", value.revision),
+            Some(target) => println!(
+                "target clients {target} · policy revision {}",
+                value.revision
+            ),
+            None => println!(
+                "target clients not configured · policy revision {}",
+                value.revision
+            ),
         },
         Some(response::Payload::TransferLimits(value)) => {
             println!(
