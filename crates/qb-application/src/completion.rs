@@ -4128,11 +4128,11 @@ mod tests {
         assert_eq!(recovered.len(), 1);
         assert_eq!(
             recovered[0].status,
-            CompletionExecutionStatus::RemoveRecordPending
+            CompletionExecutionStatus::UnknownRemoveRecord
         );
         assert_eq!(
             recovered[0].record.state,
-            CompletionState::RemoveRecordPending
+            CompletionState::UnknownRemoveRecord
         );
         assert_eq!(client.stop_calls.load(Ordering::SeqCst), 1);
     }
