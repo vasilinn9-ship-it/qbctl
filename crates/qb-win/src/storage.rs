@@ -397,16 +397,17 @@ mod tests {
         .expect_err("overlap must fail");
 
         assert!(matches!(error, StorageError::RootOverlap { .. }));
+        fs::remove_dir_all(temp).expect("cleanup");
     }
 
     #[test]
     fn managed_root_layout_accepts_distinct_existing_directories() {
-        let temp = temp_root("overlap");
+        let temp = temp_root("valid");
         let incoming = temp.join("incoming");
-        let archive = temp.path().join("archive");
-        let working = temp.path().join("working");
-        let completed = temp.path().join("completed");
-        let runtime = temp.path().join("runtime");
+        let archive = temp.join("archive");
+        let working = temp.join("working");
+        let completed = temp.join("completed");
+        let runtime = temp.join("runtime");
         for path in [&incoming, &archive, &working, &completed, &runtime] {
             fs::create_dir_all(path).expect("create root");
         }
