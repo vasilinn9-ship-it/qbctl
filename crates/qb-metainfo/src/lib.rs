@@ -34,12 +34,7 @@ enum MetainfoError {
 
 impl MetainfoReader for LocalMetainfoReader {
     fn parse(&self, bytes: &[u8]) -> Result<TorrentMetainfo, PortError> {
-        parse_metainfo(bytes).map_err(|error| match error {
-            MetainfoError::Unsupported(_) => {
-                PortError::new("METAINFO_UNSUPPORTED", error.to_string())
-            }
-            _ => PortError::new("METAINFO_INVALID", error.to_string()),
-        })
+        parse_metainfo(bytes)
     }
 }
 
@@ -667,7 +662,7 @@ fn join_path(path: &[String]) -> String {
 }
 
 const fn div_ceil(value: u64, divisor: u64) -> u64 {
-    value / divisor + u64::from(value % divisor != 0)
+    value / divisor + if value % divisor != 0 { 1 } else { 0 }
 }
 
 fn display_key(key: &[u8]) -> String {
