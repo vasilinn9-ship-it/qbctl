@@ -1,8 +1,4 @@
-use std::{
-    net::IpAddr,
-    str::FromStr,
-    time::Duration,
-};
+use std::{net::IpAddr, str::FromStr, time::Duration};
 
 use qb_application::{
     torrent::{
@@ -100,10 +96,7 @@ impl QbitClient {
         let webapi_version = self.get_text("app/webapiVersion", &[]).await?;
 
         Ok(QbitProbe {
-            mutation_ready: is_supported_mutation_version(
-                &application_version,
-                &webapi_version,
-            ),
+            mutation_ready: is_supported_mutation_version(&application_version, &webapi_version),
             application_version,
             webapi_version,
         })
@@ -156,9 +149,8 @@ impl QbitClient {
 
     async fn network_preferences_inner(&self) -> Result<NetworkPreferences, QbitError> {
         let value = self.preferences().await?;
-        let listen_port = u16::try_from(value.listen_port).map_err(|_| {
-            QbitError::InvalidResponse("listen_port is outside u16 range".into())
-        })?;
+        let listen_port = u16::try_from(value.listen_port)
+            .map_err(|_| QbitError::InvalidResponse("listen_port is outside u16 range".into()))?;
 
         Ok(NetworkPreferences {
             listen_port,
