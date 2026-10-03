@@ -3037,9 +3037,7 @@ impl MutationJournal for Journal {
     }
 }
 
-fn load_recovery_blockers(
-    connection: &Connection,
-) -> Result<Vec<RecoveryBlocker>, JournalError> {
+fn load_recovery_blockers(connection: &Connection) -> Result<Vec<RecoveryBlocker>, JournalError> {
     let mut statement = connection.prepare(
         "SELECT kind, state, problem_code, COUNT(*)
          FROM (
@@ -3102,9 +3100,8 @@ fn load_recovery_blockers(
     let mut blockers = Vec::new();
     for row in rows {
         let (kind, state, problem_code, count) = row?;
-        let count = u64::try_from(count).map_err(|_| {
-            JournalError::InvalidState("negative recovery blocker count".into())
-        })?;
+        let count = u64::try_from(count)
+            .map_err(|_| JournalError::InvalidState("negative recovery blocker count".into()))?;
         blockers.push(RecoveryBlocker {
             kind,
             state,
@@ -7182,17 +7179,11 @@ mod tests {
             CompletionReservation::New(record) => record,
             other => panic!("unexpected completion reservation: {other:?}"),
         };
-        CompletionJournal::mark_stop_pending(&journal, &record.operation_id)
-            .expect("stop pending");
-        CompletionJournal::mark_unknown_stop(
-            &journal,
-            &record.operation_id,
-            "QBIT_STOP_UNCERTAIN",
-        )
-        .expect("unknown stop");
+        CompletionJournal::mark_stop_pending(&journal, &record.operation_id).expect("stop pending");
+        CompletionJournal::mark_unknown_stop(&journal, &record.operation_id, "QBIT_STOP_UNCERTAIN")
+            .expect("unknown stop");
 
-        let blockers = JournalHealthPort::recovery_blockers(&journal)
-            .expect("recovery blockers");
+        let blockers = JournalHealthPort::recovery_blockers(&journal).expect("recovery blockers");
         assert_eq!(blockers.len(), 1);
         assert_eq!(blockers[0].kind, "completion");
         assert_eq!(blockers[0].state, "unknown_stop");
