@@ -7,6 +7,7 @@ use anyhow::{Context as _, Result};
 use qb_application::{
     cleanup::IncomingCleanupState,
     mutation::MutationExecutionStatus,
+    release::ReleaseExecutionStatus,
     system::{DaemonPhase, RuntimeHealthPort, RuntimeSnapshot},
     PortError,
 };
@@ -221,6 +222,35 @@ async fn initialize_runtime(bootstrap: &bootstrap::Bootstrap) {
                 cleanup_deleted,
                 cleanup_blocked,
                 "startup Incoming scan/cleanup completed"
+            );
+        }
+    }
+
+    if let Some(release) = bootstrap.release.as_ref() {
+        let recovered = match release.recover_all().await {
+            Ok(results) => results,
+            Err(error) => {
+                bootstrap.runtime.set_phase(DaemonPhase::Degraded);
+                error!(error = %error, "startup queue release recovery failed");
+                return;
+            }
+        };
+        let unresolved = recovered
+            .iter()
+            .filter(|execution| execution.status != ReleaseExecutionStatus::Finished)
+            .count();
+        if unresolved > 0 {
+            bootstrap.runtime.set_phase(DaemonPhase::Degraded);
+            warn!(
+                unresolved,
+                "one or more durable queue releases remain unresolved after observation-first recovery"
+            );
+            return;
+        }
+        if !recovered.is_empty() {
+            info!(
+                recovered = recovered.len(),
+                "startup durable queue release recovery completed"
             );
         }
     }
