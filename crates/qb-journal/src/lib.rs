@@ -7,12 +7,12 @@ use std::{
 
 use qb_application::{
     mutation::{
-        MutationDisposition, MutationJournal, MutationRecord, RequestReservation,
-        FINGERPRINT_VERSION,
+        MutationCommand, MutationDisposition, MutationJournal, MutationRecord, RequestReservation,
+        TorrentControlAction, FINGERPRINT_VERSION,
     },
     JournalHealthPort, PortError,
 };
-use qb_domain::{OperationId, RequestId};
+use qb_domain::{torrent::TorrentId, OperationId, RequestId};
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use thiserror::Error;
 use uuid::Uuid;
@@ -82,14 +82,11 @@ impl Journal {
     fn reserve_request_inner(
         &self,
         request_id: &RequestId,
-        command_kind: &str,
-        fingerprint: [u8; 32],
+        command: &MutationCommand,
     ) -> Result<RequestReservation, JournalError> {
-        if command_kind.is_empty() {
-            return Err(JournalError::InvalidState(
-                "command kind must not be empty".into(),
-            ));
-        }
+        let command_kind = command.kind();
+        let fingerprint = command.fingerprint();
+        let command_columns = command_columns(command)?;
 
         let mut connection = self.connection.lock().expect("journal mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -138,11 +135,27 @@ impl Journal {
         transaction.execute(
             &format!(
                 "INSERT INTO operations(
-                    operation_id, request_id, command_kind, checkpoint, disposition,
-                    pending_effect_kind, problem_code, revision, created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, 'prepared', 'prepared', NULL, NULL, 1, {now}, {now})"
+                    operation_id, request_id, command_kind,
+                    torrent_id, control_action, target_client_count, max_active_downloads,
+                    download_limit_bps, upload_limit_bps,
+                    checkpoint, disposition, pending_effect_kind, problem_code,
+                    revision, created_at, updated_at
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                    'prepared', 'prepared', NULL, NULL, 1, {now}, {now}
+                 )"
             ),
-            params![operation_id.as_str(), request_id.as_str(), command_kind],
+            params![
+                operation_id.as_str(),
+                request_id.as_str(),
+                command_kind,
+                command_columns.torrent_id,
+                command_columns.control_action,
+                command_columns.target_client_count,
+                command_columns.max_active_downloads,
+                command_columns.download_limit_bps,
+                command_columns.upload_limit_bps,
+            ],
         )?;
 
         insert_event(
@@ -272,10 +285,9 @@ impl MutationJournal for Journal {
     fn reserve_request(
         &self,
         request_id: &RequestId,
-        command_kind: &str,
-        fingerprint: [u8; 32],
+        command: &MutationCommand,
     ) -> Result<RequestReservation, PortError> {
-        self.reserve_request_inner(request_id, command_kind, fingerprint)
+        self.reserve_request_inner(request_id, command)
             .map_err(map_port_error)
     }
 
@@ -358,6 +370,29 @@ impl MutationJournal for Journal {
             effect.as_deref(),
             Some(problem_code),
             false,
+        )
+        .map_err(map_port_error)
+    }
+
+    fn mark_failed(
+        &self,
+        operation_id: &OperationId,
+        problem_code: &str,
+    ) -> Result<MutationRecord, PortError> {
+        let current = self
+            .get_operation(operation_id)?
+            .ok_or_else(|| PortError::new("OPERATION_NOT_FOUND", operation_id.to_string()))?;
+        let effect = current.pending_effect_kind.clone();
+
+        self.transition(
+            operation_id,
+            MutationDisposition::EffectPending,
+            MutationDisposition::Failed,
+            "failed",
+            "failed",
+            effect.as_deref(),
+            Some(problem_code),
+            true,
         )
         .map_err(map_port_error)
     }
@@ -449,6 +484,12 @@ fn migrate_v1_to_v2(connection: &mut Connection) -> Result<(), JournalError> {
             operation_id TEXT PRIMARY KEY,
             request_id TEXT NOT NULL UNIQUE REFERENCES requests(request_id),
             command_kind TEXT NOT NULL,
+            torrent_id TEXT,
+            control_action TEXT,
+            target_client_count INTEGER CHECK(target_client_count >= 0),
+            max_active_downloads INTEGER CHECK(max_active_downloads >= 0),
+            download_limit_bps INTEGER CHECK(download_limit_bps >= 0),
+            upload_limit_bps INTEGER CHECK(upload_limit_bps >= 0),
             checkpoint TEXT NOT NULL,
             disposition TEXT NOT NULL,
             pending_effect_kind TEXT,
@@ -564,8 +605,10 @@ fn load_operation(
 
 fn operation_select_sql() -> &'static str {
     "SELECT request_id, operation_id, command_kind, fingerprint_version,
-            command_fingerprint, checkpoint, disposition, pending_effect_kind,
-            problem_code, revision
+            command_fingerprint,
+            torrent_id, control_action, target_client_count, max_active_downloads,
+            download_limit_bps, upload_limit_bps,
+            checkpoint, disposition, pending_effect_kind, problem_code, revision
      FROM operations
      JOIN requests USING(request_id)
      WHERE operation_id = ?1"
@@ -593,10 +636,28 @@ fn map_operation_row(row: &Row<'_>) -> rusqlite::Result<MutationRecord> {
         )
     })?;
 
-    let disposition_text: String = row.get(6)?;
+    let command_kind: String = row.get(2)?;
+    let command = decode_command(
+        &command_kind,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+    )
+    .map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+        )
+    })?;
+
+    let disposition_text: String = row.get(12)?;
     let disposition = parse_disposition(&disposition_text).ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
-            6,
+            12,
             rusqlite::types::Type::Text,
             Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -604,20 +665,138 @@ fn map_operation_row(row: &Row<'_>) -> rusqlite::Result<MutationRecord> {
             )),
         )
     })?;
-    let revision: u64 = row.get(9)?;
+    let revision: u64 = row.get(15)?;
 
     Ok(MutationRecord {
         request_id,
         operation_id,
-        command_kind: row.get(2)?,
+        command,
         fingerprint_version: row.get(3)?,
         command_fingerprint,
-        checkpoint: row.get(5)?,
+        checkpoint: row.get(11)?,
         disposition,
-        pending_effect_kind: row.get(7)?,
-        problem_code: row.get(8)?,
+        pending_effect_kind: row.get(13)?,
+        problem_code: row.get(14)?,
         revision,
     })
+}
+
+struct CommandColumns<'a> {
+    torrent_id: Option<&'a str>,
+    control_action: Option<&'static str>,
+    target_client_count: Option<i64>,
+    max_active_downloads: Option<i64>,
+    download_limit_bps: Option<i64>,
+    upload_limit_bps: Option<i64>,
+}
+
+fn command_columns(command: &MutationCommand) -> Result<CommandColumns<'_>, JournalError> {
+    match command {
+        MutationCommand::TorrentControl { torrent_id, action } => Ok(CommandColumns {
+            torrent_id: Some(torrent_id.as_str()),
+            control_action: Some(match action {
+                TorrentControlAction::Stop => "stop",
+                TorrentControlAction::Start => "start",
+            }),
+            target_client_count: None,
+            max_active_downloads: None,
+            download_limit_bps: None,
+            upload_limit_bps: None,
+        }),
+        MutationCommand::QueueSet {
+            target_client_count,
+            max_active_downloads,
+        } => Ok(CommandColumns {
+            torrent_id: None,
+            control_action: None,
+            target_client_count: target_client_count.map(i64::from),
+            max_active_downloads: max_active_downloads.map(i64::from),
+            download_limit_bps: None,
+            upload_limit_bps: None,
+        }),
+        MutationCommand::TransferLimitsSet {
+            download_limit_bps,
+            upload_limit_bps,
+        } => Ok(CommandColumns {
+            torrent_id: None,
+            control_action: None,
+            target_client_count: None,
+            max_active_downloads: None,
+            download_limit_bps: optional_u64_to_i64(*download_limit_bps)?,
+            upload_limit_bps: optional_u64_to_i64(*upload_limit_bps)?,
+        }),
+    }
+}
+
+fn optional_u64_to_i64(value: Option<u64>) -> Result<Option<i64>, JournalError> {
+    value
+        .map(|value| {
+            i64::try_from(value).map_err(|_| {
+                JournalError::InvalidState("mutation numeric value exceeds SQLite integer range".into())
+            })
+        })
+        .transpose()
+}
+
+fn decode_command(
+    kind: &str,
+    torrent_id: Option<String>,
+    control_action: Option<String>,
+    target_client_count: Option<i64>,
+    max_active_downloads: Option<i64>,
+    download_limit_bps: Option<i64>,
+    upload_limit_bps: Option<i64>,
+) -> Result<MutationCommand, String> {
+    match kind {
+        "torrent.stop" | "torrent.start" => {
+            let torrent_id = TorrentId::new(
+                torrent_id.ok_or_else(|| "torrent control is missing torrent_id".to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+            let expected_action = if kind == "torrent.stop" { "stop" } else { "start" };
+            if control_action.as_deref() != Some(expected_action) {
+                return Err(format!(
+                    "torrent control action does not match command kind {kind}"
+                ));
+            }
+            Ok(MutationCommand::TorrentControl {
+                torrent_id,
+                action: if expected_action == "stop" {
+                    TorrentControlAction::Stop
+                } else {
+                    TorrentControlAction::Start
+                },
+            })
+        }
+        "queue.set" => Ok(MutationCommand::QueueSet {
+            target_client_count: optional_nonnegative_u32(target_client_count, "target_client_count")?,
+            max_active_downloads: optional_nonnegative_u32(
+                max_active_downloads,
+                "max_active_downloads",
+            )?,
+        }),
+        "transfer.limits.set" => Ok(MutationCommand::TransferLimitsSet {
+            download_limit_bps: optional_nonnegative_u64(download_limit_bps, "download_limit_bps")?,
+            upload_limit_bps: optional_nonnegative_u64(upload_limit_bps, "upload_limit_bps")?,
+        }),
+        other => Err(format!("unknown mutation command kind '{other}'")),
+    }
+}
+
+fn optional_nonnegative_u32(value: Option<i64>, field: &str) -> Result<Option<u32>, String> {
+    value
+        .map(|value| {
+            u32::try_from(value).map_err(|_| format!("{field} is outside u32 range"))
+        })
+        .transpose()
+}
+
+fn optional_nonnegative_u64(value: Option<i64>, field: &str) -> Result<Option<u64>, String> {
+    value
+        .map(|value| {
+            u64::try_from(value).map_err(|_| format!("{field} must be non-negative"))
+        })
+        .transpose()
 }
 
 fn insert_event(
