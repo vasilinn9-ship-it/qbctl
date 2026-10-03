@@ -118,28 +118,24 @@ mod platform {
     pub struct ServerListener {
         pipe_name: String,
         pending: Option<NamedPipeServer>,
-        first: bool,
     }
 
     impl ServerListener {
         pub fn bind(pipe_name: impl Into<String>) -> Result<Self, IpcError> {
             let pipe_name = pipe_name.into();
             let pending = Some(create_server(&pipe_name, true)?);
-            Ok(Self {
-                pipe_name,
-                pending,
-                first: false,
-            })
+            Ok(Self { pipe_name, pending })
         }
 
         pub async fn accept(&mut self) -> Result<ServerConnection, IpcError> {
-            if self.pending.is_none() {
-                self.pending = Some(create_server(&self.pipe_name, self.first)?);
-                self.first = false;
-            }
-
             let server = self.pending.take().expect("pending server exists");
             server.connect().await?;
+
+            // Keep one listening instance available before handing the connected
+            // instance to a client task. Tokio's named-pipe contract requires this
+            // to avoid reconnect races between short-lived clients.
+            self.pending = Some(create_server(&self.pipe_name, false)?);
+
             Ok(ServerConnection {
                 framed: Framed::new(server, codec()),
             })
@@ -194,6 +190,29 @@ mod platform {
         async fn secure_server_can_be_created() {
             let name = format!(r"\\.\pipe\qbctl-ipc-test-{}", std::process::id());
             let _server = create_server(&name, true).expect("secure pipe");
+        }
+
+        #[tokio::test]
+        async fn listener_keeps_a_pending_instance_for_immediate_reconnect() {
+            let name = format!(
+                r"\\.\pipe\qbctl-ipc-reconnect-test-{}",
+                std::process::id()
+            );
+            let mut listener = ServerListener::bind(&name).expect("listener");
+
+            let first_client = ClientConnection::connect(&name)
+                .await
+                .expect("first client");
+            let first_server = listener.accept().await.expect("first accept");
+            drop(first_client);
+            drop(first_server);
+
+            let second_client = ClientConnection::connect(&name)
+                .await
+                .expect("second client without accept gap");
+            let second_server = listener.accept().await.expect("second accept");
+            drop(second_client);
+            drop(second_server);
         }
 
         #[test]
