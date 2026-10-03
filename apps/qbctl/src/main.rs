@@ -163,7 +163,11 @@ enum StorageCommand {
 enum OperationCommand {
     List,
     Get { operation_id: String },
-    Recover { operation_id: String },
+    Recover {
+        operation_id: String,
+        #[arg(long)]
+        request_id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -294,10 +298,14 @@ fn command_request(command: Command) -> (request::Command, Option<String>) {
             None,
         ),
         Command::Operation {
-            command: OperationCommand::Recover { operation_id },
+            command:
+                OperationCommand::Recover {
+                    operation_id,
+                    request_id,
+                },
         } => (
             request::Command::OperationRecover(OperationRecoverRequest { operation_id }),
-            None,
+            Some(request_id),
         ),
         Command::Qbit {
             command: QbitCommand::Status,
