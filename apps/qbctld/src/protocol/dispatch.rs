@@ -977,6 +977,12 @@ mod tests {
         fn quick_check(&self) -> Result<(), PortError> {
             Ok(())
         }
+
+        fn recovery_blockers(
+            &self,
+        ) -> Result<Vec<qb_application::RecoveryBlocker>, PortError> {
+            Ok(Vec::new())
+        }
     }
 
     struct FakeRuntime;
