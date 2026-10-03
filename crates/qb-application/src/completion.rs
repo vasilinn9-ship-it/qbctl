@@ -106,6 +106,11 @@ pub enum CompletionReservation {
 }
 
 pub trait CompletionJournal: Send + Sync {
+    fn lookup_completion_request(
+        &self,
+        request: &CompletionRequest,
+    ) -> Result<Option<CompletionReservation>, PortError>;
+
     fn reserve_completion(
         &self,
         preflight: &CompletionPreflight,
@@ -117,6 +122,31 @@ pub trait CompletionJournal: Send + Sync {
     ) -> Result<Option<CompletionRecord>, PortError>;
 
     fn list_recoverable_completions(&self) -> Result<Vec<CompletionRecord>, PortError>;
+
+    fn mark_stop_pending(&self, operation_id: &OperationId)
+        -> Result<CompletionRecord, PortError>;
+
+    fn mark_unknown_stop(
+        &self,
+        operation_id: &OperationId,
+        problem_code: &str,
+    ) -> Result<CompletionRecord, PortError>;
+
+    fn retry_stop(&self, operation_id: &OperationId) -> Result<CompletionRecord, PortError>;
+
+    fn mark_stopped(&self, operation_id: &OperationId) -> Result<CompletionRecord, PortError>;
+
+    fn mark_completion_blocked(
+        &self,
+        operation_id: &OperationId,
+        problem_code: &str,
+    ) -> Result<CompletionRecord, PortError>;
+
+    fn mark_completion_failed(
+        &self,
+        operation_id: &OperationId,
+        problem_code: &str,
+    ) -> Result<CompletionRecord, PortError>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
