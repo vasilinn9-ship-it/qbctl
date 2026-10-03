@@ -117,7 +117,8 @@ pub async fn dispatch(
                     sequence,
                     request_id,
                     response::Payload::QueueTarget(QueueTargetResponse {
-                        target_client_count,
+                        target_client_count: target_client_count.target_client_count,
+                        revision: target_client_count.revision,
                     }),
                 ),
                 Err(error) => port_error(sequence, request_id, error),
