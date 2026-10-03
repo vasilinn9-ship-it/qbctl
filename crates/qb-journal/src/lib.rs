@@ -1974,6 +1974,8 @@ impl CompletionJournal for Journal {
                 CompletionState::Stopped,
                 CompletionState::ArchivePending,
                 CompletionState::UnknownArchive,
+                CompletionState::ArchiveSourceDeletePending,
+                CompletionState::UnknownArchiveSourceDelete,
                 CompletionState::PayloadPending,
                 CompletionState::RemoveRecordPending,
                 CompletionState::UnknownRemoveRecord,
@@ -2047,6 +2049,40 @@ impl CompletionJournal for Journal {
         destination_sha256: [u8; 32],
     ) -> Result<CompletionRecord, PortError> {
         receipt_completion_archive_destination(self, operation_id, destination, destination_sha256)
+    }
+
+    fn mark_archive_source_delete_pending(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<CompletionRecord, PortError> {
+        begin_completion_archive_source_delete(self, operation_id)
+    }
+
+    fn mark_unknown_archive_source_delete(
+        &self,
+        operation_id: &OperationId,
+        problem_code: &str,
+    ) -> Result<CompletionRecord, PortError> {
+        transition_completion(
+            self,
+            operation_id,
+            &[CompletionState::ArchiveSourceDeletePending],
+            CompletionState::UnknownArchiveSourceDelete,
+            Some(problem_code),
+        )
+    }
+
+    fn retry_archive_source_delete(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<CompletionRecord, PortError> {
+        transition_completion(
+            self,
+            operation_id,
+            &[CompletionState::UnknownArchiveSourceDelete],
+            CompletionState::ArchiveSourceDeletePending,
+            None,
+        )
     }
 
     fn mark_archive_receipted(
@@ -3425,6 +3461,8 @@ fn migrate_v6_to_v7(connection: &mut Connection) -> Result<(), JournalError> {
                 'stopped',
                 'archive_pending',
                 'unknown_archive',
+                'archive_source_delete_pending',
+                'unknown_archive_source_delete',
                 'payload_pending',
                 'remove_record_pending',
                 'unknown_remove_record',
@@ -4075,6 +4113,8 @@ fn completion_state_name(state: CompletionState) -> &'static str {
         CompletionState::Stopped => "stopped",
         CompletionState::ArchivePending => "archive_pending",
         CompletionState::UnknownArchive => "unknown_archive",
+        CompletionState::ArchiveSourceDeletePending => "archive_source_delete_pending",
+        CompletionState::UnknownArchiveSourceDelete => "unknown_archive_source_delete",
         CompletionState::PayloadPending => "payload_pending",
         CompletionState::RemoveRecordPending => "remove_record_pending",
         CompletionState::UnknownRemoveRecord => "unknown_remove_record",
@@ -4092,6 +4132,8 @@ fn parse_completion_state(value: &str) -> Option<CompletionState> {
         "stopped" => Some(CompletionState::Stopped),
         "archive_pending" => Some(CompletionState::ArchivePending),
         "unknown_archive" => Some(CompletionState::UnknownArchive),
+        "archive_source_delete_pending" => Some(CompletionState::ArchiveSourceDeletePending),
+        "unknown_archive_source_delete" => Some(CompletionState::UnknownArchiveSourceDelete),
         "payload_pending" => Some(CompletionState::PayloadPending),
         "remove_record_pending" => Some(CompletionState::RemoveRecordPending),
         "unknown_remove_record" => Some(CompletionState::UnknownRemoveRecord),
@@ -4590,7 +4632,12 @@ fn receipt_completion_archive_destination(
                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE operation_id = ?7
                AND revision = ?8
-               AND state IN ('archive_pending','unknown_archive')",
+               AND state IN (
+                   'archive_pending',
+                   'unknown_archive',
+                   'archive_source_delete_pending',
+                   'unknown_archive_source_delete'
+               )",
             params![
                 destination.identity.volume_id.to_be_bytes().as_slice(),
                 destination.identity.file_id.to_be_bytes().as_slice(),
@@ -4633,6 +4680,88 @@ fn receipt_completion_archive_destination(
     Ok(record)
 }
 
+fn begin_completion_archive_source_delete(
+    journal: &Journal,
+    operation_id: &OperationId,
+) -> Result<CompletionRecord, PortError> {
+    let mut connection = journal.connection.lock().expect("journal mutex poisoned");
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    let current = load_completion_record(&transaction, operation_id.as_str())
+        .map_err(map_port_error)?
+        .ok_or_else(|| PortError::new("COMPLETION_NOT_FOUND", operation_id.to_string()))?;
+
+    if current.state == CompletionState::ArchiveSourceDeletePending {
+        transaction
+            .commit()
+            .map_err(JournalError::from)
+            .map_err(map_port_error)?;
+        return Ok(current);
+    }
+    if current.state != CompletionState::ArchivePending {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            "Archive source-delete intent requires ArchivePending state",
+        ));
+    }
+    if current.archive_destination_evidence.is_none() || current.archive_sha256.is_none() {
+        return Err(PortError::new(
+            "ARCHIVE_RECEIPT_INCOMPLETE",
+            "Archive source-delete intent requires a durable destination receipt",
+        ));
+    }
+
+    let revision = current
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| PortError::new("JOURNAL_STATE_INVALID", "completion revision overflow"))?;
+    let changed = transaction
+        .execute(
+            "UPDATE completion_operations
+             SET state = 'archive_source_delete_pending',
+                 problem_code = NULL,
+                 revision = ?1,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE operation_id = ?2
+               AND revision = ?3
+               AND state = 'archive_pending'
+               AND archive_destination_file_id IS NOT NULL
+               AND archive_destination_sha256 IS NOT NULL",
+            params![revision, operation_id.as_str(), current.revision],
+        )
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    if changed != 1 {
+        return Err(PortError::new(
+            "OPERATION_TRANSITION_INVALID",
+            "Archive source-delete intent changed concurrently",
+        ));
+    }
+    insert_completion_event(
+        &transaction,
+        operation_id.as_str(),
+        revision,
+        "archive_source_delete_pending",
+        None,
+    )
+    .map_err(map_port_error)?;
+    let record = load_completion_record(&transaction, operation_id.as_str())
+        .map_err(map_port_error)?
+        .ok_or_else(|| {
+            PortError::new(
+                "JOURNAL_STATE_INVALID",
+                "completion disappeared after Archive source-delete intent",
+            )
+        })?;
+    transaction
+        .commit()
+        .map_err(JournalError::from)
+        .map_err(map_port_error)?;
+    Ok(record)
+}
+
 fn receipt_completion_archive(
     journal: &Journal,
     operation_id: &OperationId,
@@ -4649,11 +4778,14 @@ fn receipt_completion_archive(
         .ok_or_else(|| PortError::new("COMPLETION_NOT_FOUND", operation_id.to_string()))?;
     if !matches!(
         current.state,
-        CompletionState::ArchivePending | CompletionState::UnknownArchive
+        CompletionState::ArchivePending
+            | CompletionState::UnknownArchive
+            | CompletionState::ArchiveSourceDeletePending
+            | CompletionState::UnknownArchiveSourceDelete
     ) {
         return Err(PortError::new(
             "OPERATION_TRANSITION_INVALID",
-            "archive receipt requires ArchivePending or UnknownArchive",
+            "archive receipt requires an Archive handoff/delete state",
         ));
     }
     if destination.identity.volume_id != current.archive_volume_id
