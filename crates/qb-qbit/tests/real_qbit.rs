@@ -34,8 +34,7 @@ async fn disposable_qbittorrent_authenticates_and_probes() {
     assert!(
         probe.mutation_ready,
         "pinned real qBittorrent must be mutation-ready: app={}, webapi={}",
-        probe.application_version,
-        probe.webapi_version
+        probe.application_version, probe.webapi_version
     );
 
     let torrents = client.list().await.expect("real torrent list");
