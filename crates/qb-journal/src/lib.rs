@@ -301,6 +301,152 @@ impl Journal {
         transaction.commit()?;
         Ok(record)
     }
+    fn transition_admission(
+        &self,
+        operation_id: &OperationId,
+        spec: TransitionSpec<'_>,
+        mark_processing: bool,
+        release_reservation: bool,
+    ) -> Result<AdmissionRecord, JournalError> {
+        let mut connection = self.connection.lock().expect("journal mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let current = load_admission_record(&transaction, operation_id.as_str())?.ok_or_else(|| {
+            JournalError::InvalidState(format!(
+                "admission operation {} does not exist",
+                operation_id
+            ))
+        })?;
+
+        if current.disposition == spec.next
+            && current.checkpoint == spec.checkpoint
+            && current.pending_effect_kind.as_deref() == spec.pending_effect_kind
+            && current.problem_code.as_deref() == spec.problem_code
+        {
+            transaction.commit()?;
+            return Ok(current);
+        }
+
+        if current.disposition != spec.expected {
+            return Err(JournalError::InvalidTransition(format!(
+                "{} cannot move admission from {} to {}",
+                operation_id,
+                disposition_name(current.disposition),
+                disposition_name(spec.next)
+            )));
+        }
+
+        let next_revision = current
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| JournalError::InvalidState("operation revision overflow".into()))?;
+        let finished_sql = if spec.finished {
+            "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+        } else {
+            "NULL"
+        };
+
+        let changed = transaction.execute(
+            &format!(
+                "UPDATE operations
+                 SET checkpoint = ?1,
+                     disposition = ?2,
+                     pending_effect_kind = ?3,
+                     problem_code = ?4,
+                     revision = ?5,
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                     finished_at = {finished_sql}
+                 WHERE operation_id = ?6
+                   AND command_kind = 'admission.add'
+                   AND revision = ?7
+                   AND disposition = ?8"
+            ),
+            params![
+                spec.checkpoint,
+                disposition_name(spec.next),
+                spec.pending_effect_kind,
+                spec.problem_code,
+                next_revision,
+                operation_id.as_str(),
+                current.revision,
+                disposition_name(spec.expected),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(JournalError::InvalidTransition(format!(
+                "{} changed while admission transition was being committed",
+                operation_id
+            )));
+        }
+
+        if mark_processing {
+            let changed = transaction.execute(
+                "UPDATE torrent_registry
+                 SET state = 'processing',
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE registry_id = ?1
+                   AND operation_id = ?2
+                   AND state = 'incoming'",
+                params![current.registry_id, operation_id.as_str()],
+            )?;
+            if changed != 1 {
+                return Err(JournalError::InvalidState(
+                    "admission receipt could not advance registry to processing".into(),
+                ));
+            }
+        }
+
+        if release_reservation {
+            let changed = transaction.execute(
+                "UPDATE admission_reservations
+                 SET reservation_state = 'released',
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE operation_id = ?1
+                   AND reservation_state = 'active'",
+                [operation_id.as_str()],
+            )?;
+            if changed != 1 {
+                return Err(JournalError::InvalidState(
+                    "admission failure could not release capacity reservation".into(),
+                ));
+            }
+
+            let changed = transaction.execute(
+                "UPDATE torrent_registry
+                 SET operation_id = NULL,
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE registry_id = ?1
+                   AND operation_id = ?2
+                   AND state = 'incoming'",
+                params![current.registry_id, operation_id.as_str()],
+            )?;
+            if changed != 1 {
+                return Err(JournalError::InvalidState(
+                    "failed admission could not detach incoming registry".into(),
+                ));
+            }
+        }
+
+        insert_event(
+            &transaction,
+            operation_id.as_str(),
+            EventSpec {
+                revision: next_revision,
+                event_kind: spec.event_kind,
+                checkpoint: spec.checkpoint,
+                disposition: spec.next,
+                pending_effect_kind: spec.pending_effect_kind,
+                problem_code: spec.problem_code,
+            },
+        )?;
+
+        let record = load_admission_record(&transaction, operation_id.as_str())?.ok_or_else(|| {
+            JournalError::InvalidState("updated admission operation disappeared".into())
+        })?;
+        transaction.commit()?;
+        Ok(record)
+    }
+
     fn apply_queue_target_inner(
         &self,
         operation_id: &OperationId,
@@ -878,6 +1024,195 @@ impl AdmissionJournal for Journal {
             });
         }
         Ok(reservations)
+    }
+
+    fn mark_admission_effect_pending(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<AdmissionRecord, PortError> {
+        self.transition_admission(
+            operation_id,
+            TransitionSpec {
+                expected: MutationDisposition::Prepared,
+                next: MutationDisposition::EffectPending,
+                checkpoint: "effect_pending",
+                event_kind: "effect_pending",
+                pending_effect_kind: Some("qbit.add"),
+                problem_code: None,
+                finished: false,
+            },
+            false,
+            false,
+        )
+        .map_err(map_port_error)
+    }
+
+    fn mark_admission_not_submitted(
+        &self,
+        operation_id: &OperationId,
+        problem_code: &str,
+    ) -> Result<AdmissionRecord, PortError> {
+        self.transition_admission(
+            operation_id,
+            TransitionSpec {
+                expected: MutationDisposition::Prepared,
+                next: MutationDisposition::Blocked,
+                checkpoint: "not_submitted",
+                event_kind: "not_submitted",
+                pending_effect_kind: None,
+                problem_code: Some(problem_code),
+                finished: false,
+            },
+            false,
+            false,
+        )
+        .map_err(map_port_error)
+    }
+
+    fn mark_admission_retry_ready(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<AdmissionRecord, PortError> {
+        let current = self
+            .get_admission(operation_id)?
+            .ok_or_else(|| PortError::new("OPERATION_NOT_FOUND", operation_id.to_string()))?;
+        let (expected, checkpoint) = match current.disposition {
+            MutationDisposition::Blocked => (MutationDisposition::Blocked, "retry_ready"),
+            MutationDisposition::EffectPending => {
+                (MutationDisposition::EffectPending, "observed_not_applied")
+            }
+            other => {
+                return Err(PortError::new(
+                    "OPERATION_TRANSITION_INVALID",
+                    format!(
+                        "{} cannot become admission retry-ready from {}",
+                        operation_id,
+                        disposition_name(other)
+                    ),
+                ));
+            }
+        };
+
+        self.transition_admission(
+            operation_id,
+            TransitionSpec {
+                expected,
+                next: MutationDisposition::Prepared,
+                checkpoint,
+                event_kind: "retry_ready",
+                pending_effect_kind: None,
+                problem_code: None,
+                finished: false,
+            },
+            false,
+            false,
+        )
+        .map_err(map_port_error)
+    }
+
+    fn mark_admission_unknown(
+        &self,
+        operation_id: &OperationId,
+        problem_code: &str,
+    ) -> Result<AdmissionRecord, PortError> {
+        self.transition_admission(
+            operation_id,
+            TransitionSpec {
+                expected: MutationDisposition::EffectPending,
+                next: MutationDisposition::Unknown,
+                checkpoint: "unknown",
+                event_kind: "unknown",
+                pending_effect_kind: Some("qbit.add"),
+                problem_code: Some(problem_code),
+                finished: false,
+            },
+            false,
+            false,
+        )
+        .map_err(map_port_error)
+    }
+
+    fn mark_admission_observed_applied(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<AdmissionRecord, PortError> {
+        let current = self
+            .get_admission(operation_id)?
+            .ok_or_else(|| PortError::new("OPERATION_NOT_FOUND", operation_id.to_string()))?;
+        let expected = match current.disposition {
+            MutationDisposition::EffectPending | MutationDisposition::Unknown => {
+                current.disposition
+            }
+            other => {
+                return Err(PortError::new(
+                    "OPERATION_TRANSITION_INVALID",
+                    format!(
+                        "{} cannot record admission receipt from {}",
+                        operation_id,
+                        disposition_name(other)
+                    ),
+                ));
+            }
+        };
+
+        self.transition_admission(
+            operation_id,
+            TransitionSpec {
+                expected,
+                next: MutationDisposition::ObservedApplied,
+                checkpoint: "observed_applied",
+                event_kind: "observed_applied",
+                pending_effect_kind: Some("qbit.add"),
+                problem_code: None,
+                finished: false,
+            },
+            true,
+            false,
+        )
+        .map_err(map_port_error)
+    }
+
+    fn finish_admission(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<AdmissionRecord, PortError> {
+        self.transition_admission(
+            operation_id,
+            TransitionSpec {
+                expected: MutationDisposition::ObservedApplied,
+                next: MutationDisposition::Finished,
+                checkpoint: "finished",
+                event_kind: "finished",
+                pending_effect_kind: None,
+                problem_code: None,
+                finished: true,
+            },
+            false,
+            false,
+        )
+        .map_err(map_port_error)
+    }
+
+    fn mark_admission_failed(
+        &self,
+        operation_id: &OperationId,
+        problem_code: &str,
+    ) -> Result<AdmissionRecord, PortError> {
+        self.transition_admission(
+            operation_id,
+            TransitionSpec {
+                expected: MutationDisposition::EffectPending,
+                next: MutationDisposition::Failed,
+                checkpoint: "failed",
+                event_kind: "failed",
+                pending_effect_kind: Some("qbit.add"),
+                problem_code: Some(problem_code),
+                finished: true,
+            },
+            false,
+            true,
+        )
+        .map_err(map_port_error)
     }
 }
 
@@ -1652,6 +1987,7 @@ struct StoredAdmissionRow {
     working_volume_id: Vec<u8>,
     working_save_path: String,
     reserved_bytes: Vec<u8>,
+    reservation_state: String,
     checkpoint: String,
     pending_effect_kind: Option<String>,
     problem_code: Option<String>,
@@ -1676,6 +2012,7 @@ fn load_admission_record(
                     admission_reservations.working_volume_id,
                     admission_reservations.working_save_path,
                     admission_reservations.reserved_bytes,
+                    admission_reservations.reservation_state,
                     operations.checkpoint,
                     operations.pending_effect_kind,
                     operations.problem_code,
@@ -1702,10 +2039,11 @@ fn load_admission_record(
                     working_volume_id: row.get(9)?,
                     working_save_path: row.get(10)?,
                     reserved_bytes: row.get(11)?,
-                    checkpoint: row.get(12)?,
-                    pending_effect_kind: row.get(13)?,
-                    problem_code: row.get(14)?,
-                    revision: row.get(15)?,
+                    reservation_state: row.get(12)?,
+                    checkpoint: row.get(13)?,
+                    pending_effect_kind: row.get(14)?,
+                    problem_code: row.get(15)?,
+                    revision: row.get(16)?,
                 })
             },
         )
@@ -1728,6 +2066,7 @@ fn load_admission_record(
         working_volume_id,
         working_save_path,
         reserved_bytes,
+        reservation_state,
         checkpoint,
         pending_effect_kind,
         problem_code,
@@ -1741,9 +2080,18 @@ fn load_admission_record(
     let registry = load_registry_record(connection, &registry_id)?.ok_or_else(|| {
         JournalError::InvalidState("admission reservation references missing registry".into())
     })?;
-    if registry.operation_id.as_deref() != Some(operation_id.as_str()) {
+    let reservation_active = match reservation_state.as_str() {
+        "active" => true,
+        "released" => false,
+        other => {
+            return Err(JournalError::InvalidState(format!(
+                "unknown admission reservation state '{other}'"
+            )));
+        }
+    };
+    if reservation_active && registry.operation_id.as_deref() != Some(operation_id.as_str()) {
         return Err(JournalError::InvalidState(
-            "admission registry operation link does not match reservation".into(),
+            "active admission registry link does not match reservation".into(),
         ));
     }
 
@@ -1786,6 +2134,7 @@ fn load_admission_record(
         working_volume_id: decode_u64_blob(&working_volume_id, "working_volume_id")?,
         reserved_bytes: decode_u64_blob(&reserved_bytes, "reserved_bytes")?,
         working_save_path,
+        reservation_active,
         checkpoint,
         disposition,
         pending_effect_kind,
@@ -2443,6 +2792,129 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn admission_effect_receipt_moves_registry_to_processing_and_finishes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path().join("state.sqlite")).expect("journal");
+        let request = admission_request("admission-receipt");
+        let operation_id = match journal.reserve_admission(&request).expect("reserve") {
+            AdmissionReservationResult::New(record) => record.operation_id,
+            other => panic!("unexpected reservation: {other:?}"),
+        };
+
+        let pending = journal
+            .mark_admission_effect_pending(&operation_id)
+            .expect("effect pending");
+        assert_eq!(pending.disposition, MutationDisposition::EffectPending);
+        assert_eq!(pending.pending_effect_kind.as_deref(), Some("qbit.add"));
+
+        let observed = journal
+            .mark_admission_observed_applied(&operation_id)
+            .expect("observed applied");
+        assert_eq!(observed.disposition, MutationDisposition::ObservedApplied);
+        assert_eq!(
+            journal
+                .find_by_identity(&request.identity)
+                .expect("registry")
+                .expect("record")
+                .state,
+            RegistryState::Processing
+        );
+
+        let finished = journal.finish_admission(&operation_id).expect("finish");
+        assert_eq!(finished.disposition, MutationDisposition::Finished);
+        assert!(finished.reservation_active);
+        assert_eq!(journal.capacity_reservations(42).expect("capacity").len(), 1);
+    }
+
+    #[test]
+    fn admission_unknown_keeps_effect_and_reservation_for_observation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path().join("state.sqlite")).expect("journal");
+        let request = admission_request("admission-unknown");
+        let operation_id = match journal.reserve_admission(&request).expect("reserve") {
+            AdmissionReservationResult::New(record) => record.operation_id,
+            other => panic!("unexpected reservation: {other:?}"),
+        };
+
+        journal
+            .mark_admission_effect_pending(&operation_id)
+            .expect("effect pending");
+        let unknown = journal
+            .mark_admission_unknown(&operation_id, "QBIT_MUTATION_UNCERTAIN")
+            .expect("unknown");
+
+        assert_eq!(unknown.disposition, MutationDisposition::Unknown);
+        assert_eq!(unknown.pending_effect_kind.as_deref(), Some("qbit.add"));
+        assert!(unknown.reservation_active);
+        assert_eq!(
+            journal
+                .list_recoverable_admissions()
+                .expect("recoverable")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn definitive_admission_failure_releases_capacity_and_detaches_registry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path().join("state.sqlite")).expect("journal");
+        let request = admission_request("admission-failed");
+        let operation_id = match journal.reserve_admission(&request).expect("reserve") {
+            AdmissionReservationResult::New(record) => record.operation_id,
+            other => panic!("unexpected reservation: {other:?}"),
+        };
+
+        journal
+            .mark_admission_effect_pending(&operation_id)
+            .expect("effect pending");
+        let failed = journal
+            .mark_admission_failed(&operation_id, "QBIT_MUTATION_REJECTED")
+            .expect("failed");
+        assert_eq!(failed.disposition, MutationDisposition::Failed);
+        assert!(!failed.reservation_active);
+        assert!(journal.capacity_reservations(42).expect("capacity").is_empty());
+
+        let registry = journal
+            .find_by_identity(&request.identity)
+            .expect("registry")
+            .expect("record");
+        assert_eq!(registry.state, RegistryState::Incoming);
+        assert!(registry.operation_id.is_none());
+
+        let mut retry = request.clone();
+        retry.request_id = RequestId::new("admission-after-failure").expect("request id");
+        assert!(matches!(
+            journal.reserve_admission(&retry).expect("new reserve"),
+            AdmissionReservationResult::New(_)
+        ));
+    }
+
+    #[test]
+    fn admission_preflight_block_is_explicitly_not_submitted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path().join("state.sqlite")).expect("journal");
+        let request = admission_request("admission-blocked");
+        let operation_id = match journal.reserve_admission(&request).expect("reserve") {
+            AdmissionReservationResult::New(record) => record.operation_id,
+            other => panic!("unexpected reservation: {other:?}"),
+        };
+
+        let blocked = journal
+            .mark_admission_not_submitted(&operation_id, "INSUFFICIENT_CAPACITY")
+            .expect("blocked");
+        assert_eq!(blocked.disposition, MutationDisposition::Blocked);
+        assert_eq!(blocked.checkpoint, "not_submitted");
+        assert!(blocked.pending_effect_kind.is_none());
+
+        let retry = journal
+            .mark_admission_retry_ready(&operation_id)
+            .expect("retry ready");
+        assert_eq!(retry.disposition, MutationDisposition::Prepared);
+        assert_eq!(retry.checkpoint, "retry_ready");
     }
 
     #[test]
