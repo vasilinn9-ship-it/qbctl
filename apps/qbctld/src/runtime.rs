@@ -111,6 +111,7 @@ pub async fn run(runtime_override: Option<PathBuf>) -> Result<()> {
                         let torrents = bootstrap.torrents.as_ref().map(Arc::clone);
                         let mutations = Arc::clone(&bootstrap.mutations);
                         let completion = bootstrap.completion.as_ref().map(Arc::clone);
+                        let completion_journal = Arc::clone(&bootstrap.completion_journal);
                         let qbit_startup_problem =
                             bootstrap.qbit_startup_problem.as_deref().map(Arc::<str>::from);
                         tasks.spawn(async move {
@@ -123,6 +124,7 @@ pub async fn run(runtime_override: Option<PathBuf>) -> Result<()> {
                                 protocol::OperationServices {
                                     mutations,
                                     completion,
+                                    completion_journal,
                                 },
                                 qbit_startup_problem,
                             )
