@@ -315,6 +315,21 @@ fn ensure_local_fixed_volume(_role: ManagedRootRole, _path: &Path) -> Result<(),
     Ok(())
 }
 
+#[cfg(windows)]
+fn roots_overlap(first: &Path, second: &Path) -> bool {
+    let first = windows_path_components(first);
+    let second = windows_path_components(second);
+    first == second || first.starts_with(&second) || second.starts_with(&first)
+}
+
+#[cfg(windows)]
+fn windows_path_components(path: &Path) -> Vec<String> {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy().to_uppercase())
+        .collect()
+}
+
+#[cfg(not(windows))]
 fn roots_overlap(first: &Path, second: &Path) -> bool {
     first == second || first.starts_with(second) || second.starts_with(first)
 }
@@ -431,6 +446,19 @@ mod tests {
         assert!(validated.completed.is_absolute());
         assert!(validated.runtime.is_absolute());
         fs::remove_dir_all(temp).expect("cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_root_overlap_is_case_insensitive_and_component_aware() {
+        assert!(roots_overlap(
+            Path::new(r"C:\Data"),
+            Path::new(r"c:\data\child")
+        ));
+        assert!(!roots_overlap(
+            Path::new(r"C:\Data"),
+            Path::new(r"C:\Database")
+        ));
     }
 
     #[cfg(unix)]
