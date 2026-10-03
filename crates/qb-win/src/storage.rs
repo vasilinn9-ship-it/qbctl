@@ -6,10 +6,12 @@ use std::{
 
 use qb_application::{
     storage::{
-        FileEvidence, FileIdentity, IncomingFileSnapshot, ManagedRoot, Storage, StorageVolumeStatus,
+        FileEvidence, FileIdentity, IncomingDeleteOutcome, IncomingFileSnapshot, ManagedRoot,
+        Storage, StorageVolumeStatus,
     },
     PortError,
 };
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -317,6 +319,171 @@ impl Storage for ManagedStorage {
             bytes,
         })
     }
+
+    fn delete_incoming_exact(
+        &self,
+        relative_path: &str,
+        expected_evidence: &FileEvidence,
+        expected_sha256: &[u8; 32],
+        max_bytes: usize,
+    ) -> Result<IncomingDeleteOutcome, PortError> {
+        delete_incoming_exact(
+            &self.roots,
+            relative_path,
+            expected_evidence,
+            expected_sha256,
+            max_bytes,
+        )
+    }
+}
+
+fn validate_incoming_delete_path(
+    roots: &ValidatedManagedRootLayout,
+    relative_path: &str,
+) -> Result<PathBuf, PortError> {
+    let managed = ManagedRelativePath::parse(relative_path).map_err(|_| {
+        PortError::new(
+            "STORAGE_PATH_INVALID",
+            format!("unsafe Incoming path: {relative_path}"),
+        )
+    })?;
+    if managed.as_path().components().count() != 1 || !is_torrent_name(relative_path) {
+        return Err(PortError::new(
+            "STORAGE_PATH_INVALID",
+            "Incoming cleanup is limited to top-level .torrent files",
+        ));
+    }
+    Ok(roots.incoming.join(managed.as_path()))
+}
+
+#[cfg(windows)]
+fn delete_incoming_exact(
+    roots: &ValidatedManagedRootLayout,
+    relative_path: &str,
+    expected_evidence: &FileEvidence,
+    expected_sha256: &[u8; 32],
+    max_bytes: usize,
+) -> Result<IncomingDeleteOutcome, PortError> {
+    use std::{mem::size_of, os::windows::io::AsRawHandle};
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+    };
+
+    if max_bytes == 0 {
+        return Err(PortError::new(
+            "STORAGE_LIMIT_INVALID",
+            "Incoming cleanup read limit must be greater than zero",
+        ));
+    }
+
+    let refreshed =
+        validate_root(ManagedRootRole::Incoming, &roots.incoming).map_err(map_storage_port_error)?;
+    if !paths_equal(&refreshed, &roots.incoming) {
+        return Err(PortError::new(
+            "STORAGE_ROOT_CHANGED",
+            "Incoming root identity changed before cleanup",
+        ));
+    }
+
+    let path = validate_incoming_delete_path(roots, relative_path)?;
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(IncomingDeleteOutcome::Missing);
+        }
+        Err(error) => return Err(PortError::new("STORAGE_IO", error.to_string())),
+    };
+    if is_reparse_metadata(&metadata) {
+        return Ok(IncomingDeleteOutcome::Changed);
+    }
+
+    const GENERIC_READ_ACCESS: u32 = 0x8000_0000;
+    const DELETE_ACCESS: u32 = 0x0001_0000;
+
+    let mut file = {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        match OpenOptions::new()
+            .access_mode(GENERIC_READ_ACCESS | DELETE_ACCESS)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(IncomingDeleteOutcome::Missing);
+            }
+            Err(error) => return Err(PortError::new("STORAGE_IO", error.to_string())),
+        }
+    };
+
+    let before = file_evidence(&file, relative_path)?;
+    if &before != expected_evidence {
+        return Ok(IncomingDeleteOutcome::Changed);
+    }
+
+    let read_limit = max_bytes.checked_add(1).ok_or_else(|| {
+        PortError::new(
+            "STORAGE_LIMIT_INVALID",
+            "Incoming cleanup read limit overflow",
+        )
+    })?;
+    let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
+    (&mut file)
+        .take(u64::try_from(read_limit).unwrap_or(u64::MAX))
+        .read_to_end(&mut bytes)
+        .map_err(|error| PortError::new("STORAGE_IO", error.to_string()))?;
+    if bytes.len() > max_bytes {
+        return Ok(IncomingDeleteOutcome::Changed);
+    }
+    if before.size != u64::try_from(bytes.len()).unwrap_or(u64::MAX) {
+        return Ok(IncomingDeleteOutcome::Changed);
+    }
+    let digest: [u8; 32] = Sha256::digest(&bytes).into();
+    if &digest != expected_sha256 {
+        return Ok(IncomingDeleteOutcome::Changed);
+    }
+
+    let after = file_evidence(&file, relative_path)?;
+    if after != before {
+        return Ok(IncomingDeleteOutcome::Changed);
+    }
+
+    let disposition = FILE_DISPOSITION_INFO { DeleteFileA: 1 };
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle() as _,
+            FileDispositionInfo,
+            &disposition as *const FILE_DISPOSITION_INFO as *const core::ffi::c_void,
+            u32::try_from(size_of::<FILE_DISPOSITION_INFO>())
+                .expect("FILE_DISPOSITION_INFO size fits u32"),
+        )
+    };
+    if ok == 0 {
+        return Err(PortError::new(
+            "STORAGE_IO",
+            io::Error::last_os_error().to_string(),
+        ));
+    }
+
+    drop(file);
+    Ok(IncomingDeleteOutcome::Deleted)
+}
+
+#[cfg(not(windows))]
+fn delete_incoming_exact(
+    _roots: &ValidatedManagedRootLayout,
+    _relative_path: &str,
+    _expected_evidence: &FileEvidence,
+    _expected_sha256: &[u8; 32],
+    _max_bytes: usize,
+) -> Result<IncomingDeleteOutcome, PortError> {
+    Err(PortError::new(
+        "STORAGE_DELETE_UNSUPPORTED",
+        "race-safe Incoming deletion requires the Windows storage adapter",
+    ))
 }
 
 fn managed_root_role(root: ManagedRoot) -> ManagedRootRole {
@@ -923,6 +1090,80 @@ mod tests {
         assert_eq!(snapshot.bytes, b"metainfo");
         assert_eq!(snapshot.evidence.size, 8);
         assert_ne!(snapshot.evidence.identity.file_id, 0);
+
+        fs::remove_dir_all(temp).expect("cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn managed_storage_deletes_only_exact_incoming_snapshot() {
+        let temp = temp_root("delete-exact");
+        let roots = valid_roots(&temp);
+        fs::write(roots.incoming.join("duplicate.torrent"), b"same-metainfo").expect("fixture");
+
+        let storage = ManagedStorage::new(roots.clone());
+        let snapshot = storage
+            .read_incoming("duplicate.torrent", 1024)
+            .expect("snapshot");
+        let digest: [u8; 32] = Sha256::digest(&snapshot.bytes).into();
+
+        assert_eq!(
+            storage
+                .delete_incoming_exact(
+                    "duplicate.torrent",
+                    &snapshot.evidence,
+                    &digest,
+                    1024,
+                )
+                .expect("delete"),
+            IncomingDeleteOutcome::Deleted
+        );
+        assert!(!roots.incoming.join("duplicate.torrent").exists());
+        assert_eq!(
+            storage
+                .delete_incoming_exact(
+                    "duplicate.torrent",
+                    &snapshot.evidence,
+                    &digest,
+                    1024,
+                )
+                .expect("observe absent"),
+            IncomingDeleteOutcome::Missing
+        );
+
+        fs::remove_dir_all(temp).expect("cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn managed_storage_refuses_changed_incoming_cleanup_target() {
+        let temp = temp_root("delete-changed");
+        let roots = valid_roots(&temp);
+        let path = roots.incoming.join("duplicate.torrent");
+        fs::write(&path, b"original-metainfo").expect("fixture");
+
+        let storage = ManagedStorage::new(roots.clone());
+        let snapshot = storage
+            .read_incoming("duplicate.torrent", 1024)
+            .expect("snapshot");
+        let digest: [u8; 32] = Sha256::digest(&snapshot.bytes).into();
+        fs::write(&path, b"replacement-metainfo").expect("replace");
+
+        assert_eq!(
+            storage
+                .delete_incoming_exact(
+                    "duplicate.torrent",
+                    &snapshot.evidence,
+                    &digest,
+                    1024,
+                )
+                .expect("changed"),
+            IncomingDeleteOutcome::Changed
+        );
+        assert_eq!(
+            fs::read(&path).expect("replacement retained"),
+            b"replacement-metainfo"
+        );
 
         fs::remove_dir_all(temp).expect("cleanup");
     }
