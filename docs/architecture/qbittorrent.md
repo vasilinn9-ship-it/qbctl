@@ -31,7 +31,7 @@ Relevant compatibility points:
 - 2.15.x: Basic authentication exists but is not the baseline;
 - 2.16.x: add fields changed and combined speed-limit API appeared.
 
-Baseline authentication remains auth/login + SID cookie.
+Baseline authentication remains `auth/login` session-cookie auth. The adapter accepts the legacy `SID` cookie and the qBittorrent 5.2 `QBT_SID_<webui-port>` cookie, and treats only the documented legacy `200 Ok`/`Ok.` or modern `204 No Content` login success shapes as authenticated.
 
 ## Security
 
@@ -40,7 +40,7 @@ Baseline authentication remains auth/login + SID cookie.
 - redirects are rejected.
 - environment proxy inheritance is disabled.
 - Origin/Referer must match the configured qB endpoint where required.
-- password/SID are never logged or persisted in operational SQLite.
+- password/session cookies are never logged or persisted in operational SQLite.
 - DTOs deserialize only fields required by a use case.
 - tracker URLs are redacted before leaving qb-qbit.
 
