@@ -12,11 +12,21 @@ impl TorrentId {
         let valid_length = matches!(value.len(), 40 | 64);
         let valid_hex = value.bytes().all(|byte| byte.is_ascii_hexdigit());
 
-        if valid_length && valid_hex {
-            Ok(Self(value.to_ascii_lowercase()))
-        } else {
-            Err(TorrentIdError)
+        if !valid_length || !valid_hex {
+            return Err(TorrentIdError);
         }
+
+        // qBittorrent's public `hash` selector is its 160-bit TorrentID.
+        // For a v2-only torrent qBittorrent derives that ID from the first
+        // 160 bits of the SHA-256 info-hash, so canonicalize a full v2 hash
+        // at the domain boundary instead of sending an unsupported 64-hex
+        // value to WebAPI or fingerprinting the same torrent two ways.
+        let qbit_id = if value.len() == 64 {
+            &value[..40]
+        } else {
+            value
+        };
+        Ok(Self(qbit_id.to_ascii_lowercase()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -40,7 +50,9 @@ impl FromStr for TorrentId {
 
 impl fmt::Display for TorrentIdError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("torrent id must be a 40- or 64-character hexadecimal info-hash")
+        f.write_str(
+            "torrent selector must be a 40-character qBittorrent ID or 64-character v2 info-hash",
+        )
     }
 }
 
@@ -128,6 +140,15 @@ mod tests {
     #[test]
     fn torrent_id_normalizes_hex_case() {
         let id = TorrentId::new("ABCDEF0123456789ABCDEF0123456789ABCDEF01").expect("valid id");
+        assert_eq!(id.as_str(), "abcdef0123456789abcdef0123456789abcdef01");
+    }
+
+    #[test]
+    fn torrent_id_canonicalizes_full_v2_hash_to_qbit_id() {
+        let id = TorrentId::new(
+            "ABCDEF0123456789ABCDEF0123456789ABCDEF01112233445566778899AABBCC",
+        )
+        .expect("valid v2 hash");
         assert_eq!(id.as_str(), "abcdef0123456789abcdef0123456789abcdef01");
     }
 
