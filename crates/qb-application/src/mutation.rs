@@ -129,6 +129,11 @@ pub trait MutationJournal: Send + Sync {
         operation_id: &OperationId,
     ) -> Result<MutationRecord, PortError>;
 
+    fn mark_retry_ready(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<MutationRecord, PortError>;
+
     fn finish(&self, operation_id: &OperationId) -> Result<MutationRecord, PortError>;
 
     fn mark_unknown(
@@ -147,6 +152,16 @@ pub trait MutationJournal: Send + Sync {
         &self,
         operation_id: &OperationId,
     ) -> Result<Option<MutationRecord>, PortError>;
+
+    fn list_recoverable(&self) -> Result<Vec<MutationRecord>, PortError>;
+
+    fn queue_target(&self) -> Result<Option<u32>, PortError>;
+
+    fn apply_queue_target(
+        &self,
+        operation_id: &OperationId,
+        target_client_count: u32,
+    ) -> Result<MutationRecord, PortError>;
 }
 
 #[cfg(test)]
