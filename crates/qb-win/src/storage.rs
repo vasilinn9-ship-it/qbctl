@@ -429,8 +429,8 @@ fn move_same_volume_no_replace(
             format!("{source_role:?} root identity changed before managed move"),
         ));
     }
-    let refreshed_destination =
-        validate_root(destination_role, roots.path(destination_role)).map_err(map_storage_port_error)?;
+    let refreshed_destination = validate_root(destination_role, roots.path(destination_role))
+        .map_err(map_storage_port_error)?;
     if !paths_equal(&refreshed_destination, roots.path(destination_role)) {
         return Err(PortError::new(
             "STORAGE_ROOT_CHANGED",
@@ -498,9 +498,7 @@ fn move_same_volume_no_replace(
             .map(|value| value as u32)
             .is_some_and(|value| value == ERROR_ALREADY_EXISTS || value == ERROR_FILE_EXISTS)
         {
-            if let Some(observed) =
-                observe_managed_file(roots, destination_role, relative_path)?
-            {
+            if let Some(observed) = observe_managed_file(roots, destination_role, relative_path)? {
                 return Ok(SameVolumeMoveOutcome::DestinationExists { observed });
             }
         }
@@ -513,12 +511,13 @@ fn move_same_volume_no_replace(
             "source still exists after same-volume move",
         ));
     }
-    let destination = observe_managed_file(roots, destination_role, relative_path)?.ok_or_else(|| {
-        PortError::new(
-            "STORAGE_MOVE_POSTCONDITION",
-            "destination is missing after same-volume move",
-        )
-    })?;
+    let destination =
+        observe_managed_file(roots, destination_role, relative_path)?.ok_or_else(|| {
+            PortError::new(
+                "STORAGE_MOVE_POSTCONDITION",
+                "destination is missing after same-volume move",
+            )
+        })?;
     if destination != *expected_source {
         return Err(PortError::new(
             "STORAGE_MOVE_POSTCONDITION",
@@ -562,7 +561,10 @@ fn ensure_managed_parent_directories(
                 if is_reparse_metadata(&metadata) {
                     return Err(PortError::new(
                         "STORAGE_REPARSE_POINT",
-                        format!("managed destination parent is a reparse point: {}", current.display()),
+                        format!(
+                            "managed destination parent is a reparse point: {}",
+                            current.display()
+                        ),
                     ));
                 }
                 if !metadata.is_dir() {
@@ -583,8 +585,8 @@ fn ensure_managed_parent_directories(
                         return Err(PortError::new("STORAGE_IO", error.to_string()));
                     }
                 }
-                let metadata =
-                    fs::symlink_metadata(&current).map_err(|error| PortError::new("STORAGE_IO", error.to_string()))?;
+                let metadata = fs::symlink_metadata(&current)
+                    .map_err(|error| PortError::new("STORAGE_IO", error.to_string()))?;
                 if is_reparse_metadata(&metadata) || !metadata.is_dir() {
                     return Err(PortError::new(
                         "STORAGE_PATH_INVALID",
@@ -1388,7 +1390,10 @@ mod tests {
         );
         assert!(!source.exists());
         let destination = roots.completed.join("dir").join("payload.bin");
-        assert_eq!(fs::read(destination).expect("destination bytes"), b"payload");
+        assert_eq!(
+            fs::read(destination).expect("destination bytes"),
+            b"payload"
+        );
 
         fs::remove_dir_all(temp).expect("cleanup");
     }
